@@ -8,7 +8,7 @@
 cd /home/ubuntu/cyq_shixi_projects/rl_training
 ```
 
-楼梯教师任务默认使用本机的 `/home/ubuntu/桌面/m20_1/M20_perception_Lidar_rl_2/M20_perception_Lidar_rl/deep_robotics_model/M20/usd/M20.usd`，无需每次 `export RL_TRAINING_M20_USD_PATH`。模型搬家时才设置该环境变量覆盖默认路径。
+楼梯教师与轮式预训练任务默认从仓库内读取 `deep_robotics_model/M20/usd/M20.usd`，路径相对于配置文件自动解析，不依赖启动目录或特定用户名。模型搬出仓库时，才设置 `RL_TRAINING_M20_USD_PATH` 覆盖默认路径。
 
 工作区本机的 `.vscode/settings.json` 已指定 `m20_wzh` 解释器。VS Code 选中该解释器后，**新建的集成终端**通常会自动激活；旧终端或 VS Code 外的 shell 不受影响。可用 `which python` 确认，预期为 `/home/ubuntu/miniconda3/envs/m20_wzh/bin/python`；若不是，再运行 `conda activate m20_wzh`。MuJoCo 的 `--model` 使用 XML：
 

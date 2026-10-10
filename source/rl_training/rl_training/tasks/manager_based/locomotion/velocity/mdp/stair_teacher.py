@@ -93,6 +93,12 @@ TUNING = {
     "entry_forward_speed": 0.05, "entry_wheel_reverse_tolerance": 0.05,
     "entry_rearm_time": 0.50, "entry_retract_weight": 0.75,
     "entry_range_cost_weight": -1.0,
+    "entry_rear_pair_swing_cost_weight": -2.0,
+    "entry_front_lead_weight": 8.0, "entry_rear_early_transfer_weight": -1.0,
+    "entry_lead_min_spacing": 0.12, "entry_lead_max_spacing": 0.90,
+    "entry_lead_wait_timeout": 3.0,
+    "entry_lead_landing_inset": 0.10, "entry_lead_x_scale": 0.25,
+    "entry_lead_z_scale": 0.18,
     "entry_swing_x_lower": -0.10, "entry_swing_x_upper": 0.22,
     "entry_swing_min_extension": 0.30, "entry_swing_min_extension_high": 0.26,
     "descent_cost_soft_cap": 4.0,
@@ -267,6 +273,7 @@ def _stair_scan_context(
         # Keep all visible ascending edges for style checks. The nearest edge
         # can still be the riser the front wheels have already climbed.
         "ascending_edges_x": edge_x,
+        "edge_geometry": geometry,
         "ascending_edges_valid": nearby & (delta > 0.0),
         "ascending_edges_upper_z": profile[:, 1:],
         "ascending_edges_lower_z": profile[:, :-1],
@@ -1677,6 +1684,41 @@ def stair_descent_rear_support(
     )
 
 
+def stair_descent_entry_rear_pair_swing_cost(
+    env, asset_cfg: SceneEntityCfg, sensor_cfg: SceneEntityCfg,
+    contact_sensor_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+    """Penalize both rear wheels swinging together during the first descent transfer.
+
+    This only applies after both front wheels have confirmed support on the lower
+    tread, while the latched physical entry is active and before either rear
+    wheel has established lower-tread support. Keeping one rear wheel loaded
+    gives the policy a clear staggered-transfer target without changing later
+    stair steps.
+    """
+    _stair_step_completion_events(env, asset_cfg, sensor_cfg, contact_sensor_cfg)
+    step = getattr(env, "_m20_stair_step_state", None)
+    entry = getattr(env, "_m20_descent_entry_state", None)
+    cost = torch.zeros(env.num_envs, dtype=torch.float32, device=env.device)
+    if step is None or entry is None:
+        return cost
+
+    contact_sensor = env.scene.sensors[contact_sensor_cfg.name]
+    forces = contact_sensor.data.net_forces_w[:, contact_sensor_cfg.body_ids, :]
+    rear_loaded = (
+        (contact_sensor.data.current_contact_time[:, contact_sensor_cfg.body_ids] > 0)
+        & (forces[:, :, 2] > 0.5 * torch.linalg.vector_norm(forces, dim=-1))
+    )[:, 2:]
+    first_transfer = (
+        entry["active"] & ~step["up"] & step["active"]
+        & step["front_reached"].all(dim=1)
+        & ~step["rear_support_paid"].any(dim=1)
+        & ~entry["settled"].any(dim=1)
+    )
+    both_rears_unloaded = ~rear_loaded.any(dim=1)
+    return (first_transfer & both_rears_unloaded).to(torch.float32)
+
+
 def stair_route_track_lin_vel_xy_exp(
     env, std: float, command_name: str,
     sensor_cfg: SceneEntityCfg = SceneEntityCfg("height_scanner"),
@@ -2056,6 +2098,8 @@ def _context(env, asset_cfg, hip_cfg, knee_cfg, sensor_cfg, contact_sensor_cfg,
                   front_swing=front_swing, front_swing_fold=front_swing_fold,
                   rear_forward=rear_forward, body_angle=body_angle, gravity_angle=gravity_angle,
                   entry_retract_gain=entry["gain"], entry_range_cost=entry["cost"],
+                  entry_front_lead_reward=entry["lead_reward"],
+                  entry_rear_early_transfer_cost=entry["early_rear_transfer_cost"],
                   body_gap=body_gap, body_gap_m=gap, body_gap_valid=gap_valid, load=load, rear_load=rear_load)
     env._m20_gait_context = cached
     # Once per control step, independently of how many reward terms use it.
@@ -2197,6 +2241,12 @@ def _descent_entry_retract_context(env,scan,down,wheels,body_delta,ground,valid,
         zero=lambda *shape:torch.zeros(n,*shape,device=device)
         state=dict(settled=torch.zeros(n,2,dtype=torch.bool,device=device),active=zero().bool(),ready=torch.ones(n,dtype=torch.bool,device=device),
             top=zero(),xy=zero(2),heading=zero(2),best=zero(2),quiet=zero(),
+            lead_xy=zero(2),lead_target_z=zero(),lead_valid=zero().bool(),
+            lead_front_time=zero(2),lead_front_paid=torch.zeros(n,2,dtype=torch.bool,device=device),
+            lead_progress_best=zero(2),lead_progress_initialized=zero().bool(),
+            lead_progress_total=zero(2),lead_front_event_total=zero(2),
+            lead_pair_paid=zero().bool(),lead_pair_event=zero().bool(),lead_phase_started=zero().bool(),lead_wait_time=zero(),
+            lead_attempts=zero(),lead_successes=zero(),lead_phase_samples=zero(),early_rear_transfer_steps=zero(),
             count=torch.zeros(n,dtype=torch.long,device=device),history_xy=zero(64,2),history_heading=zero(64,2),history_top=zero(64),
             stats={k:zero(2) for k in ("samples","x_sum","in_band","too_forward","too_rearward","credit","blocked","transfer_samples","transfer_excess","transfer_swing_samples","transfer_cost_sum","transfer_compact")},
             started=zero())
@@ -2246,6 +2296,12 @@ def _descent_entry_retract_context(env,scan,down,wheels,body_delta,ground,valid,
     state["count"][ids]+=1;state["started"]+=start
     state["top"][start]=rear_top[start];state["xy"][start]=edge_xy[start]
     state["heading"][start]=anchor_heading[start];state["best"][start]=score[start];state["settled"][start]=False
+    state["lead_xy"][start]=0;state["lead_target_z"][start]=0;state["lead_valid"][start]=False
+    state["lead_front_time"][start]=0;state["lead_front_paid"][start]=False
+    state["lead_progress_best"][start]=0;state["lead_progress_initialized"][start]=False
+    state["lead_pair_paid"][start]=False;state["lead_pair_event"][start]=False
+    state["lead_phase_started"][start]=False;state["lead_wait_time"][start]=0
+    state["lead_phase_samples"][start]=0;state["early_rear_transfer_steps"][start]=0
     state["active"]|=start;state["ready"][start]=False
     # Each rear foot loses its entrance bonus permanently on leaving this top.
     on_top=valid[:,2:]&((ground[:,2:]-state["top"][:,None]).abs()<TUNING["entry_ground_tolerance"])
@@ -2259,7 +2315,80 @@ def _descent_entry_retract_context(env,scan,down,wheels,body_delta,ground,valid,
     lower_support = gone & stable[:,2:] & (
         (wheels[:,2:,2]-TUNING["wheel_radius"]-ground[:,2:]).abs()<TUNING["entry_ground_tolerance"])
     state["settled"] |= lower_support & state["active"][:,None]
-    state["active"] &= near & aligned & ~state["settled"].all(-1)
+
+    # The first descending edge is tracked by the step ledger. Find and latch
+    # the following edge whose source tread is the first edge's destination.
+    # The front axle gets credit for reaching that next tread while both rear
+    # wheels remain stable on the original platform.
+    descent=getattr(env,"_m20_stair_step_state",None)
+    lead_front_event=torch.zeros(n,2,dtype=torch.bool,device=device)
+    lead_progress_gain=torch.zeros(n,2,device=device)
+    early_rear_transfer=torch.zeros(n,dtype=torch.bool,device=device)
+    state["lead_pair_event"].zero_()
+    if descent is not None:
+        candidate_delta=scan["ascending_edges_upper_z"]-scan["ascending_edges_lower_z"]
+        candidate_xy=scanner_pos[:,None,:]+heading[:,None,:]*scan["ascending_edges_x"][None,:,None]
+        candidate_distance=((candidate_xy-descent["edge_xy"][:,None,:])*descent["heading"][:,None,:]).sum(-1)
+        next_edge=(scan["edge_geometry"]&(candidate_delta < 0.0)&
+            ((scan["ascending_edges_lower_z"]-descent["target_z"][:,None]).abs() < TUNING["riser_height_tolerance"])&
+            (candidate_distance >= TUNING["entry_lead_min_spacing"])&
+            (candidate_distance <= TUNING["entry_lead_max_spacing"]))
+        nearest=torch.where(next_edge,candidate_distance,torch.inf).argmin(dim=1)
+        found=next_edge.any(dim=1)&state["active"]&descent["active"]&~descent["up"]
+        latch=found&~state["lead_valid"]
+        state["lead_xy"][latch]=candidate_xy[latch,nearest[latch]]
+        state["lead_target_z"][latch]=scan["ascending_edges_upper_z"][latch,nearest[latch]]
+        state["lead_valid"]|=found
+        state["lead_attempts"]+=latch
+
+        state["lead_phase_started"]|=(state["active"]&descent["active"]&~descent["up"]&
+            descent["front_reached"].all(-1))
+
+        rear_on_top=(valid[:,2:]&((ground[:,2:]-state["top"][:,None]).abs()<TUNING["entry_ground_tolerance"]))
+        rear_stable_top=rear_on_top&loaded[:,2:]&(contact_time[:,2:]>=TUNING["entry_contact_time"])
+        lead_phase=(state["active"]&state["lead_phase_started"]&state["lead_valid"]&~state["lead_pair_paid"])
+        lead_front_x=((wheels[:,:2,:2]-state["lead_xy"][:,None,:])*state["heading"][:,None,:]).sum(-1)
+        desired_front_x=TUNING["tread_inset"]+TUNING["entry_lead_landing_inset"]
+        front_radius=torch.where(torch.isfinite(descent["front_source_clearance"]),
+            descent["front_source_clearance"],TUNING["wheel_radius"])
+        lead_x_error=(lead_front_x-desired_front_x).abs()
+        lead_z_error=(wheels[:,:2,2]-(state["lead_target_z"][:,None]+front_radius)).abs()
+        lead_score=torch.exp(-0.5*((lead_x_error/TUNING["entry_lead_x_scale"]).square()+
+            (lead_z_error/TUNING["entry_lead_z_scale"]).square()))
+        # Keep front-foot shaping active through rear unloading. Stable rear
+        # support is still required for touchdown credit; the separate early
+        # transfer cost preserves the desired front-before-rear sequence.
+        progress_active=lead_phase
+        initialize_progress=progress_active&~state["lead_progress_initialized"]
+        state["lead_progress_best"][initialize_progress]=lead_score[initialize_progress]
+        state["lead_progress_initialized"]|=progress_active
+        lead_progress_gain=(lead_score-state["lead_progress_best"]).clamp_min(0)*progress_active[:,None]
+        state["lead_progress_best"]=torch.where(progress_active[:,None],
+            torch.maximum(state["lead_progress_best"],lead_score),state["lead_progress_best"])
+        lead_front_now=(lead_phase[:,None]&rear_stable_top.all(-1)[:,None]&valid[:,:2]&loaded[:,:2]&
+            (contact_time[:,:2]>=TUNING["entry_contact_time"])&
+            ((ground[:,:2]-state["lead_target_z"][:,None]).abs()<TUNING["tread_height_tolerance"])&
+            (lead_front_x>TUNING["tread_inset"]))
+        state["lead_front_time"]=torch.where(lead_front_now,state["lead_front_time"]+env.step_dt,
+            torch.zeros_like(state["lead_front_time"]))
+        lead_confirmed=state["lead_front_time"]>=TUNING["entry_contact_time"]
+        lead_front_event=lead_confirmed&~state["lead_front_paid"]
+        state["lead_front_paid"]|=lead_front_event
+        state["lead_progress_total"]+=lead_progress_gain
+        state["lead_front_event_total"]+=lead_front_event
+        state["lead_pair_event"]=state["active"]&state["lead_front_paid"].all(-1)&~state["lead_pair_paid"]
+        state["lead_pair_paid"]|=state["lead_pair_event"]
+        state["lead_successes"]+=state["lead_pair_event"]
+        lead_phase_before_pair=(state["active"]&state["lead_phase_started"]&
+            state["lead_valid"]&~state["lead_pair_paid"])
+        early_rear_transfer=lead_phase_before_pair&~rear_stable_top.all(-1)
+        state["lead_phase_samples"]+=lead_phase_before_pair
+        state["early_rear_transfer_steps"]+=early_rear_transfer
+        waiting=state["active"]&state["lead_phase_started"]&state["settled"].all(-1)&~state["lead_pair_paid"]
+        state["lead_wait_time"]+=waiting*env.step_dt
+    lead_expired=state["lead_phase_started"]&(state["lead_wait_time"]>=TUNING["entry_lead_wait_timeout"])
+    transfer_done=state["settled"].all(-1)&(~state["lead_phase_started"]|state["lead_pair_paid"]|lead_expired)
+    state["active"] &= near&aligned&~transfer_done
     # Only a new flat landing with no active descending transfer rearms the
     # detector. The physical-entry history also blocks retreat/reentry farming.
     flat=valid.all(-1)&stable.all(-1)&((ground.amax(-1)-ground.amin(-1))<TUNING["entry_ground_tolerance"])&~down
@@ -2306,7 +2435,10 @@ def _descent_entry_retract_context(env,scan,down,wheels,body_delta,ground,valid,
     stats["transfer_swing_samples"]+=guard&~loaded[:,2:]
     stats["transfer_cost_sum"]+=cost
     stats["transfer_compact"]+=guard&~loaded[:,2:]&(compact_cost>0)
-    return dict(gain=gain.mean(-1),cost=cost.mean(-1))
+    lead_reward=(lead_progress_gain.sum(-1)+0.5*lead_front_event.float().sum(-1)
+        +2.0*state["lead_pair_event"].float())
+    return dict(gain=gain.mean(-1),cost=cost.mean(-1),lead_reward=lead_reward,
+        early_rear_transfer_cost=early_rear_transfer.float())
 
 
 def stair_descent_entry_retract(env,asset_cfg,hip_cfg,knee_cfg,sensor_cfg,contact_sensor_cfg):
@@ -2317,6 +2449,16 @@ def stair_descent_entry_retract(env,asset_cfg,hip_cfg,knee_cfg,sensor_cfg,contac
 def stair_descent_entry_position_cost(env,asset_cfg,hip_cfg,knee_cfg,sensor_cfg,contact_sensor_cfg):
     """Continuous entry guard until both rear wheels actually settle below."""
     return _context(env,asset_cfg,hip_cfg,knee_cfg,sensor_cfg,contact_sensor_cfg)["entry_range_cost"]
+
+
+def stair_descent_entry_front_lead_reward(env,asset_cfg,hip_cfg,knee_cfg,sensor_cfg,contact_sensor_cfg):
+    """Reward front-foot progress toward the second tread and stable support there."""
+    return _context(env,asset_cfg,hip_cfg,knee_cfg,sensor_cfg,contact_sensor_cfg)["entry_front_lead_reward"]/env.step_dt
+
+
+def stair_descent_entry_rear_early_transfer_cost(env,asset_cfg,hip_cfg,knee_cfg,sensor_cfg,contact_sensor_cfg):
+    """Penalize rear departure before the front axle has reached the second tread."""
+    return _context(env,asset_cfg,hip_cfg,knee_cfg,sensor_cfg,contact_sensor_cfg)["entry_rear_early_transfer_cost"]
 
 
 def descent_rear_forward_cost(env, asset_cfg, hip_cfg, knee_cfg, sensor_cfg, contact_sensor_cfg):
@@ -2436,6 +2578,18 @@ def gait_quality_metrics(env,env_ids):
     entry=getattr(env,"_m20_descent_entry_state",None)
     if entry is not None:
         result["descent_entry_started"]=entry["started"][env_ids].sum()
+        lead_attempts=entry["lead_attempts"][env_ids].sum()
+        lead_successes=entry["lead_successes"][env_ids].sum()
+        lead_phase=entry["lead_phase_samples"][env_ids].sum().clamp_min(1)
+        result["descent_entry_front_lead_attempts"]=lead_attempts
+        result["descent_entry_front_lead_successes"]=lead_successes
+        result["descent_entry_front_lead_success_rate"]=lead_successes/lead_attempts.clamp_min(1)
+        result["descent_entry_rear_early_transfer_fraction"]=entry["early_rear_transfer_steps"][env_ids].sum()/lead_phase
+        progress=entry["lead_progress_total"][env_ids].sum(0)
+        front_events=entry["lead_front_event_total"][env_ids].sum(0)
+        for i,leg in enumerate(("fl","fr")):
+            result[f"{leg}_entry_lead_progress_gain"]=progress[i]
+            result[f"{leg}_entry_lead_stable_events"]=front_events[i]
         for i,leg in enumerate(("hl","hr")):
             ss={k:v[env_ids,i].sum() for k,v in entry["stats"].items()}
             count=ss["samples"].clamp_min(1)

@@ -5,6 +5,7 @@
 
 from copy import deepcopy
 import os
+from pathlib import Path
 
 from isaaclab.envs.mdp import height_scan
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
@@ -20,10 +21,8 @@ from rl_training.tasks.manager_based.locomotion.velocity.velocity_env_cfg import
 from .rough_env_cfg import DeeproboticsM20RewardsCfg, DeeproboticsM20RoughEnvCfg
 
 
-DEFAULT_M20_USD_PATH = (
-    "/home/ubuntu/桌面/m20_1/M20_perception_Lidar_rl_2/"
-    "M20_perception_Lidar_rl/deep_robotics_model/M20/usd/M20.usd"
-)
+_REPO_ROOT = Path(__file__).resolve().parents[10]
+DEFAULT_M20_USD_PATH = str(_REPO_ROOT / "deep_robotics_model/M20/usd/M20.usd")
 
 
 def _gait_entities():
@@ -242,6 +241,14 @@ class M20StairTeacherRewardsCfg(DeeproboticsM20RewardsCfg):
         func=stair_teacher.stair_descent_entry_position_cost,
         weight=stair_teacher.TUNING["entry_range_cost_weight"], params=_gait_entities(),
     )
+    stair_descent_entry_front_lead_reward = RewTerm(
+        func=stair_teacher.stair_descent_entry_front_lead_reward,
+        weight=stair_teacher.TUNING["entry_front_lead_weight"], params=_gait_entities(),
+    )
+    stair_descent_entry_rear_early_transfer_cost = RewTerm(
+        func=stair_teacher.stair_descent_entry_rear_early_transfer_cost,
+        weight=stair_teacher.TUNING["entry_rear_early_transfer_weight"], params=_gait_entities(),
+    )
     stair_ascent_front_body_clearance_cost = RewTerm(
         func=stair_teacher.ascent_front_body_clearance_cost,
         weight=stair_teacher.TUNING["body_gap_weight"], params=_gait_entities(),
@@ -323,6 +330,21 @@ class M20StairTeacherRewardsCfg(DeeproboticsM20RewardsCfg):
     stair_descent_rear_support = RewTerm(
         func=stair_teacher.stair_descent_rear_support,
         weight=0.35,
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot", body_names=["fl_wheel", "fr_wheel", "hl_wheel", "hr_wheel"], preserve_order=True
+            ),
+            "sensor_cfg": SceneEntityCfg("height_scanner"),
+            "contact_sensor_cfg": SceneEntityCfg(
+                "contact_forces",
+                body_names=["fl_wheel", "fr_wheel", "hl_wheel", "hr_wheel"],
+                preserve_order=True,
+            ),
+        },
+    )
+    stair_descent_entry_rear_pair_swing_cost = RewTerm(
+        func=stair_teacher.stair_descent_entry_rear_pair_swing_cost,
+        weight=stair_teacher.TUNING["entry_rear_pair_swing_cost_weight"],
         params={
             "asset_cfg": SceneEntityCfg(
                 "robot", body_names=["fl_wheel", "fr_wheel", "hl_wheel", "hr_wheel"], preserve_order=True

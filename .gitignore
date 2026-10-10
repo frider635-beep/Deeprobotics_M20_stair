@@ -21,6 +21,8 @@
 exported/
 **/runs/*
 **/logs/*
+logs/
+.scratch/
 **/recordings/*
 **/output/*
 **/outputs/*
