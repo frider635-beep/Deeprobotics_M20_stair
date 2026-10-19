@@ -16,7 +16,10 @@ from rsl_rl.algorithms import PPO
 
 class StairGuardedPPO(PPO):
     def __init__(self, *args, anchor_coefficient=0.1, critic_warmup_iterations=50,
-                 reference_std_multiplier=1.05, **kwargs):
+                 reference_std_multiplier=1.05, anchor_stair_weight=0.02,
+                 anchor_stop_weight=0.02, anchor_stop_command_epsilon=1.e-4,
+                 stop_teacher_coefficient=0.0, stop_regularization_coefficient=0.0,
+                 motion_regularization_coefficient=0.0, **kwargs):
         super().__init__(*args, **kwargs)
         if self.actor.is_recurrent or self.symmetry or self.rnd or self.is_multi_gpu:
             raise ValueError("StairGuardedPPO currently supports plain single-device MLP PPO only")
@@ -25,7 +28,21 @@ class StairGuardedPPO(PPO):
         self.anchor_coefficient = anchor_coefficient
         self.critic_warmup_iterations = critic_warmup_iterations
         self.reference_std_multiplier = reference_std_multiplier
+        if min(anchor_stair_weight, anchor_stop_weight, anchor_stop_command_epsilon) < 0:
+            raise ValueError("Preservation sample weights/epsilon must be nonnegative")
+        self.anchor_stair_weight = anchor_stair_weight
+        self.anchor_stop_weight = anchor_stop_weight
+        self.anchor_stop_command_epsilon = anchor_stop_command_epsilon
         self.reference_actor = None
+        if stop_teacher_coefficient < 0:
+            raise ValueError("Stop teacher coefficient must be nonnegative")
+        self.stop_teacher_coefficient = stop_teacher_coefficient
+        self.stop_regularization_coefficient = stop_regularization_coefficient
+        if motion_regularization_coefficient < 0:
+            raise ValueError("Motion residual regularization must be nonnegative")
+        self.motion_regularization_coefficient = motion_regularization_coefficient
+        self.stop_teacher_actor = None
+        self._stop_teacher_metrics = []
         self.guard_updates = 0
         self._anchor_losses = []
 
@@ -40,22 +57,68 @@ class StairGuardedPPO(PPO):
             raise ValueError("Preservation requires state-independent log Gaussian std")
         self.guard_updates = 0
 
+    def act(self, obs):
+        if hasattr(self.actor, "set_update_iteration"):
+            self.actor.set_update_iteration(self.guard_updates)
+        actions = super().act(obs)
+        if hasattr(self.actor, "record_rollout_sample"):
+            self.actor.record_rollout_sample(actions)
+        return actions
+
+    def set_stop_teacher(self, actor_state):
+        """Preserve a validated quiet leg policy; never copy its wheel drift."""
+        self.stop_teacher_actor = copy.deepcopy(self.actor)
+        self.stop_teacher_actor.load_state_dict(actor_state, strict=True)
+        self.stop_teacher_actor.eval().requires_grad_(False)
+
+    def _stop_teacher_loss(self, observations):
+        if self.stop_teacher_actor is None:
+            raise RuntimeError("v1_stop_v4 requires its frozen model900 stop teacher")
+        labels = observations["stop_support"]
+        stop = observations["stop_metadata"].squeeze(-1) > .5
+        mask = stop & (labels[:, 0] > .5) & (labels[:, 2] > .5)
+        with torch.no_grad():
+            clean = observations["stop_teacher"].clone()
+            # Only physically planar support is supervised. Removing the
+            # distant edge from the teacher scan preserves the quiet flat
+            # behavior when a riser is visible but not yet being traversed.
+            clean[:, 57:244] = labels[:, 3:4]
+            target = self.stop_teacher_actor({"policy": clean})[:, :12]
+            std = self.stop_teacher_actor.distribution.log_std_param[:12].exp().clamp_min(.05)
+        predicted = self.actor(observations)[:, :12]
+        error = ((predicted-target)/std).square().mean(-1)
+        loss = (error*mask).sum()/mask.sum().clamp_min(1)
+        self._stop_teacher_metrics.append((float(loss.detach()), float(mask.float().mean()),
+                                           float((mask & (labels[:, 1] > .5)).float().mean())))
+        return loss
+
     def _anchor_loss(self, observations):
         with torch.no_grad():
             target = self.reference_actor(observations)
             std = self.reference_actor.distribution.log_std_param.exp().detach().clamp_min(0.05)
-            # Keep strong preservation on flat ground. Allow larger task-driven
-            # changes on uneven terrain, including stairs in either direction.
+            # Allow the old flat-ground stop policy to change. The actor keeps
+            # its 244D input, so a small effective yaw correction is treated as
+            # a zero request when translation is absent.
             height = observations['policy'][:, 57:244]
             uneven = (height.amax(-1)-height.amin(-1)) > 0.07
-            weight = torch.where(uneven, 0.1, 1.0)
+            command = observations['policy'][:, 6:9]
+            stopping = (command[:, :2].abs().amax(-1) < self.anchor_stop_command_epsilon) & (command[:, 2].abs() <= 0.51)
+            if 'stop_metadata' in observations:
+                # v2 stores the raw request, distinguishing automatic heading
+                # correction from a deliberate small manual turn.
+                stopping = observations['stop_metadata'].squeeze(-1) > .5
+            # Do not preserve the very stair posture / idle actions being
+            # corrected by this refinement. Normal flat motion keeps a guard.
+            weight = torch.where(uneven, self.anchor_stair_weight, 1.0)
+            weight = torch.where(stopping, self.anchor_stop_weight, weight)
         predicted = self.actor(observations)
         error = ((predicted-target)/std).square().mean(-1)
         return (weight*error).mean()
 
     def update(self):
         self._anchor_losses = []
-        warmup = self.reference_actor is not None and self.guard_updates < self.critic_warmup_iterations
+        self._stop_teacher_metrics = []
+        warmup = (self.reference_actor is not None or getattr(self.actor, 'frozen_motion', False)) and self.guard_updates < self.critic_warmup_iterations
         parameters = list(self.actor.parameters())
         flags = [p.requires_grad for p in parameters]
         if warmup:
@@ -73,6 +136,11 @@ class StairGuardedPPO(PPO):
         self.guard_updates += 1
         result['anchor'] = sum(self._anchor_losses)/max(len(self._anchor_losses), 1)
         result['critic_warmup'] = float(warmup)
+        if self._stop_teacher_metrics:
+            for i, name in enumerate(("stop_teacher", "stop_teacher_sample_fraction", "stop_teacher_preview_fraction")):
+                result[name] = sum(row[i] for row in self._stop_teacher_metrics)/len(self._stop_teacher_metrics)
+        if hasattr(self.actor, "take_rollout_metrics"):
+            result.update(self.actor.take_rollout_metrics())
         return result
 
     def save(self):
@@ -80,6 +148,11 @@ class StairGuardedPPO(PPO):
         if self.reference_actor is not None:
             state['preservation_reference_actor'] = self.reference_actor.state_dict()
         state['preservation_updates'] = self.guard_updates
+        if self.stop_teacher_actor is not None:
+            state['stop_teacher_actor'] = self.stop_teacher_actor.state_dict()
+        manifest = getattr(self, "m20_training_manifest", None)
+        if manifest is not None:
+            state["m20_training_manifest"] = copy.deepcopy(manifest)
         return state
 
     def load(self, loaded_dict, load_cfg=None, strict=True):
@@ -91,16 +164,22 @@ class StairGuardedPPO(PPO):
                 group['lr'] = self.learning_rate
         # Restore auxiliary state only for a full resume, never for actor-only initialization.
         if load_cfg is None or load_cfg.get('iteration', False):
+            if 'stop_teacher_actor' in loaded_dict:
+                self.set_stop_teacher(loaded_dict['stop_teacher_actor'])
+            elif self.stop_teacher_coefficient > 0:
+                raise ValueError("v4 full resume checkpoint is missing its frozen stop teacher")
             reference = loaded_dict.get('preservation_reference_actor')
             if reference is not None:
                 self.set_reference(reference)
                 self.guard_updates = int(loaded_dict.get('preservation_updates', 0))
-            else:
+            elif not getattr(self.actor, 'frozen_motion', False):
                 # Legacy checkpoints also support play/full resume. Freeze the
                 # actor being loaded, rather than silently disabling every guard.
                 # Training should load a task-capable checkpoint; the CLI can
                 # explicitly replace this reference with --preserve_actor_from.
                 self.set_reference(loaded_dict['actor_state_dict'])
+            if getattr(self.actor, 'frozen_motion', False):
+                self.guard_updates = int(loaded_dict.get('preservation_updates', 0))
         return result
 
     def _guarded_update(self) -> dict[str, float]:
@@ -210,6 +289,12 @@ class StairGuardedPPO(PPO):
                 anchor_loss = self._anchor_loss(batch.observations)
                 loss = loss + self.anchor_coefficient * anchor_loss
                 self._anchor_losses.append(float(anchor_loss.detach()))
+            if self.stop_teacher_coefficient > 0 and self.guard_updates >= self.critic_warmup_iterations:
+                loss = loss + self.stop_teacher_coefficient*self._stop_teacher_loss(batch.observations)
+            if self.stop_regularization_coefficient > 0 and self.guard_updates >= self.critic_warmup_iterations:
+                loss = loss+self.stop_regularization_coefficient*self.actor.stop_regularization()
+            if self.motion_regularization_coefficient > 0 and self.guard_updates >= self.critic_warmup_iterations:
+                loss = loss+self.motion_regularization_coefficient*self.actor.motion_regularization()
 
             # Symmetry loss
             if self.symmetry:

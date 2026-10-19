@@ -50,9 +50,21 @@ class M20StairTeacherObservationsCfg(ObservationsCfg):
             clip=(-1.0, 1.0),
             scale=1.0,
         )
+        velocity_commands = ObsTerm(
+            func=stair_teacher.heading_hold_velocity_commands,
+            params={"command_name": "base_velocity"},
+            clip=(-100.0, 100.0),
+            scale=1.0,
+        )
 
     @configclass
     class CriticCfg(ObservationsCfg.CriticCfg):
+        velocity_commands = ObsTerm(
+            func=stair_teacher.heading_hold_velocity_commands,
+            params={"command_name": "base_velocity"},
+            clip=(-100.0, 100.0),
+            scale=1.0,
+        )
         joint_acceleration = ObsTerm(
             func=stair_teacher.critic_joint_acceleration,
             params={"asset_cfg": SceneEntityCfg("robot", joint_names=".*", preserve_order=True)},
@@ -126,10 +138,107 @@ class M20StairTeacherRewardsCfg(DeeproboticsM20RewardsCfg):
         weight=-2.0,
         params={"asset_cfg": SceneEntityCfg("robot"), "sensor_cfg": SceneEntityCfg("height_scanner")},
     )
+    zero_command_hold_cost = RewTerm(
+        func=stair_teacher.zero_command_hold_cost,
+        weight=-1.0,
+        params={
+            "asset_cfg": SceneEntityCfg("robot"),
+            "wheel_joint_cfg": SceneEntityCfg(
+                "robot", joint_names=["fl_wheel_joint", "fr_wheel_joint", "hl_wheel_joint", "hr_wheel_joint"],
+                preserve_order=True,
+            ),
+            "leg_joint_cfg": SceneEntityCfg(
+                "robot", joint_names=[
+                    "fl_hipx_joint", "fl_hipy_joint", "fl_knee_joint",
+                    "fr_hipx_joint", "fr_hipy_joint", "fr_knee_joint",
+                    "hl_hipx_joint", "hl_hipy_joint", "hl_knee_joint",
+                    "hr_hipx_joint", "hr_hipy_joint", "hr_knee_joint",
+                ], preserve_order=True,
+            ),
+        },
+    )
+    zero_command_flat_leg_motion_cost = RewTerm(
+        func=stair_teacher.zero_command_flat_leg_motion_cost,
+        weight=-0.3,
+        params={"asset_cfg": SceneEntityCfg(
+            "robot", joint_names=[
+                "fl_hipx_joint", "fl_hipy_joint", "fl_knee_joint",
+                "fr_hipx_joint", "fr_hipy_joint", "fr_knee_joint",
+                "hl_hipx_joint", "hl_hipy_joint", "hl_knee_joint",
+                "hr_hipx_joint", "hr_hipy_joint", "hr_knee_joint",
+            ], preserve_order=True,
+        )},
+    )
+    zero_command_flat_support_cost = RewTerm(
+        func=stair_teacher.zero_command_flat_support_cost,
+        weight=-0.2,
+        params={
+            "asset_cfg": SceneEntityCfg("robot"),
+            "contact_sensor_cfg": SceneEntityCfg(
+                "contact_forces", body_names=["fl_wheel", "fr_wheel", "hl_wheel", "hr_wheel"],
+                preserve_order=True,
+            ),
+        },
+    )
+    zero_command_wheel_action_cost = RewTerm(
+        func=stair_teacher.zero_command_wheel_action_cost,
+        weight=-0.35,
+        params={"command_name": "base_velocity", "action_term_name": "joint_vel"},
+    )
+    zero_command_action_dynamics_cost = RewTerm(
+        func=stair_teacher.zero_command_action_dynamics_cost,
+        weight=-0.25,
+        params={"asset_cfg": SceneEntityCfg(
+            "robot", joint_names=[
+                "fl_hipx_joint", "fl_hipy_joint", "fl_knee_joint",
+                "fr_hipx_joint", "fr_hipy_joint", "fr_knee_joint",
+                "hl_hipx_joint", "hl_hipy_joint", "hl_knee_joint",
+                "hr_hipx_joint", "hr_hipy_joint", "hr_knee_joint",
+            ], preserve_order=True,
+        )},
+    )
+    zero_command_stair_position_cost = RewTerm(
+        func=stair_teacher.zero_command_stair_position_cost,
+        weight=-1.5,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=[
+            f"{leg}_{joint}_joint" for leg in ("fl", "fr", "hl", "hr")
+            for joint in ("hipx", "hipy", "knee")
+        ], preserve_order=True)},
+    )
     stair_ascent_direction_cost = RewTerm(
         func=stair_teacher.stair_ascent_direction_cost,
         weight=stair_teacher.TUNING["ascent_direction_weight"],
         params={k: v for k, v in _gait_entities().items() if k not in ("hip_cfg", "knee_cfg")},
+    )
+    stair_ascent_heading_cost = RewTerm(
+        func=stair_teacher.stair_ascent_heading_cost,
+        weight=-3.0,
+        params={k: v for k, v in _gait_entities().items() if k not in ("hip_cfg", "knee_cfg")},
+    )
+    stair_ascent_yaw_tracking_cost = RewTerm(
+        func=stair_teacher.stair_ascent_yaw_tracking_cost,
+        weight=-1.0,
+        params={k: v for k, v in _gait_entities().items() if k not in ("hip_cfg", "knee_cfg")},
+    )
+    stair_ascent_straight_motion_cost = RewTerm(
+        func=stair_teacher.stair_ascent_straight_motion_cost,
+        weight=stair_teacher.TUNING["ascent_straight_motion_weight"],
+        params={"asset_cfg": SceneEntityCfg("robot"), "command_name": "base_velocity"},
+    )
+    straight_flat_heading_cost = RewTerm(
+        func=stair_teacher.straight_flat_heading_cost,
+        weight=-1.0,
+        params={"command_name": "base_velocity"},
+    )
+    stair_descent_direction_cost = RewTerm(
+        func=stair_teacher.stair_descent_direction_cost,
+        weight=-0.5,
+        params={"command_name": "base_velocity"},
+    )
+    stair_descent_straight_motion_cost = RewTerm(
+        func=stair_teacher.stair_descent_straight_motion_cost,
+        weight=-1.2,
+        params={"asset_cfg": SceneEntityCfg("robot"), "command_name": "base_velocity"},
     )
     stair_front_wheel_touchdown = RewTerm(
         func=stair_teacher.stair_front_wheel_touchdown,
@@ -245,9 +354,29 @@ class M20StairTeacherRewardsCfg(DeeproboticsM20RewardsCfg):
         func=stair_teacher.stair_descent_entry_front_lead_reward,
         weight=stair_teacher.TUNING["entry_front_lead_weight"], params=_gait_entities(),
     )
+    stair_descent_entry_front_progress_reward = RewTerm(
+        func=stair_teacher.stair_descent_entry_front_progress_reward,
+        weight=stair_teacher.TUNING["entry_front_progress_weight"], params=_gait_entities(),
+    )
+    stair_descent_entry_sequence_reward = RewTerm(
+        func=stair_teacher.stair_descent_entry_sequence_reward,
+        weight=stair_teacher.TUNING["entry_sequence_weight"], params=_gait_entities(),
+    )
+    stair_descent_entry_wheel_spacing_left_cost = RewTerm(
+        func=stair_teacher.stair_descent_entry_wheel_spacing_left_cost,
+        weight=stair_teacher.TUNING["entry_wheel_spacing_left_weight"], params=_gait_entities(),
+    )
+    stair_descent_entry_wheel_spacing_right_cost = RewTerm(
+        func=stair_teacher.stair_descent_entry_wheel_spacing_right_cost,
+        weight=stair_teacher.TUNING["entry_wheel_spacing_right_weight"], params=_gait_entities(),
+    )
     stair_descent_entry_rear_early_transfer_cost = RewTerm(
         func=stair_teacher.stair_descent_entry_rear_early_transfer_cost,
         weight=stair_teacher.TUNING["entry_rear_early_transfer_weight"], params=_gait_entities(),
+    )
+    stair_descent_wheel_shank_cost = RewTerm(
+        func=stair_teacher.stair_descent_wheel_shank_cost,
+        weight=-5.0, params=_gait_entities(),
     )
     stair_ascent_front_body_clearance_cost = RewTerm(
         func=stair_teacher.ascent_front_body_clearance_cost,
@@ -293,6 +422,15 @@ class M20StairTeacherRewardsCfg(DeeproboticsM20RewardsCfg):
     stair_ascent_front_fold_cost = RewTerm(
         func=stair_teacher.ascent_front_fold_cost,
         weight=stair_teacher.TUNING["front_fold_weight"], params=_gait_entities(),
+    )
+    stair_descent_front_posture_cost = RewTerm(
+        func=stair_teacher.descent_front_posture_cost,
+        weight=stair_teacher.TUNING["descent_front_posture_weight"], params=_gait_entities(),
+    )
+    stair_descent_front_pair_cost = RewTerm(
+        func=stair_teacher.stair_descent_front_pair_cost,
+        weight=stair_teacher.TUNING["descent_front_pair_weight"],
+        params={k: v for k, v in _gait_entities().items() if k not in ("hip_cfg", "knee_cfg")},
     )
     turn_swing_size_cost = RewTerm(
         func=stair_teacher.turn_swing_size_cost,
@@ -422,15 +560,16 @@ class M20StairTeacherRewardsCfg(DeeproboticsM20RewardsCfg):
 
 @configclass
 class M20StairTeacherCurriculumCfg(CurriculumCfg):
-    """Log each terrain type without changing level promotion or rewards."""
+    """Log core diagnostics; optional detail never changes level promotion."""
 
     step_completion = CurrTerm(func=stair_teacher.stair_step_completion_metrics, params={})
     gait_quality = CurrTerm(func=stair_teacher.gait_quality_metrics, params={})
     ascent_direction = CurrTerm(func=stair_teacher.ascent_direction_metrics, params={})
+    descent_direction = CurrTerm(func=stair_teacher.descent_direction_metrics, params={})
+    zero_command_hold = CurrTerm(func=stair_teacher.zero_command_hold_metrics, params={})
 
-    terrain_level_overall = CurrTerm(
-        func=stair_teacher.stair_terrain_level_mean, params={"terrain_name": "overall"}
-    )
+    # The inherited terrain_levels term already reports the overall level.
+    terrain_level_overall = None
     terrain_level_pyramid_stairs = CurrTerm(
         func=stair_teacher.stair_terrain_level_mean, params={"terrain_name": "pyramid_stairs"}
     )
@@ -438,16 +577,16 @@ class M20StairTeacherCurriculumCfg(CurriculumCfg):
         func=stair_teacher.stair_terrain_level_mean, params={"terrain_name": "pyramid_stairs_inv"}
     )
     terrain_level_boxes = CurrTerm(
-        func=stair_teacher.stair_terrain_level_mean, params={"terrain_name": "boxes"}
+        func=stair_teacher.stair_terrain_level_mean, params={"terrain_name": "boxes", "detailed_only": True}
     )
     terrain_level_random_rough = CurrTerm(
-        func=stair_teacher.stair_terrain_level_mean, params={"terrain_name": "random_rough"}
+        func=stair_teacher.stair_terrain_level_mean, params={"terrain_name": "random_rough", "detailed_only": True}
     )
     terrain_level_hf_pyramid_slope = CurrTerm(
-        func=stair_teacher.stair_terrain_level_mean, params={"terrain_name": "hf_pyramid_slope"}
+        func=stair_teacher.stair_terrain_level_mean, params={"terrain_name": "hf_pyramid_slope", "detailed_only": True}
     )
     terrain_level_hf_pyramid_slope_inv = CurrTerm(
-        func=stair_teacher.stair_terrain_level_mean, params={"terrain_name": "hf_pyramid_slope_inv"}
+        func=stair_teacher.stair_terrain_level_mean, params={"terrain_name": "hf_pyramid_slope_inv", "detailed_only": True}
     )
     terrain_level_flat = CurrTerm(
         func=stair_teacher.stair_terrain_level_mean, params={"terrain_name": "flat"}
@@ -461,11 +600,18 @@ class DeeproboticsM20StairTeacherEnvCfg(DeeproboticsM20RoughEnvCfg):
     rewards: M20StairTeacherRewardsCfg = M20StairTeacherRewardsCfg()
     curriculum: M20StairTeacherCurriculumCfg = M20StairTeacherCurriculumCfg()
     domain_randomization_stage: int = 0
+    # Hydra: env.teacher_detailed_diagnostics=true restores detailed telemetry.
+    teacher_detailed_diagnostics: bool = False
 
     DOMAIN_RANDOMIZATION_STAGE_SCALES = (0.25, 0.50, 0.75, 1.0)
 
     def __post_init__(self):
         super().__post_init__()
+
+        # Match the actor's heading-correction command in its yaw-rate target.
+        # The command remains three-dimensional, preserving the 244D actor.
+        self.rewards.track_ang_vel_z_exp.func = stair_teacher.heading_aware_track_ang_vel_z_exp
+        self.rewards.action_smooth_l2.func = stair_teacher.teacher_action_smooth_l2
 
         # The inherited base scanner only looks beneath the trunk. Relax posture
         # when the actor's wider height scan sees a stair edge, including one
@@ -498,7 +644,8 @@ class DeeproboticsM20StairTeacherEnvCfg(DeeproboticsM20RoughEnvCfg):
 
         # Keep basic standing/turning practice while favoring traversal commands.
         self.commands.base_velocity.class_type = stair_teacher.StairTeacherVelocityCommand
-        self.commands.base_velocity.rel_zero_vel_envs = 0.05
+        self.commands.base_velocity.rel_zero_vel_envs = 0.15
+        self.commands.base_velocity.rel_only_lin_x_envs = 0.30
         self.commands.base_velocity.rel_only_ang_z_envs = 0.05
 
         # This project's known M20 USD is the teacher default. An environment
@@ -520,6 +667,16 @@ class DeeproboticsM20StairTeacherEnvCfg(DeeproboticsM20RoughEnvCfg):
             clip=(-1.0, 1.0),
             scale=1.0,
         )
+        # Keep corruption with a stop-compatible sensor budget. These are
+        # configurable assumptions, not measured hardware specifications.
+        for term_name, magnitude in (
+            ("base_ang_vel", stair_teacher.TUNING["teacher_angular_velocity_noise"]),
+            ("joint_vel", stair_teacher.TUNING["teacher_joint_velocity_noise"]),
+            ("joint_pos", stair_teacher.TUNING["teacher_joint_position_noise"]),
+            ("projected_gravity", stair_teacher.TUNING["teacher_projected_gravity_noise"]),
+        ):
+            noise = getattr(self.observations.policy, term_name).noise
+            noise.n_min, noise.n_max = -magnitude, magnitude
         for term_name in ("joint_pos", "joint_vel"):
             self.observations.critic.__getattribute__(term_name).params["asset_cfg"].joint_names = self.joint_names
 
@@ -533,8 +690,8 @@ class DeeproboticsM20StairTeacherEnvCfg(DeeproboticsM20RoughEnvCfg):
                 raise RuntimeError(f"Official rough terrain config is missing required sub-terrain: {name}")
             sub_terrains[name].step_height_range = (0.10, 0.25)
         proportions = {
-            "pyramid_stairs": 0.35,
-            "pyramid_stairs_inv": 0.35,
+            "pyramid_stairs": 0.30,
+            "pyramid_stairs_inv": 0.30,
             "boxes": 0.05,
             "random_rough": 0.05,
             "hf_pyramid_slope": 0.05,
@@ -544,7 +701,7 @@ class DeeproboticsM20StairTeacherEnvCfg(DeeproboticsM20RoughEnvCfg):
             if name not in sub_terrains:
                 raise RuntimeError(f"Official rough terrain config is missing required sub-terrain: {name}")
             sub_terrains[name].proportion = proportion
-        sub_terrains["flat"] = MeshPlaneTerrainCfg(proportion=0.10)
+        sub_terrains["flat"] = MeshPlaneTerrainCfg(proportion=0.20)
         sub_terrains["boxes"].grid_height_range = (0.025, 0.12)
         sub_terrains["random_rough"].noise_range = (0.01, 0.08)
         # Keep the small slope mix gentler than the official 0.4 gradient.

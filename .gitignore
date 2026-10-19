@@ -23,6 +23,8 @@ exported/
 **/logs/*
 logs/
 .scratch/
+docs/
+outputs/
 **/recordings/*
 **/output/*
 **/outputs/*

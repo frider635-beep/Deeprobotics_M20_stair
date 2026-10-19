@@ -20,8 +20,17 @@ import torch
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.math import quat_apply, quat_apply_inverse, yaw_quat
 
+from rl_training.teacher_diagnostics import export_teacher_metrics
+from rl_training import stop_coverage, stop_branch
+
 from .commands import UniformThresholdVelocityCommand
+from .descent_front_pair import descent_front_pair_metrics, stair_descent_front_pair_cost
 from .rewards import joint_pos_penalty
+
+
+def _detailed_teacher_diagnostics(env) -> bool:
+    """A logging choice only; rewards and physical event ledgers never depend on it."""
+    return bool(getattr(getattr(env, "cfg", None), "teacher_detailed_diagnostics", False))
 
 
 # =============================================================================
@@ -50,9 +59,10 @@ TUNING = {
     "ascent_direction_weight": -1.0,
     "direction_lateral_tolerance": 0.10, "direction_lateral_scale": 0.25,
     "direction_speed_tolerance": 0.05, "direction_speed_scale": 0.20,
-    "direction_heading_tolerance": np.deg2rad(5.0),
-    "direction_heading_scale": np.deg2rad(15.0),
-    "direction_velocity_mix": 1.0, "direction_heading_mix": 1.0,
+    "direction_heading_tolerance": np.deg2rad(3.0),
+    "direction_heading_scale": np.deg2rad(8.0),
+    "direction_heading_soft_cap": 8.0,
+    "direction_velocity_mix": 1.0, "direction_heading_mix": 2.5,
     "direction_soft_cap": 4.0,
     "direction_command_change": np.deg2rad(15.0),
     "direction_exit_inset": 0.06, "direction_exit_height_tolerance": 0.05,
@@ -94,9 +104,155 @@ TUNING = {
     "entry_rearm_time": 0.50, "entry_retract_weight": 0.75,
     "entry_range_cost_weight": -1.0,
     "entry_rear_pair_swing_cost_weight": -2.0,
-    "entry_front_lead_weight": 8.0, "entry_rear_early_transfer_weight": -1.0,
+    # Refinement: stop asking the front axle to reach the SECOND tread while
+    # the rear axle stays on the platform. That objective competes with a
+    # compact front posture. Keep the physical ledgers for diagnostics and
+    # retain the independent wheel-spacing / rear-leg collision constraints.
+    "entry_front_lead_weight": 0.0, "entry_rear_early_transfer_weight": -2.0,
+    "entry_front_progress_weight": 0.0, "entry_sequence_weight": 0.0,
+    "entry_wheel_spacing_left_weight": -3.0,
+    "entry_wheel_spacing_right_weight": -3.0,
+    "entry_wheel_spacing_min": 0.28, "entry_wheel_spacing_scale": 0.05,
+    "entry_transfer_wheel_guard": 0.34,
+    "entry_transfer_shank_guard": 0.24,
+    "entry_transfer_lookahead_s": 0.25,
+    "descent_wheel_shank_min": 0.20,
+    "descent_wheel_shank_scale": 0.05,
+    # Keep the compact warning margins, but make the final clearance much
+    # more expensive than the old linear-tail envelope. These distances are
+    # conservative geometric proxies, not measured collision mesh surfaces.
+    "interleg_wheel_critical": 0.25,
+    "interleg_shank_critical": 0.18,
+    "interleg_critical_scale": 0.02,
+    "interleg_critical_gain": 4.0,
+    "interleg_closing_speed_scale": 0.25,
+    "interleg_closing_gate": 0.03,
+    "interleg_braking_mix": 0.5,
+    "interleg_shank_proxy_radius": 0.03,
+    # On the first three descending transfers, keep the front legs near their
+    # measured flat-ground posture. Swing gets more reach and knee freedom than
+    # loaded support so the wheels can still clear and land on the next tread.
+    "descent_front_support_forward_margin": 0.03,
+    "descent_front_swing_forward_margin": 0.07,
+    "descent_front_forward_scale": 0.05,
+    "descent_front_support_knee_margin": 0.30,
+    "descent_front_swing_knee_margin": 0.50,
+    "descent_front_knee_scale": 0.35,
+    "descent_front_posture_weight": -1.5,
+    # Flexible front-axle descent: allow a brief stagger, then discourage a
+    # long one-wheel drop and the accompanying roll, without a second-tread goal.
+    "descent_front_pair_progress_tolerance": 0.20,
+    "descent_front_pair_progress_scale": 0.25,
+    "descent_front_pair_forward_tolerance": 0.05,
+    "descent_front_pair_forward_scale": 0.15,
+    "descent_front_pair_lag_grace": 0.08,
+    "descent_front_pair_lag_scale": 0.15,
+    "descent_front_pair_lag_mix": 0.6,
+    "descent_front_pair_roll_tolerance": np.deg2rad(3.0),
+    "descent_front_pair_roll_scale": np.deg2rad(5.0),
+    "descent_front_pair_roll_rate_tolerance": 0.3,
+    "descent_front_pair_roll_rate_scale": 0.6,
+    "descent_front_pair_roll_mix": 0.75,
+    "descent_front_pair_weight": -1.5,
     "entry_lead_min_spacing": 0.12, "entry_lead_max_spacing": 0.90,
     "entry_lead_wait_timeout": 3.0,
+    "stair_zero_transition_probability": 0.50,
+    "flat_zero_transition_probability": 0.50,
+    "flat_straight_practice_probability": 0.35,
+    "stair_straight_practice_probability": 0.60,
+    "stair_exit_zero_probability": 0.50,
+    "flat_height_range_max": 0.035,
+    "flat_command_duration_min": 3.0,
+    "flat_command_duration_max": 5.0,
+    "zero_command_duration_min": 6.0,
+    "zero_command_duration_max": 8.0,
+    "descent_entry_pause_probability": 0.25,
+    "descent_entry_pause_duration_min": 2.0,
+    "descent_entry_pause_duration_max": 3.0,
+    "descent_entry_restart_speed_min": 0.4,
+    "descent_entry_restart_speed_max": 0.7,
+    "descent_entry_pause_height_tolerance": 0.05,
+    "descent_entry_pause_contact_time": 0.06,
+    "zero_hold_linear_velocity_scale": 0.05,
+    "flat_zero_hold_linear_velocity_scale": 0.05,
+    "flat_zero_hold_wheel_velocity_scale": 0.07,
+    "zero_hold_brake_grace_s": 0.4,
+    "zero_hold_leg_velocity_scale": 0.40,
+    "zero_hold_yaw_velocity_scale": 0.06,
+    "zero_hold_wheel_linear_velocity_scale": 0.07,
+    "zero_hold_wheel_action_linear_scale": 0.10,
+    # Physical processed targets; these stop-specific regularizers remain
+    # active at curriculum level zero and cannot cancel between wheels.
+    "zero_hold_action_ramp_s": 0.4,
+    "zero_hold_leg_target_delta_scale": 0.008,
+    "zero_hold_leg_target_jerk_scale": 0.006,
+    "zero_hold_wheel_target_delta_scale": 0.025,
+    "zero_hold_wheel_target_jerk_scale": 0.020,
+    "zero_hold_stair_dynamics_gain": 1.0,
+    # Bounded, observable position recovery after braking on stairs. These
+    # gains are mirrored in the deployment controller, not an action filter.
+    "stair_stop_position_kp": 0.5,
+    "stair_stop_velocity_kd": 0.5,
+    "stair_stop_position_deadband": 0.02,
+    "stair_stop_velocity_deadband": 0.015,
+    "stair_stop_max_speed": 0.10,
+    "stair_stop_slew": 0.30,
+    "stair_stop_position_scale": 0.06,
+    "descent_path_kp": 0.35,
+    "descent_path_kd": 0.4,
+    "descent_path_max_lateral_speed": 0.10,
+    "descent_path_lateral_deadband": 0.03,
+    "descent_path_speed_deadband": 0.03,
+    "descent_path_lateral_slew": 0.30,
+    "zero_hold_quiet_duration_s": 1.0,
+    "quiet_leg_speed_rms": 0.10,
+    "quiet_leg_speed_max": 0.20,
+    "quiet_leg_target_delta": 0.002,
+    "quiet_leg_target_second_difference": 0.003,
+    "quiet_wheel_target_delta": 0.010,
+    "quiet_wheel_target_second_difference": 0.015,
+    "teacher_angular_velocity_noise": 0.03,
+    "teacher_joint_velocity_noise": 0.20,
+    "teacher_joint_position_noise": 0.005,
+    "teacher_projected_gravity_noise": 0.01,
+    "zero_hold_heading_tolerance": np.deg2rad(0.5),
+    "zero_hold_heading_scale": np.deg2rad(3.0),
+    "zero_hold_heading_weight": 1.0,
+    "hold_success_base_speed": 0.02,
+    "hold_success_wheel_speed": 0.03,
+    "hold_success_yaw_rate": 0.03,
+    "hold_success_heading": np.deg2rad(2.0),
+    "ascent_heading_scale": np.deg2rad(5.0),
+    "ascent_heading_tolerance": np.deg2rad(1.5),
+    "ascent_yaw_tracking_scale": 0.12,
+    "heading_hold_kp": 0.8,
+    "heading_hold_kd": 0.4,
+    "heading_hold_max_yaw_rate": 0.25,
+    "heading_hold_deadband": np.deg2rad(0.5),
+    "stair_heading_hold_kp": 1.6,
+    "stair_heading_hold_kd": 0.7,
+    "stair_heading_hold_max_yaw_rate": 0.50,
+    "stair_heading_hold_deadband": np.deg2rad(0.5),
+    "heading_hold_filter_tau": 0.04,
+    "heading_hold_exit_deadband": np.deg2rad(0.25),
+    "heading_hold_rate_enter": 0.03,
+    "heading_hold_rate_exit": 0.015,
+    "heading_hold_slew_flat": 1.5,
+    "heading_hold_slew_stairs": 3.0,
+    # Ascent-only path feedback through the existing lateral command channel.
+    "ascent_path_kp": 0.35,
+    "ascent_path_kd": 0.4,
+    "ascent_path_max_lateral_speed": 0.12,
+    "ascent_path_lateral_deadband": 0.03,
+    "ascent_path_speed_deadband": 0.03,
+    "ascent_path_lateral_slew": 0.3,
+    "ascent_path_error_tolerance": 0.05,
+    "ascent_path_error_scale": 0.15,
+    "ascent_path_velocity_error_tolerance": 0.03,
+    "ascent_path_velocity_error_scale": 0.12,
+    "ascent_forward_overspeed_tolerance": 0.15,
+    "ascent_forward_overspeed_scale": 0.25,
+    "ascent_straight_motion_weight": -1.0,
     "entry_lead_landing_inset": 0.10, "entry_lead_x_scale": 0.25,
     "entry_lead_z_scale": 0.18,
     "entry_swing_x_lower": -0.10, "entry_swing_x_upper": 0.22,
@@ -111,23 +267,343 @@ TUNING = {
 # =============================================================================
 
 class StairTeacherVelocityCommand(UniformThresholdVelocityCommand):
-    """Track translational command exposure for the stair terrain curriculum."""
+    """Track command exposure and train zero-command holds on stairs and flats."""
 
     def __init__(self, cfg, env):
         super().__init__(cfg, env)
         self.episode_commanded_translation_m = torch.zeros(self.num_envs, device=self.device)
+        # Integrate the requested world displacement separately from the total
+        # requested path. Reversal/turn practice must not look like a failed
+        # one-way traversal merely because the episode ends near its start.
+        self.episode_commanded_translation_w = torch.zeros((self.num_envs, 2), device=self.device)
+        self._stair_zero_transition_env = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._flat_zero_transition_env = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._stair_exit_zero_env = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._was_stair_area = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._entry_pause_decided_token = torch.full((self.num_envs,), -1, dtype=torch.long, device=self.device)
+        self._entry_pause_pending = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._entry_pause_until_step = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self._entry_pause_timer_expired = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._entry_pause_body_ids = None
+        self._v3_stair_timer_active = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._v4_preview_decided = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._v4_preview_pending = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._v4_preview_expired = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._v4_preview_direction = torch.ones(self.num_envs, device=self.device)
+        self.metrics["stair_zero_transition_fraction"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["flat_zero_transition_fraction"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["stair_exit_zero_fraction"] = torch.zeros(self.num_envs, device=self.device)
+        for name in ("descent_entry_pause_opportunities", "descent_entry_pause_events",
+                     "descent_entry_restart_events", "descent_entry_pause_time_fraction"):
+            self.metrics[name] = torch.zeros(self.num_envs, device=self.device)
+
+    def _resample_command(self, env_ids):
+        # Deliberately train directional-to-zero transitions on both stairs
+        # and flat terrain, in addition to the global standing command mix.
+        ids = (torch.arange(self.num_envs, device=self.device) if isinstance(env_ids, slice)
+               else torch.as_tensor(env_ids, device=self.device, dtype=torch.long))
+        previous = self.vel_command_b[ids].clone()
+        restart_preview = self._v4_preview_pending[ids] & self._v4_preview_expired[ids]
+        self._v4_preview_pending[ids] = False
+        previous_flat_stop = self._flat_zero_transition_env[ids].clone()
+        # Only expiry of our own pause may force a restart. A reset or an
+        # unrelated early resample cancels it and keeps normal command sampling.
+        restart_entry = (self._entry_pause_pending[ids] & self._entry_pause_timer_expired[ids]
+                         & (torch.linalg.vector_norm(previous[:, :2], dim=1) <= TUNING["translation_threshold"])
+                         & (previous[:, 2].abs() <= TUNING["yaw_threshold"]))
+        self._entry_pause_pending[ids] = False
+        super()._resample_command(env_ids)
+        self._stair_zero_transition_env[ids] = False
+        self._flat_zero_transition_env[ids] = False
+        self._stair_exit_zero_env[ids] = False
+        if ids.numel() == 0:
+            return
+        on_stairs = _stair_activity_mask(self._env)
+        had_motion = torch.linalg.vector_norm(previous[:, :2], dim=1) > TUNING["translation_threshold"]
+        stair_transition = (
+            on_stairs[ids]
+            & had_motion
+            & (torch.rand(ids.numel(), device=self.device)
+               < TUNING["stair_zero_transition_probability"])
+        )
+        flat = _flat_surface_mask(self._env, SceneEntityCfg("height_scanner"))[ids] & ~on_stairs[ids]
+        flat_transition = (
+            flat
+            & had_motion
+            & (torch.rand(ids.numel(), device=self.device)
+               < TUNING["flat_zero_transition_probability"])
+        )
+        # The forced stop is followed by a straight motion command, giving
+        # each flat-ground episode repeated move/stop practice.
+        restart_straight = flat & previous_flat_stop
+        sampled_motion = torch.linalg.vector_norm(self.vel_command_b[ids, :2], dim=1) > TUNING["translation_threshold"]
+        practice_straight = (
+            flat & sampled_motion & ~flat_transition & ~stair_transition
+            & (torch.rand(ids.numel(), device=self.device) < TUNING["flat_straight_practice_probability"])
+        )
+        straight_ids = ids[restart_straight | practice_straight]
+        if straight_ids.numel() > 0:
+            speed = torch.empty(straight_ids.numel(), device=self.device).uniform_(0.4, 0.8)
+            direction = torch.where(
+                torch.rand(straight_ids.numel(), device=self.device) < 0.75,
+                torch.ones_like(speed), -torch.ones_like(speed),
+            )
+            self.vel_command_b[straight_ids] = 0.0
+            self.vel_command_b[straight_ids, 0] = speed * direction
+            self.is_standing_env[straight_ids] = False
+            self.is_heading_env[straight_ids] = False
+        # Long, straight stair flights match W-only deployment. Keep the
+        # remaining samples for turning, reversing and general locomotion.
+        stair_straight = on_stairs[ids] & sampled_motion & ~stair_transition & (
+            torch.rand(ids.numel(), device=self.device) < TUNING["stair_straight_practice_probability"]
+        )
+        stair_ids = ids[stair_straight]
+        self.vel_command_b[stair_ids] = 0.0
+        self.vel_command_b[stair_ids, 0] = torch.empty(stair_ids.numel(), device=self.device).uniform_(0.4, 0.8)
+        if TUNING.get("zero_stop_v3", False):
+            # Match both W-release and S-release deployment, rather than
+            # replacing every sampled stair straight request with forward.
+            reverse = torch.rand(stair_ids.numel(), device=self.device) < .25
+            self.vel_command_b[stair_ids[reverse], 0] *= -1
+        self.is_standing_env[stair_ids] = False
+        self.is_heading_env[stair_ids] = False
+        zero_ids = ids[stair_transition | (flat_transition & ~restart_straight)]
+        self.vel_command_b[zero_ids] = 0.0
+        self.is_standing_env[zero_ids] = True
+        self.is_heading_env[zero_ids] = False
+        self._stair_zero_transition_env[ids[stair_transition]] = True
+        self._flat_zero_transition_env[ids[flat_transition & ~restart_straight]] = True
+        short_ids = ids[flat & ((restart_straight | practice_straight) | flat_transition)]
+        if short_ids.numel() > 0:
+            self.time_left[short_ids] = torch.empty(short_ids.numel(), device=self.device).uniform_(
+                TUNING["flat_command_duration_min"], TUNING["flat_command_duration_max"]
+            )
+        hold_ids = ids[(self.vel_command_b[ids].abs() <= 1.0e-6).all(dim=1)]
+        self.time_left[hold_ids] = torch.empty(hold_ids.numel(), device=self.device).uniform_(
+            TUNING["zero_command_duration_min"], TUNING["zero_command_duration_max"]
+        )
+        restart_ids = ids[restart_entry]
+        self.vel_command_b[restart_ids] = 0.0
+        self.vel_command_b[restart_ids, 0] = torch.empty(restart_ids.numel(), device=self.device).uniform_(
+            TUNING["descent_entry_restart_speed_min"], TUNING["descent_entry_restart_speed_max"]
+        )
+        self.is_standing_env[restart_ids] = False
+        self.is_heading_env[restart_ids] = False
+        self._stair_zero_transition_env[restart_ids] = False
+        self._flat_zero_transition_env[restart_ids] = False
+        self._stair_exit_zero_env[restart_ids] = False
+        self.metrics["descent_entry_restart_events"][restart_ids] += 1.0
+        if TUNING.get("zero_stop_v4", False):
+            preview_ids = ids[restart_preview]
+            self.vel_command_b[preview_ids] = 0.
+            self.vel_command_b[preview_ids, 0] = self._v4_preview_direction[preview_ids]*torch.empty(
+                preview_ids.numel(), device=self.device).uniform_(.4, .8)
+            self.is_standing_env[preview_ids] = False
+            self.is_heading_env[preview_ids] = False
+            self.time_left[preview_ids] = 2.
+        # A restart must not accidentally inherit a freshly sampled zero hold's
+        # longer duration. Subsequent changes return to the ordinary sampler.
+        self.time_left[restart_ids] = torch.empty(restart_ids.numel(), device=self.device).uniform_(
+            *self.cfg.resampling_time_range
+        )
+        if TUNING.get("zero_stop_v2", False):
+            # Resample while still on a flight, rather than usually reaching
+            # its platform before the next zero-command opportunity.
+            c = self.vel_command_b[ids]
+            motion = (on_stairs[ids] & (c[:, 0].abs() > TUNING["translation_threshold"])
+                      & (c[:, 1].abs() <= TUNING["translation_threshold"])
+                      & (c[:, 2].abs() <= TUNING["yaw_threshold"]))
+            selected = ids[motion]
+            self.time_left[selected] = torch.empty(selected.numel(), device=self.device).uniform_(1.5, 3.0)
+
+    def compute(self, dt: float):
+        # The superclass replaces time_left before invoking _resample_command.
+        # Capture the reason here: unrelated resamples must never be treated
+        # as an expired targeted pause, even after floating-point timer drift.
+        self._entry_pause_timer_expired = self._entry_pause_pending & (self.time_left <= dt)
+        self._v4_preview_expired = self._v4_preview_pending & (self.time_left <= dt)
+        try:
+            super().compute(dt)
+        finally:
+            self._entry_pause_timer_expired.zero_()
+            self._v4_preview_expired.zero_()
+
+    def _update_descent_entry_pause(self):
+        """Once per physical entry, practice a first-tread pause and restart."""
+        descent = getattr(self._env, "_m20_stair_step_state", None)
+        entry = getattr(self._env, "_m20_descent_entry_state", None)
+        if descent is None or entry is None:
+            return
+        if self._entry_pause_body_ids is None:
+            names = [f"{leg}_wheel" for leg in ("fl", "fr", "hl", "hr")]
+            body_ids, _ = self.robot.find_bodies(names, preserve_order=True)
+            contact_ids, _ = self._env.scene.sensors["contact_forces"].find_bodies(names, preserve_order=True)
+            if len(body_ids) != 4 or len(contact_ids) != 4:
+                raise ValueError("M20 entry-stop practice requires four ordered wheel bodies and contacts")
+            self._entry_pause_body_ids = (body_ids, contact_ids)
+        body_ids, contact_ids = self._entry_pause_body_ids
+        sensor = self._env.scene.sensors["contact_forces"]
+        force = sensor.data.net_forces_w[:, contact_ids]
+        loaded = (force[..., 2] > 10.0) & (force[..., 2] > 0.5 * torch.linalg.vector_norm(force, dim=-1))
+        stable = loaded & (sensor.data.current_contact_time[:, contact_ids]
+                           >= TUNING["descent_entry_pause_contact_time"])
+        center_z = self.robot.data.body_pos_w[:, body_ids, 2]
+        tolerance = TUNING["descent_entry_pause_height_tolerance"]
+        front_on_first = ((center_z[:, :2] - descent["target_z"][:, None]
+                           - TUNING["wheel_radius"]).abs() <= tolerance).all(-1)
+        rear_on_source = ((center_z[:, 2:] - descent["source_z"][:, None]
+                           - TUNING["wheel_radius"]).abs() <= tolerance).all(-1)
+        # Entry history identifies a flight entrance; the step ledger identifies
+        # a tread. Requiring the original top excludes later risers in the flight.
+        first_transfer = (descent["source_z"] - entry["top"]).abs() <= tolerance
+        command = self.vel_command_b
+        straight = ((command[:, 0] > TUNING["translation_threshold"])
+                    & (command[:, 1].abs() <= TUNING["translation_threshold"])
+                    & (command[:, 2].abs() <= TUNING["yaw_threshold"]))
+        eligible = (entry["active"] & (entry["count"] > 0)
+                    & (entry["count"] != self._entry_pause_decided_token)
+                    & descent["active"] & ~descent["up"] & descent["front_reached"].all(-1)
+                    & first_transfer & front_on_first & rear_on_source & stable.all(-1)
+                    & straight & ~self._entry_pause_pending & (self._env.episode_length_buf > 1))
+        # Decide once, including skipped samples. Repeated contact ticks must
+        # not turn a 25% probability into a nearly certain intervention.
+        self._entry_pause_decided_token[eligible] = entry["count"][eligible]
+        self.metrics["descent_entry_pause_opportunities"] += eligible
+        selected = eligible & (torch.rand(self.num_envs, device=self.device)
+                               < TUNING["descent_entry_pause_probability"])
+        ids = selected.nonzero(as_tuple=False).flatten()
+        duration = torch.empty(ids.numel(), device=self.device).uniform_(
+            TUNING["descent_entry_pause_duration_min"], TUNING["descent_entry_pause_duration_max"]
+        )
+        self.vel_command_b[ids] = 0.0
+        self.is_standing_env[ids] = True
+        self.is_heading_env[ids] = False
+        self._entry_pause_pending[ids] = True
+        self._entry_pause_until_step[ids] = (int(self._env.common_step_counter)
+                                            + torch.ceil(duration / self._env.step_dt).long())
+        self.time_left[ids] = duration
+        self._stair_zero_transition_env[ids] = True
+        self._flat_zero_transition_env[ids] = False
+        self._stair_exit_zero_env[ids] = False
+        self.metrics["descent_entry_pause_events"][ids] += 1.0
+
+    def _update_command(self):
+        # Explicit new turning/reversing requests cancel a pending practice
+        # pause before the inherited standing mask could overwrite them.
+        overridden = self._entry_pause_pending & (
+            (torch.linalg.vector_norm(self.vel_command_b[:, :2], dim=1) > TUNING["translation_threshold"])
+            | (self.vel_command_b[:, 2].abs() > TUNING["yaw_threshold"]))
+        self._entry_pause_pending[overridden] = False
+        self.is_standing_env[overridden] = False
+        if TUNING.get("zero_stop_v4", False):
+            overridden_preview = self._v4_preview_pending & (self.vel_command_b.abs().amax(-1) > 1.e-4)
+            self._v4_preview_pending[overridden_preview] = False
+            self.is_standing_env[overridden_preview] = False
+        super()._update_command()
+        on_stairs = _stair_activity_mask(self._env)
+        flat = _flat_surface_mask(self._env, SceneEntityCfg("height_scanner"))
+        reset = self._env.episode_length_buf <= 1
+        if TUNING.get("zero_stop_v4", False):
+            support = _zero_stop_support_context(self._env)
+            straight = ((self.vel_command_b[:, 0].abs() > TUNING["translation_threshold"])
+                        & (self.vel_command_b[:, 1].abs() <= TUNING["translation_threshold"])
+                        & (self.vel_command_b[:, 2].abs() <= TUNING["yaw_threshold"]))
+            # Decide once per episode, not once per contact tick. This creates
+            # real preview stops before the wheels touch the riser.
+            opportunity = support["preview"] & straight & ~self._v4_preview_decided & ~reset
+            self._v4_preview_decided |= opportunity
+            selected = opportunity & (torch.rand(self.num_envs, device=self.device) < .5)
+            self._v4_preview_direction[selected] = self.vel_command_b[selected, 0].sign()
+            self.vel_command_b[selected] = 0.
+            self.is_standing_env[selected] = True
+            self.is_heading_env[selected] = False
+            self._v4_preview_pending[selected] = True
+            self.time_left[selected] = torch.empty(int(selected.sum()), device=self.device).uniform_(6., 8.)
+        if TUNING.get("zero_stop_v3", False):
+            straight = ((self.vel_command_b[:, 0].abs() > TUNING["translation_threshold"])
+                        & (self.vel_command_b[:, 1].abs() <= TUNING["translation_threshold"])
+                        & (self.vel_command_b[:, 2].abs() <= TUNING["yaw_threshold"]))
+            motion = on_stairs & straight & ~reset
+            entering = motion & ~self._v3_stair_timer_active
+            ids = entering.nonzero(as_tuple=False).flatten()
+            # Arm once on physical stair entry as well as at resampling. A
+            # long command sampled on the platform must not span the flight.
+            duration = torch.empty(ids.numel(), device=self.device).uniform_(1.5, 3.)
+            self.time_left[ids] = torch.minimum(self.time_left[ids], duration)
+            self._v3_stair_timer_active = motion.clone()
+        leaving = self._was_stair_area & ~on_stairs & flat & (
+            self.vel_command_b[:, 0] > TUNING["translation_threshold"]
+        ) & ~reset
+        stop = leaving & (torch.rand(self.num_envs, device=self.device) < TUNING["stair_exit_zero_probability"])
+        ids = stop.nonzero(as_tuple=False).flatten()
+        if ids.numel() > 0:
+            self.vel_command_b[ids] = 0.0
+            self.is_standing_env[ids] = True
+            self.is_heading_env[ids] = False
+            self._flat_zero_transition_env[ids] = True
+            self._stair_exit_zero_env[ids] = True
+            self.time_left[ids] = torch.empty(ids.numel(), device=self.device).uniform_(
+                TUNING["zero_command_duration_min"], TUNING["zero_command_duration_max"]
+            )
+        self._was_stair_area = on_stairs.clone()
+        self._was_stair_area[reset] = False
+        self._update_descent_entry_pause()
 
     def _update_metrics(self):
         super()._update_metrics()
         self.episode_commanded_translation_m += (
             torch.linalg.vector_norm(self.vel_command_b[:, :2], dim=1) * self._env.step_dt
         )
+        translation = torch.zeros((self.num_envs, 3), device=self.device)
+        translation[:, :2] = self.vel_command_b[:, :2]
+        self.episode_commanded_translation_w += (
+            quat_apply(yaw_quat(self.robot.data.root_quat_w), translation)[:, :2] * self._env.step_dt
+        )
+        self.metrics["stair_zero_transition_fraction"] += self._stair_zero_transition_env.float()
+        self.metrics["flat_zero_transition_fraction"] += self._flat_zero_transition_env.float()
+        self.metrics["stair_exit_zero_fraction"] += self._stair_exit_zero_env.float()
+        self.metrics["descent_entry_pause_time_fraction"] += self._entry_pause_pending.float()
 
     def reset(self, env_ids=None):
         if env_ids is None:
             env_ids = slice(None)
+        ids = (torch.arange(self.num_envs, device=self.device) if isinstance(env_ids, slice)
+               else torch.as_tensor(env_ids, device=self.device, dtype=torch.long))
+        zero_count = self._metric_step_counter[ids].float().clamp_min(1.0)
+        zero_fraction = (
+            self.metrics["stair_zero_transition_fraction"][ids] / zero_count
+        ).mean().item()
+        flat_zero_fraction = (
+            self.metrics["flat_zero_transition_fraction"][ids] / zero_count
+        ).mean().item()
+        exit_zero_fraction = (
+            self.metrics["stair_exit_zero_fraction"][ids] / zero_count
+        ).mean().item()
+        entry_pause_fraction = (
+            self.metrics["descent_entry_pause_time_fraction"][ids] / zero_count
+        ).mean().item()
         self.episode_commanded_translation_m[env_ids] = 0.0
-        return super().reset(env_ids)
+        self.episode_commanded_translation_w[env_ids] = 0.0
+        self._entry_pause_decided_token[ids] = -1
+        self._entry_pause_pending[ids] = False
+        self._entry_pause_until_step[ids] = 0
+        self._entry_pause_timer_expired[ids] = False
+        self._v4_preview_decided[ids] = False
+        self._v4_preview_pending[ids] = False
+        self._v4_preview_expired[ids] = False
+        if TUNING.get("zero_stop_v4", False):
+            self._env._m20_stop_support = None
+        if TUNING.get('zero_stop_v5', False):
+            self._env._m20_fast_flat_cache = None
+            self._env._m20_stop_control_observation = None
+        if TUNING.get("zero_stop_v3", False):
+            self._v3_stair_timer_active[ids] = False
+        extras = super().reset(env_ids)
+        extras["stair_zero_transition_fraction"] = zero_fraction
+        extras["flat_zero_transition_fraction"] = flat_zero_fraction
+        extras["stair_exit_zero_fraction"] = exit_zero_fraction
+        extras["descent_entry_pause_time_fraction"] = entry_pause_fraction
+        return extras
 
 
 def critic_joint_acceleration(env, asset_cfg: SceneEntityCfg) -> torch.Tensor:
@@ -298,6 +774,38 @@ def _stair_scan_context(
     stats["nearby"] += (terrain_gate > 0).to(stats["nearby"].dtype)
     setattr(env, "_m20_stair_scan_context", {"counter": counter, "sensor_name": sensor_cfg.name, "context": context})
     return context
+
+
+def _flat_surface_mask(env, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
+    """Require a valid, nearly level support patch under the body."""
+    cache = getattr(env, "_m20_fast_flat_cache", None)
+    tick = (int(getattr(env, 'common_step_counter', -1)), sensor_cfg.name)
+    if TUNING.get("zero_stop_fast_stats", False) and cache is not None and cache[0] == tick:
+        return cache[1]
+    sensor = env.scene[sensor_cfg.name]
+    starts = torch.as_tensor(sensor.ray_starts, device=env.device)
+    if starts.ndim == 3:
+        starts = starts[0]
+    patch = (starts[:, 0].abs() <= 0.45) & (starts[:, 1].abs() <= 0.35)
+    heights = sensor.data.ray_hits_w[:, patch, 2]
+    valid = torch.isfinite(heights) & (heights.abs() < 1.0e6)
+    low = torch.where(valid, heights, torch.inf).amin(dim=1)
+    high = torch.where(valid, heights, -torch.inf).amax(dim=1)
+    flat = valid.all(dim=1) & ((high - low) <= TUNING["flat_height_range_max"])
+    if TUNING.get("zero_stop_fast_stats", False):
+        env._m20_fast_flat_cache = (tick, flat)
+    return flat
+
+
+def _stair_activity_mask(env) -> torch.Tensor:
+    """Include nearby risers and active step ledgers while crossing a flight."""
+    scan = _stair_scan_context(env, SceneEntityCfg("height_scanner"))
+    on_stairs = scan["terrain_gate"] > 0.0
+    for name in ("_m20_stair_step_state", "_m20_ascent_state", "_m20_descent_entry_state"):
+        state = getattr(env, name, None)
+        if state is not None and "active" in state:
+            on_stairs |= state["active"].bool()
+    return on_stairs
 
 
 # =============================================================================
@@ -911,7 +1419,8 @@ def _update_rear_angle_histograms(env,b,g,loaded,swing):
 
 def stair_rear_wheel_lift(env, asset_cfg, sensor_cfg, contact_sensor_cfg, command_name="base_velocity"):
     """One bounded preparation budget per rear target; no cyclic leg-dance pay."""
-    return ascent_state(env,asset_cfg,sensor_cfg,contact_sensor_cfg,command_name)["rear_lift_gain"] / env.step_dt
+    gain = ascent_state(env,asset_cfg,sensor_cfg,contact_sensor_cfg,command_name)["rear_lift_gain"]
+    return gain * _stair_forward_command_gate(env, command_name) / env.step_dt
 
 
 
@@ -940,6 +1449,11 @@ def stair_terrain_aware_orientation_cost(
             & ~state["rear_support_paid"].all(dim=1)
         )
     stair_gate = torch.maximum(context["terrain_gate"], descent_rear_follow.float())
+    if TUNING.get("zero_stop_v4", False):
+        raw_zero = env.command_manager.get_command(command_name).abs().amax(-1) <= 1.e-4
+        flat_stop = raw_zero & _zero_stop_support_context(env)["flat"]
+        stair_gate = torch.where(flat_stop, 0., stair_gate)
+        descent_rear_follow &= ~flat_stop
     effective_weight = flat_weight * (1.0 - stair_gate) + stair_weight * stair_gate
     # During rear follow, pitch is needed to transfer support down a step.
     tilt = torch.where(descent_rear_follow, gravity[:, 1].square(), gravity[:, :2].square().sum(dim=1))
@@ -966,6 +1480,16 @@ def stair_joint_pos_cost(
     cost = joint_pos_penalty(
         env, command_name, asset_cfg, stand_still_scale, velocity_threshold, command_threshold
     )
+    if TUNING.get("zero_stop_v2", False):
+        cmd = env.command_manager.get_command(command_name)
+        raw_zero = cmd.abs().amax(-1) <= 1.e-4
+        slow = torch.linalg.vector_norm(env.scene[asset_cfg.name].data.root_lin_vel_b[:, :2], dim=-1) <= velocity_threshold
+        # Cancel only the inherited stationary amplification, not joint limits,
+        # terrain posture envelopes or any nonzero command's original cost.
+        release = raw_zero & slow & _stair_activity_mask(env)
+        if TUNING.get("zero_stop_v4", False):
+            release &= ~_zero_stop_support_context(env)["flat"]
+        cost = torch.where(release, cost / max(float(stand_still_scale), 1.e-6), cost)
     if disable_turn_side_cmd:
         cmd = env.command_manager.get_command(command_name)
         turn = (cmd[:, 2].abs() > ang_cmd_threshold) & (torch.linalg.vector_norm(cmd[:, :2], dim=1) < xy_norm_max)
@@ -977,6 +1501,13 @@ def stair_joint_pos_cost(
         scale = torch.where(turn, turn_penalty_scale, 1.0)
         cost = cost * torch.where(side, 0.0, scale)
     gate = _stair_scan_context(env, stair_sensor_cfg, command_name)["terrain_gate"]
+    if TUNING.get("zero_stop_v4", False):
+        raw_zero = env.command_manager.get_command(command_name).abs().amax(-1) <= 1.e-4
+        gate = torch.where(raw_zero & _zero_stop_support_context(env)["flat"], 0., gate)
+    if TUNING.get('zero_stop_v5', False):
+        # A fixed flat default pose must not compete with a captured support
+        # pose. Limits/contact costs remain active, and motion is untouched.
+        cost = cost*(env.command_manager.get_command(command_name).abs().amax(-1) > 1.e-4)
     return cost * (1.0 - (1.0 - stair_penalty_scale) * gate)
 
 
@@ -1053,6 +1584,12 @@ def _stair_route_quality(env, sensor_cfg: SceneEntityCfg, command_name: str = "b
     return torch.where(active, quality, torch.ones_like(quality))
 
 
+def _stair_forward_command_gate(env, command_name: str = "base_velocity") -> torch.Tensor:
+    """Enable forward stair shaping only for a current forward-x command."""
+    command = env.command_manager.get_command(command_name)
+    return (command[:, 0] > TUNING["translation_threshold"]).to(command.dtype)
+
+
 def _ascent_direction_context(env, asset_cfg, sensor_cfg, contact_sensor_cfg,
                               command_name="base_velocity"):
     """Track ascent drift against a command-integrated heading, once per step.
@@ -1084,8 +1621,11 @@ def _ascent_direction_context(env, asset_cfg, sensor_cfg, contact_sensor_cfg,
                      previous_xy=root_xy.clone(), previous_command=command.clone(),
                      cross_track=zero(), edge_xy=zero(2), edge_heading=zero(2),
                      top_z=zero(), stats={key: zero() for key in
-                         ("samples", "lateral_sum", "speed_sum", "heading_sum",
-                          "outside_samples", "cost_sum", "max_lateral", "eligible_samples", "tail_samples")})
+                         ("samples", "lateral_sum", "speed_sum", "heading_sum", "heading_signed_sum",
+                          "outside_samples", "heading_outside_samples", "yaw_rate_sum", "yaw_rate_signed_sum", "yaw_rate_max",
+                          "cost_sum", "max_lateral", "eligible_samples", "tail_samples",
+                          "max_heading", "right_peak", "left_peak", "heading_over10", "heading_over20",
+                          "exit_heading_sum", "exit_samples", "yaw_tracking_sum", "yaw_tracking_samples")})
         env._m20_ascent_direction_state = state
     reset = env.episode_length_buf <= 1
     state["engaged"][reset] = False
@@ -1129,7 +1669,16 @@ def _ascent_direction_context(env, asset_cfg, sensor_cfg, contact_sensor_cfg,
         similarity < np.cos(TUNING["direction_command_change"]))
     after_turn = (old_norm <= TUNING["translation_threshold"]) & (
         previous[:, 2].abs() > TUNING["yaw_threshold"]) & moving_up
-    reference = torch.where(start | after_turn, actual_yaw, reference)
+    heading_state = getattr(env, "_m20_zero_hold_heading_state", None)
+    straight_up = moving_up & (command[:, 1].abs() <= TUNING["translation_threshold"]) & (
+        command[:, 2].abs() <= TUNING["yaw_threshold"]
+    )
+    start_yaw = actual_yaw if heading_state is None else torch.where(
+        straight_up, heading_state["straight_target_yaw"], actual_yaw
+    )
+    reference = torch.where(start, start_yaw, reference)
+    reference = torch.where(direction_change & straight_up, start_yaw, reference)
+    reference = torch.where(after_turn, actual_yaw, reference)
     state["cross_track"][start | direction_change | after_turn] = 0.0
     state["engaged"] |= start
     state["reference_yaw"] = reference
@@ -1144,6 +1693,11 @@ def _ascent_direction_context(env, asset_cfg, sensor_cfg, contact_sensor_cfg,
     clear = state["engaged"] & ~seen_up & loaded.all(-1) & on_top.all(-1) & (
         past > TUNING["direction_exit_inset"]).all(-1)
     heading_error = torch.atan2(torch.sin(actual_yaw - reference), torch.cos(actual_yaw - reference))
+    flight_exit = clear & state["engaged"]
+    state["stats"]["exit_heading_sum"] += heading_error.abs() * flight_exit
+    state["stats"]["exit_samples"] += flight_exit
+    measured_yaw_rate, _ = _automatic_ascent_heading_rate(env, command, robot, scan)
+    yaw_rate = measured_yaw_rate.abs()
     # A commanded turn leading onto descending terrain also ends ascent shaping;
     # an uncommanded turn away from the scan must retain its cost.
     clear |= state["engaged"] & (scan["down_gate"] > 0) & ~seen_up & (
@@ -1155,12 +1709,22 @@ def _ascent_direction_context(env, asset_cfg, sensor_cfg, contact_sensor_cfg,
     velocity = robot.data.root_lin_vel_w[:, :2]
     lateral_speed = -velocity[:, 0] * path[:, 1] + velocity[:, 1] * path[:, 0]
     active = state["engaged"] & moving_up
+    straight_active = active & (command[:, 1].abs() <= TUNING["translation_threshold"]) & (
+        command[:, 2].abs() <= TUNING["yaw_threshold"])
+    effective_command = heading_hold_velocity_commands(env, command_name)
+    yaw_tracking_error = measured_yaw_rate - effective_command[:, 2]
+    effective_body = torch.zeros_like(robot.data.root_lin_vel_b)
+    effective_body[:, :2] = effective_command[:, :2]
+    effective_world = quat_apply(robot.data.root_quat_w, effective_body)[:, :2]
+    desired_lateral_speed = -effective_world[:, 0] * path[:, 1] + effective_world[:, 1] * path[:, 0]
+    _, ascent_straight = _automatic_ascent_heading_rate(env, command, robot, scan)
+    lateral_speed_error = torch.where(ascent_straight, lateral_speed - desired_lateral_speed, lateral_speed)
     def excess(value, tolerance, scale):
         u = (value.abs() - tolerance).clamp_min(0.0) / scale
         huber = 2.0 * (torch.sqrt(1.0 + u.square()) - 1.0)
         return huber / (1.0 + huber / TUNING["direction_soft_cap"])
     cost = excess(state["cross_track"], TUNING["direction_lateral_tolerance"], TUNING["direction_lateral_scale"])
-    cost += TUNING["direction_velocity_mix"] * excess(lateral_speed, TUNING["direction_speed_tolerance"], TUNING["direction_speed_scale"])
+    cost += TUNING["direction_velocity_mix"] * excess(lateral_speed_error, TUNING["direction_speed_tolerance"], TUNING["direction_speed_scale"])
     cost += TUNING["direction_heading_mix"] * excess(heading_error, TUNING["direction_heading_tolerance"], TUNING["direction_heading_scale"])
     cost *= active
     stats = state["stats"]
@@ -1171,13 +1735,26 @@ def _ascent_direction_context(env, asset_cfg, sensor_cfg, contact_sensor_cfg,
     stats["lateral_sum"] += state["cross_track"].abs() * active
     stats["speed_sum"] += lateral_speed.abs() * active
     stats["heading_sum"] += heading_error.abs() * active
+    stats["heading_signed_sum"] += heading_error * active
     stats["outside_samples"] += (state["cross_track"].abs() > TUNING["direction_lateral_tolerance"]) & active
+    stats["heading_outside_samples"] += (heading_error.abs() > TUNING["direction_heading_tolerance"]) & active
+    stats["yaw_rate_sum"] += yaw_rate * active
+    stats["yaw_rate_signed_sum"] += measured_yaw_rate * active
+    stats["yaw_rate_max"] = torch.maximum(stats["yaw_rate_max"], yaw_rate * active)
     stats["cost_sum"] += cost
     stats["max_lateral"] = torch.maximum(stats["max_lateral"], state["cross_track"].abs() * active)
+    stats["max_heading"] = torch.maximum(stats["max_heading"], heading_error.abs() * straight_active)
+    stats["right_peak"] = torch.maximum(stats["right_peak"], (-heading_error).clamp_min(0.0) * straight_active)
+    stats["left_peak"] = torch.maximum(stats["left_peak"], heading_error.clamp_min(0.0) * straight_active)
+    stats["heading_over10"] += (heading_error.abs() > np.deg2rad(10.0)) & active
+    stats["heading_over20"] += (heading_error.abs() > np.deg2rad(20.0)) & active
+    stats["yaw_tracking_sum"] += yaw_tracking_error.abs() * straight_active
+    stats["yaw_tracking_samples"] += straight_active
     state["previous_xy"] = root_xy.clone()
     state["previous_command"] = command.clone()
     cached = dict(step=step, cost=cost, active=active, cross_track=state["cross_track"].clone(),
-                  lateral_speed=lateral_speed, heading_error=heading_error)
+                  lateral_speed=lateral_speed, heading_error=heading_error,
+                  straight_active=straight_active, yaw_tracking_error=yaw_tracking_error)
     env._m20_ascent_direction_cache = cached
     return cached
 
@@ -1188,20 +1765,91 @@ def stair_ascent_direction_cost(env, asset_cfg, sensor_cfg, contact_sensor_cfg,
     return _ascent_direction_context(env, asset_cfg, sensor_cfg, contact_sensor_cfg, command_name)["cost"]
 
 
-def ascent_direction_metrics(env, env_ids):
+def stair_ascent_heading_cost(env, asset_cfg, sensor_cfg, contact_sensor_cfg,
+                              command_name="base_velocity"):
+    """Keep large ascent heading errors distinguishable to PPO."""
+    context = _ascent_direction_context(env, asset_cfg, sensor_cfg, contact_sensor_cfg, command_name)
+    error = context["heading_error"].abs()
+    excess = (error - TUNING["ascent_heading_tolerance"]).clamp_min(0.0)
+    excess = excess / TUNING["ascent_heading_scale"]
+    huber = 2.0 * (torch.sqrt(1.0 + excess.square()) - 1.0)
+    # Linear tails keep 20/30 degree errors distinguishable without the
+    # exploding scale of a squared error. PPO compares these rewards; it
+    # does not differentiate through this expression.
+    return huber * context["active"]
+
+
+def stair_ascent_yaw_tracking_cost(env, asset_cfg, sensor_cfg, contact_sensor_cfg,
+                                  command_name="base_velocity"):
+    """Penalize failure to follow the same corrective yaw target seen by the actor."""
+    c = _ascent_direction_context(env, asset_cfg, sensor_cfg, contact_sensor_cfg, command_name)
+    u = c["yaw_tracking_error"] / TUNING["ascent_yaw_tracking_scale"]
+    return 2.0 * (torch.sqrt(1.0 + u.square()) - 1.0) * c["straight_active"]
+
+
+def straight_flat_heading_cost(env, command_name: str = "base_velocity") -> torch.Tensor:
+    """Keep the latched route after the last riser and on level approaches."""
+    command = env.command_manager.get_command(command_name)
+    robot = env.scene["robot"]
+    state, actual_yaw, _ = _zero_hold_heading_context(env, command, robot)
+    straight = (
+        (command[:, 0].abs() > TUNING["translation_threshold"])
+        & (command[:, 1].abs() <= TUNING["translation_threshold"])
+        & (command[:, 2].abs() <= TUNING["yaw_threshold"])
+    )
+    error = torch.atan2(
+        torch.sin(actual_yaw - state["straight_target_yaw"]),
+        torch.cos(actual_yaw - state["straight_target_yaw"]),
+    ).abs()
+    scaled = (error - TUNING["direction_heading_tolerance"]).clamp_min(0.0) / TUNING["direction_heading_scale"]
+    huber = 2.0 * (torch.sqrt(1.0 + scaled.square()) - 1.0)
+    flat = _flat_surface_mask(env, SceneEntityCfg("height_scanner"))
+    return huber / (1.0 + huber / TUNING["direction_heading_soft_cap"]) * (straight & flat).to(error.dtype)
+
+
+def _ascent_direction_metrics(env, env_ids):
     state = getattr(env, "_m20_ascent_direction_state", None)
     if state is None:
         return {"samples": torch.zeros((), device=env.device)}
     s = {key: value[env_ids].sum() for key, value in state["stats"].items()}
     count = s["samples"].clamp_min(1)
+    observed = (state["stats"]["yaw_tracking_samples"][env_ids] > 0).sum().clamp_min(1)
     return dict(samples=s["samples"], lateral_error_mean_m=s["lateral_sum"] / count,
                 lateral_error_max_m=state["stats"]["max_lateral"][env_ids].max(),
                 lateral_speed_mean_m_s=s["speed_sum"] / count,
                 heading_error_mean_deg=torch.rad2deg(s["heading_sum"] / count),
+                heading_error_signed_mean_deg=torch.rad2deg(s["heading_signed_sum"] / count),
+                heading_outside_tolerance_fraction=s["heading_outside_samples"] / count,
+                yaw_rate_mean_rad_s=s["yaw_rate_sum"] / count,
+                yaw_rate_signed_mean_rad_s=s["yaw_rate_signed_sum"] / count,
+                yaw_rate_max_rad_s=state["stats"]["yaw_rate_max"][env_ids].max(),
                 outside_tolerance_fraction=s["outside_samples"] / count,
                 cost_mean=s["cost_sum"] / count,
                 activation_fraction=s["samples"] / s["eligible_samples"].clamp_min(1),
-                large_error_fraction=s["tail_samples"] / count)
+                large_error_fraction=s["tail_samples"] / count,
+                heading_error_peak_mean_deg=torch.rad2deg(state["stats"]["max_heading"][env_ids].sum() / observed),
+                right_heading_peak_mean_deg=torch.rad2deg(state["stats"]["right_peak"][env_ids].sum() / observed),
+                left_heading_peak_mean_deg=torch.rad2deg(state["stats"]["left_peak"][env_ids].sum() / observed),
+                heading_over10deg_fraction=s["heading_over10"] / count,
+                heading_over20deg_fraction=s["heading_over20"] / count,
+                flight_exit_samples=s["exit_samples"],
+                flight_exit_heading_error_mean_deg=torch.rad2deg(s["exit_heading_sum"] / s["exit_samples"].clamp_min(1)),
+                yaw_tracking_error_mean_rad_s=s["yaw_tracking_sum"] / s["yaw_tracking_samples"].clamp_min(1))
+
+
+def ascent_direction_metrics(env, env_ids):
+    core = {
+        "samples", "heading_error_mean_deg", "heading_error_signed_mean_deg",
+        "heading_outside_tolerance_fraction", "heading_over10deg_fraction",
+        "heading_over20deg_fraction", "yaw_rate_mean_rad_s", "yaw_rate_signed_mean_rad_s",
+        "lateral_error_mean_m", "flight_exit_samples", "flight_exit_heading_error_mean_deg",
+        "yaw_tracking_error_mean_rad_s",
+    }
+    result = _ascent_direction_metrics(env, env_ids)
+    straight_metrics = ascent_straight_motion_metrics(env, env_ids)
+    result.update(straight_metrics)
+    core.update(straight_metrics)
+    return export_teacher_metrics(result, core, _detailed_teacher_diagnostics(env))
 
 
 def stair_forward_progress(
@@ -1212,7 +1860,7 @@ def stair_forward_progress(
 ) -> torch.Tensor:
     """Reward only new ground covered while a stair edge is visible."""
     rate, _ = _stair_new_progress(env, asset_cfg, sensor_cfg, command_name)
-    return rate * _stair_route_quality(env, sensor_cfg, command_name)
+    return rate * _stair_route_quality(env, sensor_cfg, command_name) * _stair_forward_command_gate(env, command_name)
 
 
 def _stair_front_sequence_events(
@@ -1253,7 +1901,7 @@ def stair_front_wheel_lift(
 ) -> torch.Tensor:
     """Pay bounded lift-height improvement before the expected leg lands."""
     state = ascent_state(env, asset_cfg, sensor_cfg, contact_sensor_cfg, command_name)
-    return state["front_lift_gain"] / env.step_dt
+    return state["front_lift_gain"] * _stair_forward_command_gate(env, command_name) / env.step_dt
 
 
 def stair_forward_motion_cost(
@@ -1285,6 +1933,1254 @@ def stair_forward_motion_cost(
     return gate * traversing.float() * shortfall
 
 
+def _zero_hold_heading_context(env, command, robot):
+    """Update and return the latched yaw target used during stationary commands."""
+    zero_command = (
+        (torch.linalg.vector_norm(command[:, :2], dim=1) <= TUNING["translation_threshold"])
+        & (command[:, 2].abs() <= TUNING["yaw_threshold"])
+    )
+    forward = torch.zeros((env.num_envs, 3), device=env.device)
+    forward[:, 0] = 1.0
+    body_heading = quat_apply(yaw_quat(robot.data.root_quat_w), forward)[:, :2]
+    actual_yaw = torch.atan2(body_heading[:, 1], body_heading[:, 0])
+
+    # Latch the body heading on the first zero-command frame after motion. Keep
+    # it fixed until another translation/turn command arrives. This gives the
+    # stop state its own heading target instead of reusing a stair-only target.
+    state = getattr(env, "_m20_zero_hold_heading_state", None)
+    moving_command = ~zero_command
+    straight_command = (
+        (command[:, 0].abs() > TUNING["translation_threshold"])
+        & (command[:, 1].abs() <= TUNING["translation_threshold"])
+        & (command[:, 2].abs() <= TUNING["yaw_threshold"])
+    )
+    if state is None or state["active"].shape[0] != env.num_envs:
+        state = {
+            "active": zero_command.clone(),
+            "was_moving": moving_command.clone(),
+            "target_yaw": actual_yaw.clone(),
+            "hold_start_step": torch.full((env.num_envs,), int(env.common_step_counter),
+                                           device=env.device, dtype=torch.long),
+            "reset_step": torch.full((env.num_envs,), -1, device=env.device, dtype=torch.long),
+            "straight_active": straight_command.clone(),
+            "straight_target_yaw": actual_yaw.clone(),
+            "straight_origin_xy": robot.data.root_pos_w[:, :2].clone(),
+            "stop_origin_xy": robot.data.root_pos_w[:, :2].clone(),
+            "stop_position_latched": torch.zeros(env.num_envs, device=env.device, dtype=torch.bool),
+            "straight_direction": torch.sign(command[:, 0]),
+            "error_sum": torch.zeros(env.num_envs, device=env.device),
+            "error_signed_sum": torch.zeros(env.num_envs, device=env.device),
+            "samples": torch.zeros(env.num_envs, device=env.device),
+            "max_error": torch.zeros(env.num_envs, device=env.device),
+            "base_speed_sum": torch.zeros(env.num_envs, device=env.device),
+            "base_speed_max": torch.zeros(env.num_envs, device=env.device),
+            "yaw_rate_sum": torch.zeros(env.num_envs, device=env.device),
+            "yaw_rate_signed_sum": torch.zeros(env.num_envs, device=env.device),
+            "yaw_rate_max": torch.zeros(env.num_envs, device=env.device),
+            "wheel_speed_sum": torch.zeros(env.num_envs, device=env.device),
+            "wheel_speed_max": torch.zeros(env.num_envs, device=env.device),
+            "hold_xy": robot.data.root_pos_w[:, :2].clone(),
+            "previous_hold_xy": robot.data.root_pos_w[:, :2].clone(),
+            "position_latched": torch.zeros(env.num_envs, device=env.device, dtype=torch.bool),
+            "quiet_run_s": torch.zeros(env.num_envs, device=env.device),
+            "settled_seen": {group: torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
+                             for group in ("flat", "stair")},
+            "quiet_seen": {group: torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
+                           for group in ("flat", "stair")},
+            "settled_stats": {
+                group: {key: torch.zeros(env.num_envs, device=env.device) for key in (
+                    "samples", "success", "base_speed", "wheel_speed", "heading", "yaw_rate", "drift", "path", "holds",
+                    "quiet_samples", "quiet_holds")}
+                for group in ("flat", "stair")
+            },
+        }
+        env._m20_zero_hold_heading_state = state
+    reset = (env.episode_length_buf <= 1) & (state["reset_step"] != int(env.common_step_counter))
+    state["reset_step"][reset] = int(env.common_step_counter)
+    state["active"][reset] = zero_command[reset]
+    state["was_moving"][reset] = moving_command[reset]
+    state["target_yaw"][reset] = actual_yaw[reset]
+    state["hold_start_step"][reset] = int(env.common_step_counter)
+    state["straight_active"][reset] = straight_command[reset]
+    state["straight_target_yaw"][reset] = actual_yaw[reset]
+    state["straight_origin_xy"][reset] = robot.data.root_pos_w[reset, :2]
+    state["straight_direction"][reset] = torch.sign(command[reset, 0])
+    for key in (
+        "error_sum", "error_signed_sum", "samples", "max_error", "base_speed_sum", "base_speed_max",
+        "yaw_rate_sum", "yaw_rate_signed_sum", "yaw_rate_max", "wheel_speed_sum", "wheel_speed_max",
+    ):
+        state[key][reset] = 0.0
+    for stats in state["settled_stats"].values():
+        for value in stats.values():
+            value[reset] = 0.0
+    state["position_latched"][reset | moving_command] = False
+    state["stop_position_latched"][reset | moving_command] = False
+    for seen in state["settled_seen"].values():
+        seen[reset | moving_command] = False
+    for seen in state["quiet_seen"].values():
+        seen[reset | moving_command] = False
+    state["quiet_run_s"][reset | moving_command] = 0.0
+    just_stopped = state["was_moving"] & zero_command & ~reset
+    state["target_yaw"][just_stopped] = actual_yaw[just_stopped]
+    state["hold_start_step"][just_stopped] = int(env.common_step_counter)
+    state["active"][just_stopped] = True
+    state["active"][moving_command] = False
+    # Also support episodes that begin with a zero command.
+    first_zero = zero_command & ~state["active"] & ~state["was_moving"] & ~reset
+    state["target_yaw"][first_zero] = actual_yaw[first_zero]
+    state["hold_start_step"][first_zero] = int(env.common_step_counter)
+    state["active"][first_zero] = True
+    state["was_moving"] = moving_command
+    straight_start = straight_command & ~state["straight_active"] & ~reset
+    reversed_direction = straight_command & state["straight_active"] & (
+        torch.sign(command[:, 0]) != state["straight_direction"])
+    path_start = straight_start if TUNING.get("v1_motion_baseline", False) else straight_start | reversed_direction
+    state["straight_target_yaw"][path_start] = actual_yaw[path_start]
+    state["straight_origin_xy"][path_start] = robot.data.root_pos_w[path_start, :2]
+    state["straight_direction"] = torch.sign(command[:, 0])
+    state["straight_active"] = straight_command.clone()
+    hold_active = zero_command & state["active"]
+    # Ignore the braking displacement, then latch once for the whole hold.
+    # Repeated observation/reward consumers never move this reference.
+    age = (int(env.common_step_counter) - state["hold_start_step"]) * env.step_dt
+    latch = hold_active & (age >= TUNING["zero_hold_brake_grace_s"] - 1.e-7) & ~state["stop_position_latched"]
+    state["stop_origin_xy"][latch] = robot.data.root_pos_w[latch, :2]
+    state["stop_position_latched"] |= latch
+    return state, actual_yaw, hold_active
+
+
+def _descent_direction_context(env, command_name: str = "base_velocity"):
+    """Latch a straight descent heading and accumulate per-episode yaw telemetry."""
+    step = int(env.common_step_counter)
+    cached = getattr(env, "_m20_descent_direction_cache", None)
+    if cached is not None and cached["step"] == step:
+        return cached
+
+    command = env.command_manager.get_command(command_name)
+    robot = env.scene["robot"]
+    scan = _stair_scan_context(env, SceneEntityCfg("height_scanner"), command_name)
+    forward = torch.zeros((env.num_envs, 3), device=env.device)
+    forward[:, 0] = 1.0
+    body_heading = quat_apply(yaw_quat(robot.data.root_quat_w), forward)[:, :2]
+    actual_yaw = torch.atan2(body_heading[:, 1], body_heading[:, 0])
+    straight_command = (
+        (command[:, 0] > TUNING["translation_threshold"])
+        & (command[:, 1].abs() <= TUNING["translation_threshold"])
+        & (command[:, 2].abs() <= TUNING["yaw_threshold"])
+    )
+    on_descent = scan["down_gate"] > 0.0
+    eligible = on_descent & straight_command
+
+    state = getattr(env, "_m20_descent_direction_state", None)
+    if state is None or state["active"].shape[0] != env.num_envs:
+        zero = lambda: torch.zeros(env.num_envs, device=env.device)
+        state = {
+            "active": torch.zeros(env.num_envs, dtype=torch.bool, device=env.device),
+            "reference_yaw": actual_yaw.clone(),
+            "reference_xy": robot.data.root_pos_w[:, :2].clone(),
+            "quiet_time": zero(),
+            "stats": {key: zero() for key in (
+                "samples", "heading_sum", "heading_signed_sum", "heading_outside",
+                "yaw_rate_sum", "yaw_rate_signed_sum", "yaw_rate_max",
+            )},
+        }
+        env._m20_descent_direction_state = state
+
+    reset = env.episode_length_buf <= 1
+    state["active"][reset] = False
+    state["reference_yaw"][reset] = actual_yaw[reset]
+    state["reference_xy"][reset] = robot.data.root_pos_w[reset, :2]
+    state["quiet_time"][reset] = 0.0
+    for value in state["stats"].values():
+        value[reset] = 0.0
+
+    start = eligible & ~state["active"]
+    state["reference_yaw"][start] = actual_yaw[start]
+    state["reference_xy"][start] = robot.data.root_pos_w[start, :2]
+    state["active"] |= start
+    state["quiet_time"] = torch.where(on_descent, torch.zeros_like(state["quiet_time"]),
+                                       state["quiet_time"] + env.step_dt * state["active"])
+    intentional_turn = (command[:, 1].abs() > TUNING["translation_threshold"]) | (
+        command[:, 2].abs() > TUNING["yaw_threshold"]
+    ) | (command[:, 0] < -TUNING["translation_threshold"])
+    expired = state["active"] & (state["quiet_time"] > 0.30)
+    state["active"] &= ~intentional_turn & ~expired
+
+    signed_heading_error = torch.atan2(
+        torch.sin(actual_yaw - state["reference_yaw"]),
+        torch.cos(actual_yaw - state["reference_yaw"]),
+    )
+    heading_error = signed_heading_error.abs()
+    signed_yaw_rate = robot.data.root_ang_vel_b[:, 2]
+    yaw_rate = signed_yaw_rate.abs()
+    measured = eligible & state["active"] & ~reset
+    stats = state["stats"]
+    stats["samples"] += measured
+    stats["heading_sum"] += heading_error * measured
+    stats["heading_signed_sum"] += signed_heading_error * measured
+    stats["heading_outside"] += (heading_error > TUNING["direction_heading_tolerance"]) & measured
+    stats["yaw_rate_sum"] += yaw_rate * measured
+    stats["yaw_rate_signed_sum"] += signed_yaw_rate * measured
+    stats["yaw_rate_max"] = torch.maximum(stats["yaw_rate_max"], yaw_rate * measured)
+
+    cost_u = (heading_error - TUNING["direction_heading_tolerance"]).clamp_min(0.0)
+    cost_u = cost_u / TUNING["direction_heading_scale"]
+    huber = 2.0 * (torch.sqrt(1.0 + cost_u.square()) - 1.0)
+    cost = huber / (1.0 + huber / TUNING["direction_soft_cap"])
+    cached = {"step": step, "active": state["active"], "measured": measured,
+              "heading_error": heading_error, "yaw_rate": yaw_rate, "cost": cost * measured}
+    env._m20_descent_direction_cache = cached
+    return cached
+
+
+def stair_descent_direction_cost(env, command_name: str = "base_velocity") -> torch.Tensor:
+    """Penalize heading drift from the latched route while descending straight."""
+    return _descent_direction_context(env, command_name)["cost"]
+
+
+def stair_descent_lateral_cost(env, command_name: str = "base_velocity") -> torch.Tensor:
+    """Track lateral position and velocity against the latched descent lane."""
+    context = _descent_direction_context(env, command_name)
+    state = env._m20_descent_direction_state
+    robot = env.scene["robot"]
+    yaw = state["reference_yaw"]
+    lateral = torch.stack((-torch.sin(yaw), torch.cos(yaw)), -1)
+    displacement = robot.data.root_pos_w[:, :2] - state["reference_xy"]
+    position_error = (displacement * lateral).sum(-1).abs()
+    lateral_speed = (robot.data.root_lin_vel_w[:, :2] * lateral).sum(-1).abs()
+    position = ((position_error - .04).clamp_min(0.) / .10)
+    speed = ((lateral_speed - .03).clamp_min(0.) / .12)
+    return (position.square() + .5 * speed.square()) * context["measured"]
+
+
+def _descent_direction_metrics(env, env_ids):
+    state = getattr(env, "_m20_descent_direction_state", None)
+    if state is None:
+        zero = torch.zeros((), device=env.device)
+        return {
+            "samples": zero,
+            "heading_error_mean_deg": zero,
+            "heading_error_signed_mean_deg": zero,
+            "heading_outside_tolerance_fraction": zero,
+            "yaw_rate_mean_rad_s": zero,
+            "yaw_rate_signed_mean_rad_s": zero,
+            "yaw_rate_max_rad_s": zero,
+        }
+    stats = state["stats"]
+    samples = stats["samples"][env_ids].sum()
+    count = samples.clamp_min(1.0)
+    return {
+        "samples": samples,
+        "heading_error_mean_deg": torch.rad2deg(stats["heading_sum"][env_ids].sum() / count),
+        "heading_error_signed_mean_deg": torch.rad2deg(stats["heading_signed_sum"][env_ids].sum() / count),
+        "heading_outside_tolerance_fraction": stats["heading_outside"][env_ids].sum() / count,
+        "yaw_rate_mean_rad_s": stats["yaw_rate_sum"][env_ids].sum() / count,
+        "yaw_rate_signed_mean_rad_s": stats["yaw_rate_signed_sum"][env_ids].sum() / count,
+        "yaw_rate_max_rad_s": stats["yaw_rate_max"][env_ids].max(),
+    }
+
+
+def descent_direction_metrics(env, env_ids):
+    result = _descent_direction_metrics(env, env_ids)
+    result.update(_descent_motion_metrics(env, env_ids))
+    return export_teacher_metrics(result, result.keys())
+
+
+def _automatic_descent_mask(env, command, scan):
+    """Detect straight descent without changing ascent or manual commands."""
+    descending = scan.get("down_gate", torch.zeros(env.num_envs, device=env.device)) > 0.0
+    ledger = getattr(env, "_m20_stair_step_state", None)
+    if ledger is not None:
+        descending = descending | (ledger["active"].bool() & ~ledger["up"].bool())
+    return (descending & (command[:, 0] > TUNING["translation_threshold"])
+            & (command[:, 1].abs() <= TUNING["translation_threshold"])
+            & (command[:, 2].abs() <= TUNING["yaw_threshold"]))
+
+
+def _automatic_ascent_heading_rate(env, command, robot, scan=None):
+    """Use horizontal heading rate for automatic straight ascent only.
+
+    Body-z angular velocity is not the derivative of world yaw when the base
+    pitches and rolls on a riser. Preserve the existing body-z convention for
+    flat travel, descent, zero holds and explicit turning commands. The actor's
+    angular-velocity observation also retains its original body frame.
+    """
+    if TUNING.get("v1_motion_baseline", False):
+        return robot.data.root_ang_vel_b[:, 2], torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
+    if scan is None:
+        scan = _stair_scan_context(env, SceneEntityCfg("height_scanner"), "base_velocity")
+    ascending = scan["up_gate"] > 0.0
+    ascent = getattr(env, "_m20_ascent_state", None)
+    if ascent is not None:
+        # A stale last-riser latch must not enable ascent corrections after
+        # the user has turned around and is now approaching descending stairs.
+        ascending = ascending | (ascent["active"].bool() & (scan["down_gate"] <= 0.0))
+    straight_up = (
+        (command[:, 0] > TUNING["translation_threshold"])
+        & (command[:, 1].abs() <= TUNING["translation_threshold"])
+        & (command[:, 2].abs() <= TUNING["yaw_threshold"])
+        & ascending
+    )
+    forward_body = torch.zeros_like(robot.data.root_ang_vel_b)
+    forward_body[:, 0] = 1.0
+    forward = quat_apply(robot.data.root_quat_w, forward_body)
+    omega = quat_apply(robot.data.root_quat_w, robot.data.root_ang_vel_b)
+    horizontal_squared = forward[:, :2].square().sum(-1)
+    # Heading is undefined near a vertical forward axis. Keep the original
+    # body-rate convention outside the ordinary stair posture envelope.
+    straight_up = straight_up & (horizontal_squared >= 0.25)
+    heading_rate = omega[:, 2] - forward[:, 2] * (
+        forward[:, :2] * omega[:, :2]
+    ).sum(-1) / horizontal_squared.clamp_min(0.25)
+    return torch.where(straight_up, heading_rate, robot.data.root_ang_vel_b[:, 2]), straight_up
+
+
+def heading_hold_velocity_commands(env, command_name: str = "base_velocity") -> torch.Tensor:
+    """Expose a yaw-rate correction in the existing command observation channels.
+
+    The actor input shape stays unchanged. Straight travel keeps one heading
+    through approach, stairs, and exit; zero holds latch the release heading.
+    """
+    raw_command = env.command_manager.get_command(command_name)
+    command = raw_command.clone()
+    robot = env.scene["robot"]
+    state, actual_yaw, hold_active = _zero_hold_heading_context(env, raw_command, robot)
+
+    straight = (
+        (raw_command[:, 0].abs() > TUNING["translation_threshold"])
+        & (raw_command[:, 1].abs() <= TUNING["translation_threshold"])
+        & (raw_command[:, 2].abs() <= TUNING["yaw_threshold"])
+    )
+    target_yaw = torch.where(straight, state["straight_target_yaw"], state["target_yaw"])
+    correction_active = hold_active | straight
+    scan = _stair_scan_context(env, SceneEntityCfg("height_scanner"), command_name)
+    stair_correction = correction_active & (scan["terrain_gate"] > 0.0)
+    for name in ("_m20_stair_step_state", "_m20_ascent_state", "_m20_descent_entry_state"):
+        stair_state = getattr(env, name, None)
+        if stair_state is not None and "active" in stair_state:
+            stair_correction |= correction_active & stair_state["active"].bool()
+
+    heading_error = torch.atan2(
+        torch.sin(target_yaw - actual_yaw),
+        torch.cos(target_yaw - actual_yaw),
+    )
+    yaw_rate, world_heading_rate_active = _automatic_ascent_heading_rate(env, raw_command, robot, scan)
+    automatic_descent = _automatic_descent_mask(env, raw_command, scan)
+    forward_axis = torch.zeros_like(robot.data.root_ang_vel_b)
+    forward_axis[:, 0] = 1.0
+    automatic_descent &= quat_apply(robot.data.root_quat_w, forward_axis)[:, :2].square().sum(-1) >= 0.25
+    path_active = world_heading_rate_active | automatic_descent
+    stop_feedback = hold_active & stair_correction & state["stop_position_latched"]
+    kp = torch.where(
+        stair_correction,
+        torch.full_like(heading_error, TUNING["stair_heading_hold_kp"]),
+        torch.full_like(heading_error, TUNING["heading_hold_kp"]),
+    )
+    kd = torch.where(
+        stair_correction,
+        torch.full_like(heading_error, TUNING["stair_heading_hold_kd"]),
+        torch.full_like(heading_error, TUNING["heading_hold_kd"]),
+    )
+    max_yaw_rate = torch.where(
+        stair_correction,
+        torch.full_like(heading_error, TUNING["stair_heading_hold_max_yaw_rate"]),
+        torch.full_like(heading_error, TUNING["heading_hold_max_yaw_rate"]),
+    )
+    deadband = torch.where(
+        stair_correction,
+        torch.full_like(heading_error, TUNING["stair_heading_hold_deadband"]),
+        torch.full_like(heading_error, TUNING["heading_hold_deadband"]),
+    )
+    if TUNING.get("v1_motion_baseline", False):
+        # Same direct body-z PD convention as deployment's legacy_v1 mode.
+        # No motion-route vy, world-yaw conversion, filtering or XY stop input.
+        active = correction_active & ((heading_error.abs() > deadband) | (yaw_rate.abs() > 0.03))
+        correction = (kp * heading_error - kd * yaw_rate).clamp(-max_yaw_rate, max_yaw_rate)
+        command[:, 2] = torch.where(correction_active, torch.where(active, correction, 0.0), raw_command[:, 2])
+        return command
+    # Observation and several rewards request this command in the same tick.
+    # Recompute from one pre-tick snapshot, so filters never advance once per
+    # consumer. This also handles a command resample in the same env tick.
+    mode = torch.where(straight, 1, torch.where(hold_active, 2, 0))
+    filt = getattr(env, "_m20_heading_command_filter", None)
+    step = int(env.common_step_counter)
+    if filt is None or filt["mode"].shape != mode.shape:
+        filt = dict(step=-1, mode=torch.zeros_like(mode), filtered_rate=yaw_rate.clone(),
+                    straight_direction=torch.zeros_like(raw_command[:, 0]),
+                    world_heading_rate_active=torch.zeros_like(world_heading_rate_active),
+                    correction=torch.zeros_like(yaw_rate), lateral_correction=torch.zeros_like(yaw_rate),
+                    path_active=torch.zeros_like(path_active),
+                    stop_correction=torch.zeros(env.num_envs, 2, device=env.device),
+                    active=torch.zeros_like(correction_active))
+        env._m20_heading_command_filter = filt
+    if filt["step"] != step:
+        filt["before"] = {key: filt[key].clone() for key in
+                          ("mode", "filtered_rate", "correction", "active", "world_heading_rate_active",
+                           "lateral_correction", "straight_direction", "path_active", "stop_correction")}
+        filt["step"] = step
+    before = filt["before"]
+    reset = env.episode_length_buf <= 1
+    entering = (mode != before["mode"]) & correction_active
+    reversing = straight & (before["mode"] == 1) & (
+        torch.sign(raw_command[:, 0]) != before["straight_direction"])
+    frame_changed = world_heading_rate_active != before["world_heading_rate_active"]
+    rate_before = torch.where(reset | entering | reversing | frame_changed, yaw_rate, before["filtered_rate"])
+    alpha = 1.0 - float(np.exp(-env.step_dt / TUNING["heading_hold_filter_tau"]))
+    filtered_rate = rate_before + alpha * (yaw_rate - rate_before)
+    was_active = before["active"] & ~entering & ~reversing & ~reset
+    enter = ((heading_error.abs() > deadband)
+             | (filtered_rate.abs() > TUNING["heading_hold_rate_enter"]))
+    remain = ((heading_error.abs() > TUNING["heading_hold_exit_deadband"])
+              | (filtered_rate.abs() > TUNING["heading_hold_rate_exit"]))
+    active = correction_active & torch.where(was_active, remain, enter)
+    desired = (kp * heading_error - kd * filtered_rate).clamp(-max_yaw_rate, max_yaw_rate)
+    desired = torch.where(active, desired, torch.zeros_like(desired))
+    previous = torch.where(reset | (before["mode"] == 0), torch.zeros_like(yaw_rate), before["correction"])
+    slew = torch.where(stair_correction, TUNING["heading_hold_slew_stairs"], TUNING["heading_hold_slew_flat"])
+    yaw_correction = previous + (desired - previous).clamp(-slew * env.step_dt, slew * env.step_dt)
+    # A stairs->flat transition decays smoothly from the stair limit rather
+    # than making a discontinuous second clip to the smaller flat limit.
+    yaw_correction = torch.where(correction_active, yaw_correction, torch.zeros_like(yaw_correction))
+    # Hold the same world route on either flight. A small heading error does not
+    # detect sideways wheel slip, so feedback also uses cross-track position
+    # and route-normal velocity. It only changes the existing vy channel.
+    route_normal = torch.stack((-torch.sin(state["straight_target_yaw"]),
+                                 torch.cos(state["straight_target_yaw"])), dim=-1)
+    path_error = ((robot.data.root_pos_w[:, :2] - state["straight_origin_xy"])
+                  * route_normal).sum(-1)
+    path_speed = (robot.data.root_lin_vel_w[:, :2] * route_normal).sum(-1)
+    def path_parameter(suffix):
+        return torch.where(automatic_descent, TUNING["descent_path_" + suffix],
+                           TUNING["ascent_path_" + suffix])
+    position_excess = path_error.sign() * (path_error.abs() - path_parameter("lateral_deadband")).clamp_min(0.0)
+    velocity_excess = path_speed.sign() * (path_speed.abs() - path_parameter("speed_deadband")).clamp_min(0.0)
+    lateral_limit = path_parameter("max_lateral_speed")
+    route_correction = (-path_parameter("kp") * position_excess
+                        - path_parameter("kd") * velocity_excess).clamp(-lateral_limit, lateral_limit)
+    body_lateral = (route_correction * torch.cos(actual_yaw - state["straight_target_yaw"])).clamp(-lateral_limit, lateral_limit)
+    lateral_before = torch.where(
+        reset | reversing | ~before["path_active"], torch.zeros_like(yaw_rate), before["lateral_correction"])
+    lateral_slew = path_parameter("lateral_slew") * env.step_dt
+    lateral_correction = lateral_before + (body_lateral - lateral_before).clamp(-lateral_slew, lateral_slew)
+    lateral_correction = torch.where(path_active, lateral_correction, torch.zeros_like(lateral_correction))
+    stop_error = robot.data.root_pos_w[:, :2] - state["stop_origin_xy"]
+    position_excess_xy = stop_error.sign() * (stop_error.abs() - TUNING["stair_stop_position_deadband"]).clamp_min(0.0)
+    velocity_xy = robot.data.root_lin_vel_w[:, :2]
+    velocity_excess_xy = velocity_xy.sign() * (velocity_xy.abs() - TUNING["stair_stop_velocity_deadband"]).clamp_min(0.0)
+    desired_world = (-TUNING["stair_stop_position_kp"] * position_excess_xy
+                     - TUNING["stair_stop_velocity_kd"] * velocity_excess_xy)
+    desired_world *= (TUNING["stair_stop_max_speed"]
+                      / torch.linalg.vector_norm(desired_world, dim=-1).clamp_min(TUNING["stair_stop_max_speed"]))[:, None]
+    cos_yaw, sin_yaw = torch.cos(actual_yaw), torch.sin(actual_yaw)
+    desired_body = torch.stack((desired_world[:, 0] * cos_yaw + desired_world[:, 1] * sin_yaw,
+                                -desired_world[:, 0] * sin_yaw + desired_world[:, 1] * cos_yaw), -1)
+    stop_before = torch.where((reset | entering)[:, None], 0.0, before["stop_correction"])
+    stop_slew = TUNING["stair_stop_slew"] * env.step_dt
+    stop_delta = desired_body - stop_before
+    stop_delta *= (stop_slew / torch.linalg.vector_norm(stop_delta, dim=-1).clamp_min(stop_slew))[:, None]
+    stop_correction = stop_before + stop_delta
+    stop_correction = torch.where(stop_feedback[:, None], stop_correction, 0.0)
+    filt.update(mode=mode.clone(), filtered_rate=filtered_rate, correction=yaw_correction, active=active,
+                world_heading_rate_active=world_heading_rate_active.clone(), lateral_correction=lateral_correction,
+                path_error=path_error, path_speed=path_speed,
+                path_active=path_active.clone(), automatic_descent=automatic_descent,
+                stop_correction=stop_correction, stop_feedback=stop_feedback,
+                translation_active=path_active | stop_feedback, stop_error=stop_error,
+                straight_direction=torch.sign(raw_command[:, 0]))
+    command[:, 2] = torch.where(correction_active, yaw_correction, raw_command[:, 2])
+    command[:, 1] = torch.where(path_active, lateral_correction, raw_command[:, 1])
+    command[:, :2] = torch.where(stop_feedback[:, None], stop_correction, command[:, :2])
+    return command
+
+
+def heading_aware_track_ang_vel_z_exp(
+    env, command_name: str = "base_velocity", std: float = np.sqrt(0.5),
+) -> torch.Tensor:
+    """Track explicit yaw commands plus the heading-hold correction seen by the actor."""
+    command = heading_hold_velocity_commands(env, command_name)
+    robot = env.scene["robot"]
+    measured_yaw_rate, _ = _automatic_ascent_heading_rate(
+        env, env.command_manager.get_command(command_name), robot,
+        _stair_scan_context(env, SceneEntityCfg("height_scanner"), command_name),
+    )
+    error = measured_yaw_rate - command[:, 2]
+    return torch.exp(-torch.square(error / std))
+
+
+def zero_stop_metadata(env, command_name="base_velocity"):
+    """Exact raw-stop flag stored for PPO; excluded from the 244D actor input."""
+    return (env.command_manager.get_command(command_name).abs().amax(-1) <= 1.e-4).float()[:, None]
+
+
+def raw_velocity_command_observation(env, command_name="base_velocity"):
+    """Unmodified command, for strictly gating a residual motion policy."""
+    return env.command_manager.get_command(command_name).clone()
+
+
+def zero_stop_control_observation(env, command_name="base_velocity"):
+    """Shared 24D stop reference errors; used by actor and privileged critic."""
+    cache = getattr(env, '_m20_stop_control_observation', None)
+    step = int(env.common_step_counter)
+    if cache is not None and cache[0] == step:
+        return cache[1]
+    robot = env.scene['robot']
+    contact = env.scene.sensors['contact_forces']
+    ids = getattr(env, '_m20_stop_control_ids', None)
+    if ids is None:
+        legs = ('fl', 'fr', 'hl', 'hr')
+        joints = [f'{leg}_{joint}_joint' for leg in legs for joint in ('hipx', 'hipy', 'knee')]+[f'{leg}_wheel_joint' for leg in legs]
+        names = [f'{leg}_wheel' for leg in legs]
+        ids = (robot.find_joints(joints, preserve_order=True)[0], robot.find_bodies(names, preserve_order=True)[0],
+               contact.find_bodies(names, preserve_order=True)[0])
+        env._m20_stop_control_ids = ids
+    data = robot.data
+    q = data.root_quat_w
+    yaw = torch.atan2(2*(q[:, 0]*q[:, 3]+q[:, 1]*q[:, 2]), 1-2*(q[:, 2].square()+q[:, 3].square()))
+    support = stop_branch.stable_support(data.body_pos_w[:, ids[1]], contact.data.net_forces_w[:, ids[2]],
+                                         data.root_pos_w[:, :2], data.root_lin_vel_w[:, :2])
+    reference = getattr(env, '_m20_stop_control_reference', None)
+    if reference is None:
+        reference = stop_branch.StopReference(env.step_dt)
+        env._m20_stop_control_reference = reference
+    value = reference.update(env.command_manager.get_command(command_name), data.joint_pos[:, ids[0]],
+                             data.root_pos_w[:, :2], yaw, data.root_lin_vel_b[:, :2],
+                             reset=env.episode_length_buf <= 1, support=support,
+                             joint_velocity=data.joint_vel[:, ids[0]],
+                             planar_support=(data.body_pos_w[:, ids[1], 2].amax(-1)-data.body_pos_w[:, ids[1], 2].amin(-1)) <= .03,
+                             angular_velocity=data.root_ang_vel_b)
+    env._m20_stop_control_observation = (step, value)
+    return value
+
+
+def zero_stop_pose_hold_cost(env, asset_cfg, leg_joint_cfg, wheel_joint_cfg, command_name="base_velocity"):
+    c = _zero_stop_context(env, asset_cfg, leg_joint_cfg, wheel_joint_cfg, command_name)
+    reference = getattr(env, '_m20_stop_control_reference', None)
+    if reference is None or reference.state is None:
+        return torch.zeros(env.num_envs, device=env.device)
+    state = reference.state
+    current = env.scene[asset_cfg.name].data.joint_pos[:, leg_joint_cfg.joint_ids]
+    deviation = (current-state['joints'][:, :12])/.08
+    return _zero_stop_robust(deviation).mean(-1)*state['legs_held']*(state['leg_age'] >= .4)*c['ramp']
+
+
+def zero_stop_settled_reward(env, asset_cfg, leg_joint_cfg, wheel_joint_cfg, command_name="base_velocity"):
+    c = _zero_stop_context(env, asset_cfg, leg_joint_cfg, wheel_joint_cfg, command_name)
+    cost = (c['velocity']/.03).square()+.25*(c['wheels']/.05).square().mean(-1)
+    cost += (c['drift']/.04).square()+.25*(c['leg_velocity']/.2).square().mean(-1)
+    return torch.exp(-cost)*c['ramp']
+
+
+def _zero_stop_support_context(env):
+    """Physical four-wheel planar support, independent of visible stair edges.
+
+    A flat scan alone cannot prove support; all four wheels must bear mostly
+    vertical loads for >=40ms, at one height, with a nearly upright trunk.
+    Mixed-tread, riser-only and airborne states never receive a flat pose target.
+    """
+    step = int(env.common_step_counter)
+    cache = getattr(env, "_m20_stop_support", None)
+    if cache is not None and cache["step"] == step:
+        return cache
+    robot = env.scene["robot"]
+    contact = env.scene.sensors["contact_forces"]
+    ids = getattr(env, "_m20_stop_support_ids", None)
+    if ids is None:
+        names = [f"{leg}_wheel" for leg in ("fl", "fr", "hl", "hr")]
+        ids = (robot.find_bodies(names, preserve_order=True)[0],
+               contact.find_bodies(names, preserve_order=True)[0])
+        env._m20_stop_support_ids = ids
+    wheels = robot.data.body_pos_w[:, ids[0]]
+    force = contact.data.net_forces_w[:, ids[1]]
+    loaded = (force[..., 2] > 5.) & (force[..., 2] > .7*force.norm(dim=-1))
+    loaded &= contact.data.current_contact_time[:, ids[1]] >= .04
+    upright = robot.data.projected_gravity_b[:, :2].square().sum(-1) < .12**2
+    planar = wheels[..., 2].amax(-1)-wheels[..., 2].amin(-1) <= .03
+    flat = loaded.all(-1) & planar & upright
+    hits = env.scene["height_scanner"].data.ray_hits_w[..., 2]
+    valid = torch.isfinite(hits) & (hits.abs() < 1.e6)
+    high = torch.where(valid, hits, -torch.inf).amax(-1)
+    low = torch.where(valid, hits, torch.inf).amin(-1)
+    visible = valid.all(-1) & ((high-low) > .06)
+    ground_z = wheels[..., 2].mean(-1)-TUNING["wheel_radius"]
+    flat_scan = (robot.data.root_pos_w[:, 2]-ground_z-.5).clamp(-1., 1.)
+    cache = dict(step=step, flat=flat, preview=flat & visible, visible=visible,
+                 flat_scan=flat_scan)
+    env._m20_stop_support = cache
+    return cache
+
+
+def zero_stop_support_metadata(env, command_name="base_velocity"):
+    """PPO-only [flat support, preview, post-brake eligible, flat scan value]."""
+    c = _zero_stop_support_context(env)
+    zero = env.command_manager.get_command(command_name).abs().amax(-1) <= 1.e-4
+    state = getattr(env, "_m20_zero_stop", None)
+    eligible = torch.zeros_like(zero)
+    if state is not None:
+        age = (int(env.common_step_counter)-state["start"])*env.step_dt
+        eligible = zero & state["was_zero"] & (age >= .8) & (env.episode_length_buf > 1)
+    return torch.stack((c["flat"].float(), c["preview"].float(), eligible.float(), c["flat_scan"]), -1)
+
+
+def _zero_stop_groups():
+    base = ("flat", "stair", "rough")
+    groups = base + ("stair_ascent", "stair_descent", "stair_unknown") if TUNING.get("zero_stop_v2", False) else base
+    return groups + ("support_flat", "support_preview", "support_stair") if TUNING.get("zero_stop_v4", False) else groups
+
+
+def _zero_stop_entry_terrain(env, flat, stairs):
+    scan = _stair_scan_context(env, SceneEntityCfg("height_scanner"))
+    if TUNING.get("zero_stop_v3", False):
+        return stop_coverage.classify_terrain(env, scan, flat, stairs)
+    up, down = scan["up_gate"] > 0, scan["down_gate"] > 0
+    ascent = getattr(env, "_m20_ascent_state", None)
+    descent = getattr(env, "_m20_stair_step_state", None)
+    if ascent is not None:
+        up = up | (ascent["active"].bool() & ~down)
+    if descent is not None:
+        down = down | (descent["active"].bool() & ~descent["up"].bool() & ~up)
+    kind = torch.full((env.num_envs,), 3, device=env.device, dtype=torch.long)
+    kind[flat & ~stairs] = 0
+    kind[stairs] = 4  # Ambiguous scans remain observable rather than mislabeled.
+    kind[stairs & up & ~down] = 1
+    kind[stairs & down & ~up] = 2
+    return kind
+
+
+def _zero_stop_context(env, asset_cfg, leg_joint_cfg, wheel_joint_cfg,
+                       command_name="base_velocity"):
+    """One stop ledger per tick; exact raw zero, brake, then gradual shaping.
+
+    The post-braking world position is a training measurement, never an extra
+    policy input or an XY recovery command. The actor learns to resist drift.
+    """
+    step = int(env.common_step_counter)
+    state = getattr(env, "_m20_zero_stop", None)
+    if state is not None and state["step"] == step:
+        zero_now = env.command_manager.get_command(command_name).abs().amax(-1) <= 1.e-4
+        return dict(state["context"], ramp=state["context"]["ramp"] * zero_now)
+    robot = env.scene[asset_cfg.name].data
+    command = env.command_manager.get_command(command_name)
+    zero = command.abs().amax(-1) <= 1.e-4
+    xy = robot.root_pos_w[:, :2]
+    legs = env.action_manager.get_term("joint_pos").processed_actions
+    wheels = -env.action_manager.get_term("joint_vel").processed_actions * TUNING["wheel_radius"]
+    targets = torch.cat((legs, wheels), -1)
+    if state is None:
+        z = lambda: torch.zeros(env.num_envs, device=env.device)
+        state = dict(step=-1, was_zero=torch.zeros_like(zero),
+                     start=torch.full_like(env.episode_length_buf, step),
+                     origin=xy.clone(), latched=torch.zeros_like(zero),
+                     previous=targets.clone(), older=targets.clone(),
+                     history=torch.zeros_like(env.episode_length_buf), quiet_s=z(),
+                     entry_terrain=torch.full_like(env.episode_length_buf, 3),
+                     seen=torch.zeros_like(zero), quiet_seen=torch.zeros_like(zero),
+                     stats={group: {key: z() for key in (
+                         "samples", "holds", "quiet_holds", "quiet_samples", "success",
+                         "speed", "wheel_speed", "yaw_rate", "drift", "leg_speed_sq",
+                         "leg_delta_sq", "wheel_delta_sq", "leg_second_sq", "wheel_second_sq", "wheel_target_bias_sq")}
+                            for group in _zero_stop_groups()})
+        env._m20_zero_stop = state
+        if TUNING.get('zero_stop_fast_stats', False):
+            groups = tuple(state['stats'])
+            fields = tuple(state['stats'][groups[0]])
+            buffer = targets.new_zeros((env.num_envs, len(groups), len(fields)))
+            state['stats_buffer'], state['stats_fields'] = buffer, fields
+            state['stats'] = {g: {f: buffer[:, i, j] for j, f in enumerate(fields)} for i, g in enumerate(groups)}
+    if TUNING.get("zero_stop_v4", False) and "support_seen" not in state:
+        state["support_seen"] = {group: torch.zeros_like(zero) for group in ("support_flat", "support_preview", "support_stair")}
+        state["support_quiet_seen"] = {group: torch.zeros_like(zero) for group in state["support_seen"]}
+    reset = env.episode_length_buf <= 1
+    entering = zero & (~state["was_zero"] | reset)
+    if TUNING.get("zero_stop_v4", False):
+        for fields in (state["support_seen"], state["support_quiet_seen"]):
+            for seen in fields.values():
+                seen[entering | ~zero | reset] = False
+    state["start"][entering] = step
+    state["latched"][entering | ~zero | reset] = False
+    state["seen"][entering | ~zero | reset] = False
+    state["quiet_seen"][entering | ~zero | reset] = False
+    state["quiet_s"][entering | ~zero | reset] = 0.0
+    age = (step - state["start"]) * env.step_dt
+    ramp = ((age - 0.4) / 0.4).clamp(0., 1.) * zero
+    latch = zero & (age >= 0.4 - 1.e-7) & ~state["latched"]
+    state["origin"][latch] = xy[latch]
+    state["latched"] |= latch
+    valid_rate = zero & state["was_zero"] & ~reset & (state["history"] >= 1)
+    valid_second = valid_rate & (state["history"] >= 2)
+    delta = (targets - state["previous"]) * valid_rate[:, None]
+    second = (targets - 2 * state["previous"] + state["older"]) * valid_second[:, None]
+    flat = _flat_surface_mask(env, SceneEntityCfg("height_scanner"))
+    stairs = _stair_activity_mask(env)
+    if TUNING.get("zero_stop_v2", False):
+        kind = _zero_stop_entry_terrain(env, flat, stairs)
+        state["entry_terrain"][entering] = kind[entering]
+        # Keep the stop's original terrain even if the policy rolls off stairs.
+        flat = state["entry_terrain"] == 0
+        stairs = (state["entry_terrain"] == 1) | (state["entry_terrain"] == 2) | (state["entry_terrain"] == 4)
+    effective = heading_hold_velocity_commands(env, command_name)
+    desired_wheels = effective[:, :1] + effective[:, 2:3] * command.new_tensor([[-.28, .28, -.28, .28]])
+    speed = torch.linalg.vector_norm(robot.root_lin_vel_w[:, :2], dim=-1)
+    signed_wheels = -robot.joint_vel[:, wheel_joint_cfg.joint_ids] * TUNING["wheel_radius"]
+    wheel_speed = signed_wheels.abs().amax(-1)
+    yaw_rate = robot.root_ang_vel_b[:, 2].abs()
+    leg_velocity = robot.joint_vel[:, leg_joint_cfg.joint_ids]
+    leg_speed_sq = leg_velocity.square().mean(-1)
+    drift = torch.linalg.vector_norm(xy - state["origin"], dim=-1)
+    n = legs.shape[-1]
+    hold = env._m20_zero_hold_heading_state
+    q = robot.root_quat_w
+    yaw = torch.atan2(2 * (q[:, 0] * q[:, 3] + q[:, 1] * q[:, 2]), 1 - 2 * (q[:, 2].square() + q[:, 3].square()))
+    heading_error = torch.atan2(torch.sin(yaw - hold["target_yaw"]), torch.cos(yaw - hold["target_yaw"]))
+    success = ((speed < .02) & (wheel_speed < .03) & (yaw_rate < .03)
+               & (heading_error.abs() < np.deg2rad(2)) & (drift < .03))
+    quiet = (success & (leg_speed_sq.sqrt() < .1) & (leg_velocity.abs().amax(-1) < .2)
+             & valid_second & (delta[:, :n].abs().amax(-1) < .002)
+             & (delta[:, n:].abs().amax(-1) < .010)
+             & (second[:, :n].abs().amax(-1) < .003)
+             & (second[:, n:].abs().amax(-1) < .015))
+    measured = zero & (age >= .8 - 1.e-7) & ~reset
+    state["quiet_s"] = torch.where(measured & quiet, state["quiet_s"] + env.step_dt, 0.)
+    sustained = state["quiet_s"] >= 1. - 1.e-6
+    terrains = {"flat": flat & ~stairs, "stair": stairs, "rough": ~flat & ~stairs}
+    if TUNING.get("zero_stop_v2", False):
+        terrains.update(stair_ascent=state["entry_terrain"] == 1,
+                        stair_descent=state["entry_terrain"] == 2,
+                        stair_unknown=state["entry_terrain"] == 4)
+    support = None
+    if TUNING.get("zero_stop_v4", False):
+        support = _zero_stop_support_context(env)
+        # Live physical groups complement, rather than overwrite, entry labels.
+        terrains.update(support_flat=support["flat"] & ~support["visible"],
+                        support_preview=support["preview"],
+                        support_stair=~support["flat"] & _stair_activity_mask(env))
+    if TUNING.get('zero_stop_fast_stats', False):
+        groups, fields = tuple(state['stats']), state['stats_fields']
+        masks = torch.stack([measured & terrains[g] for g in groups], -1)
+        values = dict(samples=torch.ones_like(speed), holds=~state['seen'],
+                      quiet_holds=sustained & ~state['quiet_seen'], quiet_samples=sustained,
+                      success=success, speed=speed, wheel_speed=wheel_speed, yaw_rate=yaw_rate,
+                      drift=drift, leg_speed_sq=leg_speed_sq,
+                      leg_delta_sq=delta[:, :n].square().mean(-1), wheel_delta_sq=delta[:, n:].square().mean(-1),
+                      leg_second_sq=second[:, :n].square().mean(-1), wheel_second_sq=second[:, n:].square().mean(-1),
+                      wheel_target_bias_sq=(wheels-desired_wheels).square().mean(-1))
+        increments = torch.stack([values[f].float() for f in fields], -1)[:, None, :]*masks[:, :, None]
+        for i, group in enumerate(groups):
+            if group.startswith('support_'):
+                increments[:, i, fields.index('holds')] = masks[:, i] & ~state['support_seen'][group]
+                increments[:, i, fields.index('quiet_holds')] = masks[:, i] & sustained & ~state['support_quiet_seen'][group]
+                state['support_seen'][group] |= masks[:, i]
+                state['support_quiet_seen'][group] |= masks[:, i] & sustained
+        state['stats_buffer'].masked_fill_(reset[:, None, None], 0.)
+        state['stats_buffer'].add_(increments)
+    else:
+        for group, terrain in terrains.items():
+            stats = state["stats"][group]
+            mask = measured & terrain
+            for value in stats.values():
+                value[reset] = 0.
+            values = dict(samples=torch.ones_like(speed), holds=(~state["seen"]),
+                          quiet_holds=sustained & ~state["quiet_seen"], quiet_samples=sustained,
+                          success=success, speed=speed, wheel_speed=wheel_speed, yaw_rate=yaw_rate,
+                          drift=drift, leg_speed_sq=leg_speed_sq,
+                          leg_delta_sq=delta[:, :n].square().mean(-1), wheel_delta_sq=delta[:, n:].square().mean(-1),
+                          leg_second_sq=second[:, :n].square().mean(-1), wheel_second_sq=second[:, n:].square().mean(-1),
+                          wheel_target_bias_sq=(wheels - desired_wheels).square().mean(-1))
+            if group.startswith("support_"):
+                # A stop can enter another physical group after its first sample.
+                # Count one observed hold per group, not only in the initial one.
+                values["holds"] = ~state["support_seen"][group]
+                values["quiet_holds"] = sustained & ~state["support_quiet_seen"][group]
+                state["support_seen"][group] |= mask
+                state["support_quiet_seen"][group] |= mask & sustained
+            for key, value in values.items():
+                stats[key] += value * mask
+    state["seen"] |= measured
+    state["quiet_seen"] |= measured & sustained
+    state["history"] = torch.where(zero & ~entering, state["history"] + 1, zero.long())
+    if TUNING.get("zero_stop_v3", False):
+        coverage = getattr(env, "_m20_stop_coverage", None)
+        if coverage is None:
+            coverage = stop_coverage.StopCoverage(env)
+            env._m20_stop_coverage = coverage
+        coverage.update(env, command, kind, state["entry_terrain"], measured, sustained)
+    state.update(step=step, was_zero=zero.clone(), older=state["previous"].clone(), previous=targets.clone())
+    # Losing one contact on otherwise plain ground must not remove the old
+    # flat quiet constraint. Physical evidence adds the visible-edge case.
+    quiet_flat = (support["flat"] | (_flat_surface_mask(env, SceneEntityCfg("height_scanner"))
+                                   & ~support["visible"])) if support is not None else flat & ~stairs
+    context = dict(ramp=ramp, flat=quiet_flat, velocity=speed, wheels=signed_wheels - desired_wheels,
+                   yaw=robot.root_ang_vel_b[:, 2] - effective[:, 2], heading=heading_error,
+                   leg_velocity=leg_velocity, delta=delta, second=second, leg_count=n, drift=drift,
+                   wheel_target_residual=wheels - desired_wheels)
+    state["context"] = context
+    return context
+
+
+def _zero_stop_robust(value):
+    return 2 * (torch.sqrt(1 + value.square()) - 1)
+
+
+def zero_stop_velocity_cost(env, asset_cfg, leg_joint_cfg, wheel_joint_cfg, command_name="base_velocity"):
+    c = _zero_stop_context(env, asset_cfg, leg_joint_cfg, wheel_joint_cfg, command_name)
+    tolerance = .002 if TUNING.get("zero_stop_v4", False) else .005
+    cost = _zero_stop_robust((c["velocity"] - tolerance).clamp_min(0.) / .05)
+    cost += .5 * _zero_stop_robust(c["wheels"] / .07).mean(-1)
+    cost += _zero_stop_robust(c["yaw"] / .06)
+    cost += _zero_stop_robust((c["heading"].abs() - np.deg2rad(.5)).clamp_min(0.) / np.deg2rad(3))
+    return cost * c["ramp"]
+
+
+def zero_stop_position_cost(env, asset_cfg, leg_joint_cfg, wheel_joint_cfg, command_name="base_velocity"):
+    c = _zero_stop_context(env, asset_cfg, leg_joint_cfg, wheel_joint_cfg, command_name)
+    tolerance = .005 if TUNING.get("zero_stop_v4", False) else .02
+    return _zero_stop_robust((c["drift"] - tolerance).clamp_min(0.) / .06) * c["ramp"]
+
+
+def zero_stop_wheel_target_cost(env, asset_cfg, leg_joint_cfg, wheel_joint_cfg, command_name="base_velocity"):
+    """Discourage constant drive and opposing-wheel targets after braking.
+
+    A soft 0.01m/s allowance and the existing yaw target retain balancing and
+    corrective authority. This is not an actuator clamp or a frozen pose.
+    """
+    c = _zero_stop_context(env, asset_cfg, leg_joint_cfg, wheel_joint_cfg, command_name)
+    excess = (c["wheel_target_residual"].abs() - .01).clamp_min(0.) / .05
+    return _zero_stop_robust(excess).mean(-1) * c["ramp"]
+
+
+def zero_stop_chatter_cost(env, asset_cfg, leg_joint_cfg, wheel_joint_cfg, command_name="base_velocity"):
+    c = _zero_stop_context(env, asset_cfg, leg_joint_cfg, wheel_joint_cfg, command_name)
+    n = c["leg_count"]
+    # Stair balance corrections retain freedom; no default joint pose is latched.
+    gain = torch.where(c["flat"], 1., .25)
+    if TUNING.get('zero_stop_v5', False):
+        gain = torch.ones_like(gain)
+    cost = gain * _zero_stop_robust(c["leg_velocity"] / .4).mean(-1)
+    cost += .5 * _zero_stop_robust(c["delta"][:, :n] / .008).mean(-1)
+    cost += .5 * _zero_stop_robust(c["delta"][:, n:] / .025).mean(-1)
+    cost += _zero_stop_robust(c["second"][:, :n] / .006).mean(-1)
+    cost += _zero_stop_robust(c["second"][:, n:] / .020).mean(-1)
+    return cost * c["ramp"]
+
+
+def zero_stop_flat_stand_still(env, asset_cfg, command_name="base_velocity", command_threshold=.06):
+    """The old flat reference pose must not pull a stair stop off its supports."""
+    robot = env.scene[asset_cfg.name].data
+    deviation = (robot.joint_pos[:, asset_cfg.joint_ids] - robot.default_joint_pos[:, asset_cfg.joint_ids]).abs().sum(-1)
+    command = env.command_manager.get_command(command_name)
+    flat = _flat_surface_mask(env, SceneEntityCfg("height_scanner")) & ~_stair_activity_mask(env)
+    if TUNING.get("zero_stop_v4", False):
+        raw_zero = command.abs().amax(-1) <= 1.e-4
+        flat = torch.where(raw_zero, flat | _zero_stop_support_context(env)["flat"], flat)
+    if TUNING.get('zero_stop_v5', False):
+        flat &= command.abs().amax(-1) > 1.e-4
+    return deviation * (torch.linalg.vector_norm(command, dim=-1) < command_threshold) * flat
+
+
+def zero_stop_metrics(env, env_ids):
+    state = getattr(env, "_m20_zero_stop", None)
+    result = {}
+    for group in _zero_stop_groups():
+        raw = state["stats"][group] if state is not None else {}
+        s = {k: v[env_ids].sum() for k, v in raw.items()}
+        count = s.get("samples", torch.zeros((), device=env.device))
+        result[f"{group}_samples"] = count
+        holds = s.get("holds", torch.zeros_like(count))
+        result[f"{group}_holds"] = holds
+        for key, name in (("speed", "base_speed_m_s"), ("wheel_speed", "max_wheel_speed_m_s"),
+                          ("yaw_rate", "yaw_rate_rad_s"), ("drift", "drift_mean_m"),
+                          ("success", "success_fraction"), ("quiet_samples", "quiet_1s_fraction"),
+                          ("quiet_holds", "holds_reached_quiet_1s_fraction"),
+                          ("leg_speed_sq", "leg_speed_rms_rad_s"),
+                          ("leg_delta_sq", "leg_target_delta_rms_rad"), ("wheel_delta_sq", "wheel_target_delta_rms_m_s"),
+                          ("leg_second_sq", "leg_target_second_difference_rms_rad"), ("wheel_second_sq", "wheel_target_second_difference_rms_m_s"),
+                          ("wheel_target_bias_sq", "wheel_target_bias_rms_m_s")):
+            denom = holds if key == "quiet_holds" else count
+            total = s.get(key, torch.zeros_like(count))
+            rms = key.endswith("_sq")
+            value = total / denom.clamp_min(1.)
+            metric = f"{group}_{name}"
+            result[metric] = value.sqrt() if rms else value
+            prefix = "__rms" if rms else "__weighted"
+            result[f"{prefix}_total__/{metric}"] = total
+            result[f"{prefix}_count__/{metric}"] = denom
+    coverage = getattr(env, "_m20_stop_coverage", None)
+    if TUNING.get("zero_stop_v3", False) and coverage is not None:
+        result.update(coverage.metrics(env_ids))
+    return export_teacher_metrics(result, result.keys())
+
+
+def _zero_hold_targets_quiet(env) -> torch.Tensor:
+    """Read target history without advancing the action-dynamics consumer."""
+    state = getattr(env, "_m20_stop_action_dynamics", None)
+    if state is None:
+        return torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
+    before = state["before"] if state["step"] == int(env.common_step_counter) else state
+    legs = env.action_manager.get_term("joint_pos").processed_actions
+    wheels = -env.action_manager.get_term("joint_vel").processed_actions * TUNING["wheel_radius"]
+    targets = torch.cat((legs, wheels), dim=-1)
+    delta = (targets - before["previous"]).abs()
+    second = (targets - 2.0 * before["previous"] + before["older"]).abs()
+    n = legs.shape[-1]
+    return ((before["history"] >= 2) & (env.episode_length_buf > 1)
+            & (delta[:, :n].amax(-1) < TUNING["quiet_leg_target_delta"])
+            & (delta[:, n:].amax(-1) < TUNING["quiet_wheel_target_delta"])
+            & (second[:, :n].amax(-1) < TUNING["quiet_leg_target_second_difference"])
+            & (second[:, n:].amax(-1) < TUNING["quiet_wheel_target_second_difference"]))
+
+
+def zero_command_hold_cost(
+    env, asset_cfg: SceneEntityCfg, wheel_joint_cfg: SceneEntityCfg,
+    command_name: str = "base_velocity", leg_joint_cfg: SceneEntityCfg | None = None,
+) -> torch.Tensor:
+    """Penalize drift, wheel activity, and heading error while a zero command is held."""
+    command = env.command_manager.get_command(command_name)
+    robot = env.scene[asset_cfg.name]
+    state, actual_yaw, hold_active = _zero_hold_heading_context(env, command, robot)
+
+    body_speed = torch.linalg.vector_norm(robot.data.root_lin_vel_w[:, :2], dim=1)
+    yaw_speed = robot.data.root_ang_vel_b[:, 2].abs()
+    wheel_speed = robot.data.joint_vel[:, wheel_joint_cfg.joint_ids].abs() * TUNING["wheel_radius"]
+    wheel_speed_mean = wheel_speed.mean(dim=1)
+    wheel_speed_max = wheel_speed.max(dim=1).values
+    flat = _flat_surface_mask(env, SceneEntityCfg("height_scanner"))
+    linear_scale = TUNING["zero_hold_linear_velocity_scale"] + flat.to(body_speed.dtype) * (
+        TUNING["flat_zero_hold_linear_velocity_scale"] - TUNING["zero_hold_linear_velocity_scale"]
+    )
+    wheel_scale = TUNING["zero_hold_wheel_linear_velocity_scale"] + flat.to(body_speed.dtype) * (
+        TUNING["flat_zero_hold_wheel_velocity_scale"] - TUNING["zero_hold_wheel_linear_velocity_scale"]
+    )
+    def robust(value):
+        return 2.0 * (torch.sqrt(1.0 + value.square()) - 1.0)
+
+    # A corrective turn must remain possible. Penalize yaw-rate tracking
+    # error rather than all angular motion, using the actor's effective goal.
+    effective = heading_hold_velocity_commands(env, command_name)
+    effective_yaw = effective[:, 2]
+    yaw_error = robot.data.root_ang_vel_b[:, 2] - effective_yaw
+    cost = robust(body_speed / linear_scale)
+    cost += robust(yaw_error / TUNING["zero_hold_yaw_velocity_scale"])
+    # Allow the differential wheel speed needed for that same correction.
+    # URDF and MJCF wheel axes are (0, -1, 0): NEGATIVE joint velocity
+    # rolls toward body +X. Convert before comparing to the yaw correction.
+    desired_wheel_speed = (effective[:, :1] + effective_yaw[:, None]
+                           * command.new_tensor([-0.28, 0.28, -0.28, 0.28]))
+    signed_wheel_speed = -robot.data.joint_vel[:, wheel_joint_cfg.joint_ids] * TUNING["wheel_radius"]
+    cost += 0.5 * robust((signed_wheel_speed - desired_wheel_speed) / wheel_scale[:, None]).mean(dim=1)
+    heading_error = torch.atan2(
+        torch.sin(actual_yaw - state["target_yaw"]),
+        torch.cos(actual_yaw - state["target_yaw"]),
+    ).abs()
+    heading_excess = (
+        (heading_error - TUNING["zero_hold_heading_tolerance"]).clamp_min(0.0)
+        / TUNING["zero_hold_heading_scale"]
+    )
+    cost += TUNING["zero_hold_heading_weight"] * robust(heading_excess)
+    if state.get("telemetry_step") == int(env.common_step_counter):
+        return cost * hold_active.to(cost.dtype)
+    state["telemetry_step"] = int(env.common_step_counter)
+    if _detailed_teacher_diagnostics(env):
+        # The per-terrain settled counters below are the core measurements.
+        # Skip this redundant whole-hold summary before the braking grace.
+        state["error_sum"] += heading_error * hold_active
+        signed_heading_error = torch.atan2(
+            torch.sin(actual_yaw - state["target_yaw"]),
+            torch.cos(actual_yaw - state["target_yaw"]),
+        )
+        state["error_signed_sum"] += signed_heading_error * hold_active
+        state["samples"] += hold_active
+        state["max_error"] = torch.maximum(state["max_error"], heading_error * hold_active)
+        state["base_speed_sum"] += body_speed * hold_active
+        state["base_speed_max"] = torch.maximum(state["base_speed_max"], body_speed * hold_active)
+        state["yaw_rate_sum"] += yaw_speed * hold_active
+        state["yaw_rate_signed_sum"] += robot.data.root_ang_vel_b[:, 2] * hold_active
+        state["yaw_rate_max"] = torch.maximum(state["yaw_rate_max"], yaw_speed * hold_active)
+        state["wheel_speed_sum"] += wheel_speed_mean * hold_active
+        state["wheel_speed_max"] = torch.maximum(state["wheel_speed_max"], wheel_speed_max * hold_active)
+    age = (int(env.common_step_counter) - state["hold_start_step"]) * env.step_dt
+    settled = hold_active & (age >= TUNING["zero_hold_brake_grace_s"])
+    latch = settled & ~state["position_latched"]
+    xy = robot.data.root_pos_w[:, :2]
+    state["hold_xy"][latch] = xy[latch]
+    state["previous_hold_xy"][latch] = xy[latch]
+    state["position_latched"] |= latch
+    drift = torch.linalg.vector_norm(xy - state["hold_xy"], dim=1)
+    path = torch.linalg.vector_norm(xy - state["previous_hold_xy"], dim=1)
+    success = ((body_speed < TUNING["hold_success_base_speed"])
+               & (wheel_speed_max < TUNING["hold_success_wheel_speed"])
+               & (yaw_speed < TUNING["hold_success_yaw_rate"])
+               & (heading_error < TUNING["hold_success_heading"]))
+    quiet_motion = success
+    if leg_joint_cfg is not None:
+        leg_velocity = robot.data.joint_vel[:, leg_joint_cfg.joint_ids]
+        quiet_motion = (quiet_motion
+                        & (leg_velocity.square().mean(-1).sqrt() < TUNING["quiet_leg_speed_rms"])
+                        & (leg_velocity.abs().amax(-1) < TUNING["quiet_leg_speed_max"])
+                        & _zero_hold_targets_quiet(env))
+    state["quiet_run_s"] = torch.where(settled & quiet_motion,
+                                       state["quiet_run_s"] + env.step_dt,
+                                       torch.zeros_like(body_speed))
+    quiet = state["quiet_run_s"] >= TUNING["zero_hold_quiet_duration_s"] - 1.0e-6
+    on_stairs = _stair_activity_mask(env)
+    for group, mask in (("flat", settled & flat & ~on_stairs), ("stair", settled & on_stairs)):
+        stats = state["settled_stats"][group]
+        stats["holds"] += mask & ~state["settled_seen"][group]
+        state["settled_seen"][group] |= mask
+        stats["quiet_holds"] += mask & quiet & ~state["quiet_seen"][group]
+        state["quiet_seen"][group] |= mask & quiet
+        for key, value in (("samples", torch.ones_like(body_speed)), ("success", success),
+                           ("base_speed", body_speed), ("wheel_speed", wheel_speed_mean),
+                           ("heading", heading_error), ("yaw_rate", yaw_speed),
+                           ("drift", drift), ("path", path), ("quiet_samples", quiet)):
+            stats[key] += value * mask
+    state["previous_hold_xy"] = xy.clone()
+    return cost * hold_active.to(cost.dtype)
+
+
+def zero_command_flat_leg_motion_cost(env, asset_cfg: SceneEntityCfg,
+                                      command_name: str = "base_velocity") -> torch.Tensor:
+    """Discourage continued stepping after a flat-ground stop has settled."""
+    command = env.command_manager.get_command(command_name)
+    robot = env.scene[asset_cfg.name]
+    state, _, hold_active = _zero_hold_heading_context(env, command, robot)
+    age = (int(env.common_step_counter) - state["hold_start_step"]) * env.step_dt
+    settled = hold_active & (age >= TUNING["zero_hold_brake_grace_s"])
+    flat = _flat_surface_mask(env, SceneEntityCfg("height_scanner"))
+    leg_speed = robot.data.joint_vel[:, asset_cfg.joint_ids]
+    scaled = leg_speed / TUNING["zero_hold_leg_velocity_scale"]
+    cost = (2.0 * (torch.sqrt(1.0 + scaled.square()) - 1.0)).mean(dim=1)
+    return cost * (settled & flat).to(cost.dtype)
+
+
+def zero_command_flat_support_cost(env, asset_cfg: SceneEntityCfg,
+                                    contact_sensor_cfg: SceneEntityCfg,
+                                    command_name: str = "base_velocity") -> torch.Tensor:
+    """Favor four loaded wheels after the braking interval on level ground."""
+    command = env.command_manager.get_command(command_name)
+    robot = env.scene[asset_cfg.name]
+    state, _, hold_active = _zero_hold_heading_context(env, command, robot)
+    age = (int(env.common_step_counter) - state["hold_start_step"]) * env.step_dt
+    settled = hold_active & (age >= TUNING["zero_hold_brake_grace_s"])
+    flat = _flat_surface_mask(env, SceneEntityCfg("height_scanner"))
+    sensor = env.scene.sensors[contact_sensor_cfg.name]
+    loaded = sensor.data.net_forces_w[:, contact_sensor_cfg.body_ids, 2] > 10.0
+    return (1.0 - loaded.float().mean(dim=1)) * (settled & flat).to(command.dtype)
+
+
+def _zero_command_hold_metrics(env, env_ids):
+    """Report the mean and peak heading error accumulated during zero holds."""
+    state = getattr(env, "_m20_zero_hold_heading_state", None)
+    if state is None:
+        zero = torch.zeros((), device=env.device)
+        return {
+            "samples": zero,
+            "heading_error_mean_deg": zero,
+            "heading_error_signed_mean_deg": zero,
+            "heading_error_max_deg": zero,
+            "base_speed_mean_m_s": zero,
+            "base_speed_max_m_s": zero,
+            "yaw_rate_mean_rad_s": zero,
+            "yaw_rate_signed_mean_rad_s": zero,
+            "yaw_rate_max_rad_s": zero,
+            "wheel_speed_mean_m_s": zero,
+            "wheel_speed_max_m_s": zero,
+        }
+    result = {}
+    if _detailed_teacher_diagnostics(env):
+        count = state["samples"][env_ids].sum().clamp_min(1.0)
+        result = {
+            "samples": state["samples"][env_ids].sum(),
+            "heading_error_mean_deg": torch.rad2deg(state["error_sum"][env_ids].sum() / count),
+            "heading_error_signed_mean_deg": torch.rad2deg(state["error_signed_sum"][env_ids].sum() / count),
+            "heading_error_max_deg": torch.rad2deg(state["max_error"][env_ids].max()),
+            "base_speed_mean_m_s": state["base_speed_sum"][env_ids].sum() / count,
+            "base_speed_max_m_s": state["base_speed_max"][env_ids].max(),
+            "yaw_rate_mean_rad_s": state["yaw_rate_sum"][env_ids].sum() / count,
+            "yaw_rate_signed_mean_rad_s": state["yaw_rate_signed_sum"][env_ids].sum() / count,
+            "yaw_rate_max_rad_s": state["yaw_rate_max"][env_ids].max(),
+            "wheel_speed_mean_m_s": state["wheel_speed_sum"][env_ids].sum() / count,
+            "wheel_speed_max_m_s": state["wheel_speed_max"][env_ids].max(),
+        }
+    for group, stats in state["settled_stats"].items():
+        s = {key: value[env_ids].sum() for key, value in stats.items()}
+        count = s["samples"].clamp_min(1.0)
+        result.update({
+            f"{group}_settled_samples": s["samples"],
+            f"{group}_settled_success_fraction": s["success"] / count,
+            f"{group}_settled_base_speed_m_s": s["base_speed"] / count,
+            f"{group}_settled_wheel_speed_m_s": s["wheel_speed"] / count,
+            f"{group}_settled_yaw_rate_rad_s": s["yaw_rate"] / count,
+            f"{group}_settled_heading_error_deg": torch.rad2deg(s["heading"] / count),
+            f"{group}_settled_drift_mean_m": s["drift"] / count,
+            f"{group}_settled_holds": s["holds"],
+            f"{group}_settled_path_per_hold_m": s["path"] / s["holds"].clamp_min(1.0),
+            f"{group}_quiet_1s_sample_fraction": s["quiet_samples"] / count,
+            f"{group}_holds_reached_quiet_1s_fraction": s["quiet_holds"] / s["holds"].clamp_min(1.0),
+        })
+        # RSL-RL averages reset batches of different sizes. Preserve numerator
+        # and denominator so the project logger can pool samples exactly.
+        numerator = {
+            f"{group}_settled_success_fraction": s["success"],
+            f"{group}_settled_base_speed_m_s": s["base_speed"],
+            f"{group}_settled_wheel_speed_m_s": s["wheel_speed"],
+            f"{group}_settled_yaw_rate_rad_s": s["yaw_rate"],
+            f"{group}_settled_heading_error_deg": torch.rad2deg(s["heading"]),
+            f"{group}_settled_drift_mean_m": s["drift"],
+            f"{group}_quiet_1s_sample_fraction": s["quiet_samples"],
+        }
+        for name, total in numerator.items():
+            result[f"__weighted_total__/{name}"] = total
+            result[f"__weighted_count__/{name}"] = s["samples"]
+        for name, total in ((f"{group}_settled_path_per_hold_m", s["path"]),
+                            (f"{group}_holds_reached_quiet_1s_fraction", s["quiet_holds"])):
+            result[f"__weighted_total__/{name}"] = total
+            result[f"__weighted_count__/{name}"] = s["holds"]
+    dynamics = getattr(env, "_m20_stop_action_stats", None)
+    if dynamics is not None:
+        s = {key: value[env_ids].sum() for key, value in dynamics.items()}
+        result["action_dynamics_samples"] = s["samples"]
+        for field, name in (
+            ("leg_delta_sq", "leg_target_delta_rms_rad"),
+            ("wheel_delta_sq", "wheel_target_delta_rms_m_s"),
+            ("leg_jerk_sq", "leg_target_second_difference_rms_rad"),
+            ("wheel_jerk_sq", "wheel_target_second_difference_rms_m_s"),
+            ("leg_speed_sq", "leg_speed_rms_rad_s"),
+        ):
+            result[name] = torch.sqrt(s[field] / s["samples"].clamp_min(1.0))
+            result[f"__rms_total__/{name}"] = s[field]
+            result[f"__rms_count__/{name}"] = s["samples"]
+    return result
+
+
+def zero_command_hold_metrics(env, env_ids):
+    core = {"action_dynamics_samples", "leg_target_delta_rms_rad", "wheel_target_delta_rms_m_s",
+            "leg_target_second_difference_rms_rad", "wheel_target_second_difference_rms_m_s",
+            "leg_speed_rms_rad_s"}
+    for group in ("flat", "stair"):
+        core.update(f"{group}_{name}" for name in (
+            "settled_samples", "settled_holds", "settled_success_fraction",
+            "settled_base_speed_m_s", "settled_wheel_speed_m_s", "settled_yaw_rate_rad_s",
+            "settled_heading_error_deg", "settled_drift_mean_m", "settled_path_per_hold_m",
+            "quiet_1s_sample_fraction", "holds_reached_quiet_1s_fraction",
+        ))
+    return export_teacher_metrics(
+        _zero_command_hold_metrics(env, env_ids), core, _detailed_teacher_diagnostics(env)
+    )
+
+
+def zero_command_wheel_action_cost(
+    env, command_name: str = "base_velocity", action_term_name: str = "joint_vel",
+) -> torch.Tensor:
+    """Penalize rolling drift while leaving room for heading correction."""
+    command = env.command_manager.get_command(command_name)
+    zero_command = (
+        (torch.linalg.vector_norm(command[:, :2], dim=1) <= TUNING["translation_threshold"])
+        & (command[:, 2].abs() <= TUNING["yaw_threshold"])
+    )
+    wheel_targets = env.action_manager.get_term(action_term_name).processed_actions
+    wheel_speed = -wheel_targets * TUNING["wheel_radius"]
+    effective = heading_hold_velocity_commands(env, command_name)
+    desired = (effective[:, :1] + effective[:, 2:3]
+               * wheel_speed.new_tensor([[-0.28, 0.28, -0.28, 0.28]]))
+    scale = TUNING["zero_hold_wheel_action_linear_scale"]
+    # Penalize each axle independently: [+v,+v,-v,-v] must not disappear
+    # from the cost just because its mean and left/right differential vanish.
+    residual = (wheel_speed - desired) / scale
+    cost = (2.0 * (torch.sqrt(1.0 + residual.square()) - 1.0)).mean(dim=1)
+    return cost * zero_command.to(cost.dtype)
+
+
+def zero_command_stair_position_cost(env, asset_cfg: SceneEntityCfg,
+                                     command_name: str = "base_velocity") -> torch.Tensor:
+    """Hold the post-braking stair position while allowing balance corrections.
+
+    Position error is observable through the bounded vx/vy command feedback.
+    No joint target is frozen, and the first braking interval is unpenalized.
+    """
+    heading_hold_velocity_commands(env, command_name)
+    feedback = env._m20_heading_command_filter
+    error = feedback["stop_error"]
+    u = (error.abs() - TUNING["stair_stop_position_deadband"]).clamp_min(0.0)
+    u = u / TUNING["stair_stop_position_scale"]
+    cost = (2.0 * (torch.sqrt(1.0 + u.square()) - 1.0)).sum(-1)
+    leg_speed = env.scene[asset_cfg.name].data.joint_vel[:, asset_cfg.joint_ids]
+    scaled = leg_speed / TUNING["zero_hold_leg_velocity_scale"]
+    cost += 0.1 * (2.0 * (torch.sqrt(1.0 + scaled.square()) - 1.0)).mean(-1)
+    return cost * feedback["stop_feedback"]
+
+
+def zero_command_action_dynamics_cost(
+    env, asset_cfg: SceneEntityCfg, command_name: str = "base_velocity",
+    leg_action_name: str = "joint_pos", wheel_action_name: str = "joint_vel",
+) -> torch.Tensor:
+    """Suppress stop-state target chatter without freezing a stair balance pose.
+
+    Processed leg targets are radians; processed wheel targets become m/s.
+    History validity depends on elapsed control ticks, including exactly-zero
+    actions, and never on the terrain curriculum level.
+    """
+    step = int(env.common_step_counter)
+    legs = env.action_manager.get_term(leg_action_name).processed_actions
+    wheels = (-env.action_manager.get_term(wheel_action_name).processed_actions
+              * TUNING["wheel_radius"])
+    targets = torch.cat((legs, wheels), dim=-1)
+    state = getattr(env, "_m20_stop_action_dynamics", None)
+    if state is None or state["previous"].shape != targets.shape:
+        state = dict(step=-1, previous=targets.clone(), older=targets.clone(),
+                     history=torch.zeros(env.num_envs, device=env.device, dtype=torch.long))
+        env._m20_stop_action_dynamics = state
+    if state["step"] != step:
+        state["before"] = {key: state[key].clone() for key in ("previous", "older", "history")}
+        state["step"] = step
+    before = state["before"]
+    reset = env.episode_length_buf <= 1
+    valid_rate = (before["history"] >= 1) & ~reset
+    valid_jerk = (before["history"] >= 2) & ~reset
+    delta = targets - before["previous"]
+    jerk = targets - 2.0 * before["previous"] + before["older"]
+    leg_count = legs.shape[-1]
+
+    def robust_mean(value, scale):
+        u = value / scale
+        return (2.0 * (torch.sqrt(1.0 + u.square()) - 1.0)).mean(-1)
+
+    rate_cost = (robust_mean(delta[:, :leg_count], TUNING["zero_hold_leg_target_delta_scale"])
+                 + robust_mean(delta[:, leg_count:], TUNING["zero_hold_wheel_target_delta_scale"]))
+    jerk_cost = (robust_mean(jerk[:, :leg_count], TUNING["zero_hold_leg_target_jerk_scale"])
+                 + robust_mean(jerk[:, leg_count:], TUNING["zero_hold_wheel_target_jerk_scale"]))
+    command = env.command_manager.get_command(command_name)
+    robot = env.scene[asset_cfg.name]
+    hold, _, active = _zero_hold_heading_context(env, command, robot)
+    age = (step - hold["hold_start_step"]) * env.step_dt
+    ramp = ((age - TUNING["zero_hold_brake_grace_s"])
+            / TUNING["zero_hold_action_ramp_s"]).clamp(0.0, 1.0)
+    flat = _flat_surface_mask(env, SceneEntityCfg("height_scanner"))
+    terrain_gain = torch.where(flat, 1.0, TUNING["zero_hold_stair_dynamics_gain"])
+    result = (0.5 * rate_cost * valid_rate + jerk_cost * valid_jerk) * active * ramp * terrain_gain
+    # Keep the state valid when an episode starts at a random episode age.
+    state.update(previous=targets.clone(), older=before["previous"].clone(),
+                 history=torch.where(reset, torch.ones_like(before["history"]), before["history"] + 1))
+    measured = active & (ramp >= 1.0) & valid_jerk
+    stats = getattr(env, "_m20_stop_action_stats", None)
+    if stats is None:
+        stats = {key: torch.zeros(env.num_envs, device=env.device) for key in (
+            "samples", "leg_delta_sq", "wheel_delta_sq", "leg_jerk_sq", "wheel_jerk_sq", "leg_speed_sq")}
+        env._m20_stop_action_stats = stats
+    # Only one telemetry update per physical tick, regardless of reward consumers.
+    if state.get("stats_step") != step:
+        for value in stats.values():
+            value[reset] = 0.0
+        values = dict(samples=torch.ones_like(result),
+                      leg_delta_sq=delta[:, :leg_count].square().mean(-1),
+                      wheel_delta_sq=delta[:, leg_count:].square().mean(-1),
+                      leg_jerk_sq=jerk[:, :leg_count].square().mean(-1),
+                      wheel_jerk_sq=jerk[:, leg_count:].square().mean(-1),
+                      leg_speed_sq=robot.data.joint_vel[:, asset_cfg.joint_ids].square().mean(-1))
+        for key, value in values.items():
+            stats[key] += value * measured
+        state["stats_step"] = step
+    return result
+
+
 def stair_front_wheel_touchdown(
     env, asset_cfg: SceneEntityCfg, sensor_cfg: SceneEntityCfg,
     contact_sensor_cfg: SceneEntityCfg, command_name: str = "base_velocity",
@@ -1294,7 +3190,8 @@ def stair_front_wheel_touchdown(
     _stair_step_completion_events(env, asset_cfg, sensor_cfg, contact_sensor_cfg, command_name)
     down_state = env._m20_stair_step_state
     down_front = down_state["front_support_event"].float().sum(dim=1)
-    return (state["front_event"].float().sum(dim=1) + down_front) / env.step_dt
+    return ((state["front_event"].float().sum(dim=1) + down_front)
+            * _stair_forward_command_gate(env, command_name) / env.step_dt)
 
 
 def stair_front_single_support(
@@ -1309,7 +3206,21 @@ def stair_front_single_support(
     progress_rate, _ = _stair_new_progress(env, asset_cfg, sensor_cfg, command_name)
     in_contact = contact_sensor.data.current_contact_time[:, contact_sensor_cfg.body_ids] > 0.0
     one_support = in_contact.sum(dim=1) == 1
-    return progress_rate * one_support.to(progress_rate.dtype) * _stair_route_quality(env, sensor_cfg, command_name)
+    descent = getattr(env, "_m20_stair_step_state", None)
+    if descent is not None and not TUNING.get("v1_motion_baseline", False):
+        command = env.command_manager.get_command(command_name)
+        paired_descent = (
+            descent["active"] & ~descent["up"] & (descent["down_successes"] < 3)
+            & (command[:, 0] > TUNING["translation_threshold"])
+            & (command[:, 1].abs() <= TUNING["translation_threshold"])
+            & (command[:, 2].abs() <= TUNING["yaw_threshold"])
+        )
+        # Do not pay the one-front-loaded pattern while the descent term
+        # explicitly asks for a short, balanced front-axle transfer.
+        one_support &= ~paired_descent
+    return (progress_rate * one_support.to(progress_rate.dtype)
+            * _stair_route_quality(env, sensor_cfg, command_name)
+            * _stair_forward_command_gate(env, command_name))
 
 
 def stair_diagonal_support_symmetry(
@@ -1325,7 +3236,9 @@ def stair_diagonal_support_symmetry(
     contact = sensor.data.current_contact_time[:, contact_sensor_cfg.body_ids] > 0.0
     # body_ids are configured in FL, FR, HL, HR order.
     matches = (contact[:, 0] == contact[:, 3]) & (contact[:, 1] == contact[:, 2])
-    return progress_rate * matches.to(progress_rate.dtype) * _stair_route_quality(env, sensor_cfg, command_name)
+    return (progress_rate * matches.to(progress_rate.dtype)
+            * _stair_route_quality(env, sensor_cfg, command_name)
+            * _stair_forward_command_gate(env, command_name))
 
 
 def stair_front_alternation(
@@ -1334,7 +3247,8 @@ def stair_front_alternation(
 ) -> torch.Tensor:
     """Bonus after the first, only for the opposite front leg on the next riser."""
     state = ascent_state(env, asset_cfg, sensor_cfg, contact_sensor_cfg, command_name)
-    return (state["front_event"].any(dim=1) & (state["front_count"] > 1)).float() / env.step_dt
+    event = (state["front_event"].any(dim=1) & (state["front_count"] > 1)).float()
+    return event * _stair_forward_command_gate(env, command_name) / env.step_dt
 
 
 def _stair_step_completion_events(
@@ -1579,13 +3493,30 @@ def _stair_step_completion_events(
     return up, down
 
 
+def _ascent_completion_speed_scale(env, command_name="base_velocity"):
+    """Reduce the extra completion payout from racing above the requested speed.
+
+    This adjusts two positive task-completion terms, leaving style-credit
+    accounting, safety costs and every descent/zero/manual mode unchanged.
+    """
+    if TUNING.get("v1_motion_baseline", False):
+        return torch.ones(env.num_envs, device=env.device)
+    command = env.command_manager.get_command(command_name)
+    robot = env.scene["robot"]
+    _, active = _automatic_ascent_heading_rate(env, command, robot)
+    allowed = (command[:, 0] + TUNING["ascent_forward_overspeed_tolerance"]).clamp_min(0.1)
+    scale = allowed / torch.maximum(robot.data.root_lin_vel_b[:, 0], allowed)
+    return torch.where(active, scale, torch.ones_like(scale))
+
+
 def stair_up_step_completion(
     env, asset_cfg: SceneEntityCfg, sensor_cfg: SceneEntityCfg,
     contact_sensor_cfg: SceneEntityCfg,
 ) -> torch.Tensor:
     """Credit a safe front landing on the next ascending riser, one leg only."""
     state = ascent_state(env, asset_cfg, sensor_cfg, contact_sensor_cfg)
-    return state["front_event"].any(dim=1).float() / env.step_dt
+    return (state["front_event"].any(dim=1).float() * _stair_forward_command_gate(env)
+            * _ascent_completion_speed_scale(env) / env.step_dt)
 
 
 def ascent_task_crossing_events(state, known, x, cross, wheels, loaded, root_pos, root_quat):
@@ -1607,7 +3538,8 @@ def ascent_task_crossing_events(state, known, x, cross, wheels, loaded, root_pos
 
 def stair_up_task_crossing(env, asset_cfg, sensor_cfg, contact_sensor_cfg):
     state = ascent_state(env, asset_cfg, sensor_cfg, contact_sensor_cfg)
-    return state["task_crossing_event"] / env.step_dt
+    return (state["task_crossing_event"] * _stair_forward_command_gate(env)
+            * _ascent_completion_speed_scale(env) / env.step_dt)
 
 
 def stair_up_rear_step_completion(
@@ -1616,12 +3548,13 @@ def stair_up_rear_step_completion(
 ) -> torch.Tensor:
     """Credit one alternating rear landing per front-confirmed ascending riser."""
     state = ascent_state(env, asset_cfg, sensor_cfg, contact_sensor_cfg)
-    return state["rear_event"].any(dim=1).float() / env.step_dt
+    return state["rear_event"].any(dim=1).float() * _stair_forward_command_gate(env) / env.step_dt
 
 
 def stair_rear_transition_recovery(env, asset_cfg, sensor_cfg, contact_sensor_cfg):
     """Small once-only signal for a safe first step out of rear same-tread gait."""
-    return ascent_state(env,asset_cfg,sensor_cfg,contact_sensor_cfg)["rear_recovery_event"].float()/env.step_dt
+    event = ascent_state(env,asset_cfg,sensor_cfg,contact_sensor_cfg)["rear_recovery_event"].float()
+    return event * _stair_forward_command_gate(env) / env.step_dt
 
 
 def stair_rear_style_refund(env, asset_cfg, sensor_cfg, contact_sensor_cfg):
@@ -1659,7 +3592,7 @@ def stair_down_step_completion(
 ) -> torch.Tensor:
     """One event when a whole riser has been descended and rear support is stable."""
     _, down = _stair_step_completion_events(env, asset_cfg, sensor_cfg, contact_sensor_cfg)
-    return down.to(torch.float32) / env.step_dt
+    return down.to(torch.float32) * _stair_forward_command_gate(env) / env.step_dt
 
 
 def stair_front_riser_face_cost(
@@ -1680,7 +3613,7 @@ def stair_descent_rear_support(
     state = env._m20_stair_step_state
     return (
         state["rear_support_event"].float().sum(dim=1) * (~state["up"]).float()
-        / env.step_dt
+        * _stair_forward_command_gate(env, command_name) / env.step_dt
     )
 
 
@@ -1732,12 +3665,157 @@ def stair_route_track_lin_vel_xy_exp(
     """
     from .rewards import track_lin_vel_xy_exp
     native = track_lin_vel_xy_exp(env,std,command_name,asset_cfg)
+    if TUNING.get("v1_motion_baseline", False):
+        # v1's recorded pose_tracking_discount is zero; target is raw XY.
+        return native
+    robot = env.scene[asset_cfg.name]
+    effective = heading_hold_velocity_commands(env, command_name)
+    effective_error = (effective[:, :2] - robot.data.root_lin_vel_b[:, :2]).square().sum(-1)
+    # The actor receives bounded XY corrections. Reward those same targets;
+    # modes outside feedback retain their original velocity target.
+    native = torch.where(env._m20_heading_command_filter["translation_active"],
+                         torch.exp(-effective_error / std**2), native)
     if hip_cfg is None or knee_cfg is None or contact_sensor_cfg is None:
         return native
     c = _context(env,asset_cfg,hip_cfg,knee_cfg,sensor_cfg,contact_sensor_cfg,command_name)
     severity = torch.maximum((c["front_fold"]+c["front_swing_fold"]).mean(-1),c["rear_forward"].mean(-1))
     severity = torch.maximum(severity,c["body_gap"])
     return native*(1-TUNING["pose_tracking_discount"]*severity)
+
+
+def stair_ascent_straight_motion_cost(
+    env, asset_cfg: SceneEntityCfg, command_name: str = "base_velocity",
+) -> torch.Tensor:
+    """Separate ascent side-slip and overspeed from small heading errors.
+
+    The path target is exposed through the actor's existing lateral command.
+    Penalize velocity residuals against that correction, so returning to the
+    line is permitted. No term here applies to zero holds or descending travel.
+    """
+    tick = int(env.common_step_counter)
+    cached = getattr(env, "_m20_ascent_straight_motion_cache", None)
+    if cached is not None and cached["tick"] == tick:
+        return cached["cost"]
+    robot = env.scene[asset_cfg.name]
+    raw = env.command_manager.get_command(command_name)
+    effective = heading_hold_velocity_commands(env, command_name)
+    _, active = _automatic_ascent_heading_rate(env, raw, robot)
+    active &= env.episode_length_buf > 1
+    heading = env._m20_zero_hold_heading_state
+    yaw = heading["straight_target_yaw"]
+    normal = torch.stack((-torch.sin(yaw), torch.cos(yaw)), -1)
+    path_error = ((robot.data.root_pos_w[:, :2] - heading["straight_origin_xy"]) * normal).sum(-1)
+    lateral_speed = (robot.data.root_lin_vel_w[:, :2] * normal).sum(-1)
+    desired_body = torch.zeros_like(robot.data.root_lin_vel_b)
+    desired_body[:, :2] = effective[:, :2]
+    desired_world = quat_apply(robot.data.root_quat_w, desired_body)
+    desired_side = (desired_world[:, :2] * normal).sum(-1)
+    lateral_error = lateral_speed - desired_side
+    forward_speed = robot.data.root_lin_vel_b[:, 0]
+    overspeed = (forward_speed - raw[:, 0] - TUNING["ascent_forward_overspeed_tolerance"]).clamp_min(0.0)
+
+    def smooth_excess(value, tolerance, scale):
+        u = (value.abs() - tolerance).clamp_min(0.0) / scale
+        return 2.0 * (torch.sqrt(1.0 + u.square()) - 1.0)
+
+    cost = smooth_excess(path_error, TUNING["ascent_path_error_tolerance"], TUNING["ascent_path_error_scale"])
+    cost += 0.5 * smooth_excess(lateral_error, TUNING["ascent_path_velocity_error_tolerance"],
+                              TUNING["ascent_path_velocity_error_scale"])
+    cost += smooth_excess(overspeed, 0.0, TUNING["ascent_forward_overspeed_scale"])
+    cost *= active
+    stats = getattr(env, "_m20_ascent_straight_motion_stats", None)
+    values = {
+        "samples": torch.ones_like(cost), "path_abs": path_error.abs(), "path_signed": path_error,
+        "side_abs": lateral_speed.abs(), "side_signed": lateral_speed,
+        "side_error_abs": lateral_error.abs(), "forward": forward_speed,
+        "overspeed": (overspeed > 0).float(), "correction": (effective[:, 1] - raw[:, 1]).abs(),
+        "cost": cost,
+    }
+    if stats is None:
+        stats = {key: torch.zeros(env.num_envs, device=env.device) for key in values}
+        env._m20_ascent_straight_motion_stats = stats
+    reset = env.episode_length_buf <= 1
+    for key, value in values.items():
+        stats[key][reset] = 0.0
+        stats[key] += value * active
+    env._m20_ascent_straight_motion_cache = {"tick": tick, "cost": cost}
+    return cost
+
+
+def ascent_straight_motion_metrics(env, env_ids):
+    """Report signed lateral drift and speed separately from heading error."""
+    stats = getattr(env, "_m20_ascent_straight_motion_stats", None)
+    if stats is None:
+        return {}
+    sums = {key: value[env_ids].sum() for key, value in stats.items()}
+    count = sums["samples"]
+    result = {"straight_motion_samples": count}
+    for name, field in (
+        ("path_error_mean_m", "path_abs"), ("path_error_signed_mean_m", "path_signed"),
+        ("lateral_speed_mean_m_s", "side_abs"), ("lateral_speed_signed_mean_m_s", "side_signed"),
+        ("lateral_tracking_error_mean_m_s", "side_error_abs"), ("forward_speed_mean_m_s", "forward"),
+        ("overspeed_fraction", "overspeed"), ("lateral_correction_mean_m_s", "correction"),
+        ("straight_motion_cost_mean", "cost"),
+    ):
+        result[name] = sums[field] / count.clamp_min(1.0)
+        result[f"__weighted_total__/{name}"] = sums[field]
+        result[f"__weighted_count__/{name}"] = count
+    return result
+
+
+def stair_descent_straight_motion_cost(env, asset_cfg: SceneEntityCfg,
+                                       command_name: str = "base_velocity") -> torch.Tensor:
+    """Penalize descent side slip against the same route target the actor sees."""
+    tick = int(env.common_step_counter)
+    cached = getattr(env, "_m20_descent_motion_cache", None)
+    if cached is not None and cached["tick"] == tick:
+        return cached["cost"]
+    robot = env.scene[asset_cfg.name]
+    raw = env.command_manager.get_command(command_name)
+    effective = heading_hold_velocity_commands(env, command_name)
+    feedback = env._m20_heading_command_filter
+    active = feedback["automatic_descent"] & (env.episode_length_buf > 1)
+    yaw = env._m20_zero_hold_heading_state["straight_target_yaw"]
+    normal = torch.stack((-torch.sin(yaw), torch.cos(yaw)), -1)
+    desired = torch.zeros_like(robot.data.root_lin_vel_b)
+    desired[:, :2] = effective[:, :2]
+    desired_side = (quat_apply(robot.data.root_quat_w, desired)[:, :2] * normal).sum(-1)
+    residual = feedback["path_speed"] - desired_side
+    def smooth(value, tolerance, scale):
+        u = (value.abs() - tolerance).clamp_min(0.0) / scale
+        return 2.0 * (torch.sqrt(1.0 + u.square()) - 1.0)
+    cost = (smooth(feedback["path_error"], 0.04, 0.12)
+            + 0.5 * smooth(residual, 0.025, 0.10)) * active
+    values = dict(samples=torch.ones_like(cost), path_abs=feedback["path_error"].abs(),
+                  path_signed=feedback["path_error"], side_abs=feedback["path_speed"].abs(),
+                  side_signed=feedback["path_speed"], tracking=residual.abs(),
+                  correction=(effective[:, 1] - raw[:, 1]).abs(), forward=robot.data.root_lin_vel_b[:, 0])
+    stats = getattr(env, "_m20_descent_motion_stats", None)
+    if stats is None:
+        stats = {key: torch.zeros(env.num_envs, device=env.device) for key in values}
+        env._m20_descent_motion_stats = stats
+    for key, value in values.items():
+        stats[key][env.episode_length_buf <= 1] = 0.0
+        stats[key] += value * active
+    env._m20_descent_motion_cache = dict(tick=tick, cost=cost)
+    return cost
+
+
+def _descent_motion_metrics(env, env_ids):
+    stats = getattr(env, "_m20_descent_motion_stats", None)
+    if stats is None:
+        return {}
+    sums = {key: value[env_ids].sum() for key, value in stats.items()}
+    count = sums["samples"]
+    result = {"straight_motion_samples": count}
+    for name, field in (("path_error_mean_m", "path_abs"), ("path_error_signed_mean_m", "path_signed"),
+                        ("lateral_speed_mean_m_s", "side_abs"), ("lateral_speed_signed_mean_m_s", "side_signed"),
+                        ("lateral_tracking_error_mean_m_s", "tracking"),
+                        ("lateral_correction_mean_m_s", "correction"), ("forward_speed_mean_m_s", "forward")):
+        result[name] = sums[field] / count.clamp_min(1.0)
+        result[f"__weighted_total__/{name}"] = sums[field]
+        result[f"__weighted_count__/{name}"] = count
+    return result
 
 
 def _legacy_step_completion_metrics(env, env_ids) -> dict[str, torch.Tensor]:
@@ -2055,6 +4133,80 @@ def _context(env, asset_cfg, hip_cfg, knee_cfg, sensor_cfg, contact_sensor_cfg,
     delta = wheels-hips
     qb = robot.data.root_quat_w[:,None].expand(-1,4,-1).reshape(-1,4)
     body_delta = quat_apply_inverse(qb,delta.reshape(-1,3)).reshape(-1,4,3)
+    descent_front_posture_cost = torch.zeros(env.num_envs, 2, device=env.device)
+    descent_step = getattr(env, "_m20_stair_step_state", None)
+    if descent_step is not None:
+        first_three_down = (descent_step["active"] & ~descent_step["up"]
+                            & (descent_step["down_successes"] < 3)
+                            & (command[:, 0] > TUNING["translation_threshold"]))
+        level_index = descent_step["down_successes"].long().clamp(0, 2)
+        reference = getattr(env, "_m20_descent_front_posture_reference", None)
+        if reference is None or reference["forward"].shape[0] != env.num_envs:
+            reference = {
+                "forward": body_delta[:, :2, 0].clone(),
+                "knee": robot.data.default_joint_pos[:, knee_cfg.joint_ids[:2]].clone(),
+            }
+            env._m20_descent_front_posture_reference = reference
+        reset = env.episode_length_buf <= 1
+        reference["forward"][reset] = body_delta[reset, :2, 0]
+        reference["knee"][reset] = robot.data.default_joint_pos[reset][:, knee_cfg.joint_ids[:2]]
+        flat_straight = (
+            _flat_surface_mask(env, sensor_cfg)
+            & (scan["down_gate"] <= 0.0) & (scan["up_gate"] <= 0.0)
+            & (command[:, 0] > TUNING["translation_threshold"])
+            & (command[:, 1].abs() <= TUNING["translation_threshold"])
+            & (command[:, 2].abs() <= TUNING["yaw_threshold"])
+            & ~reset
+        )
+        reference["forward"] = torch.where(
+            flat_straight[:, None],
+            0.98 * reference["forward"] + 0.02 * body_delta[:, :2, 0],
+            reference["forward"],
+        )
+        reference["knee"] = torch.where(
+            flat_straight[:, None],
+            0.98 * reference["knee"] + 0.02 * knee[:, :2],
+            reference["knee"],
+        )
+
+        front_forward = body_delta[:, :2, 0]
+        front_extension = torch.linalg.vector_norm(body_delta[:, :2], dim=-1)
+        front_knee_error = (knee[:, :2] - reference["knee"]).abs()
+        descent_front_support = first_three_down[:, None] & load[:, :2]
+        descent_front_swing = first_three_down[:, None] & ~load[:, :2]
+
+        def smooth_excess(value):
+            scaled = value.clamp_min(0.0)
+            return 2.0 * (torch.sqrt(1.0 + scaled.square()) - 1.0)
+
+        support_forward_excess = (
+            front_forward - reference["forward"]
+            - TUNING["descent_front_support_forward_margin"]
+        ) / TUNING["descent_front_forward_scale"]
+        swing_forward_excess = (
+            front_forward - reference["forward"]
+            - TUNING["descent_front_swing_forward_margin"]
+        ) / TUNING["descent_front_forward_scale"]
+        support_knee_excess = (
+            front_knee_error - TUNING["descent_front_support_knee_margin"]
+        ) / TUNING["descent_front_knee_scale"]
+        swing_knee_excess = (
+            front_knee_error - TUNING["descent_front_swing_knee_margin"]
+        ) / TUNING["descent_front_knee_scale"]
+        support_cost = torch.maximum(
+            smooth_excess(support_forward_excess), smooth_excess(support_knee_excess)
+        )
+        swing_cost = torch.maximum(
+            smooth_excess(swing_forward_excess), smooth_excess(swing_knee_excess)
+        )
+        descent_front_posture_cost = (
+            support_cost * descent_front_support + swing_cost * descent_front_swing
+        )
+        _update_descent_front_posture_stats(
+            env, level_index, descent_front_support, descent_front_swing,
+            front_extension, front_forward, knee[:, :2].abs(), front_knee_error,
+            descent_front_posture_cost, reference["forward"],
+        )
     qy = yaw_quat(robot.data.root_quat_w)[:,None].expand(-1,4,-1).reshape(-1,4)
     gravity_delta = quat_apply_inverse(qy,delta.reshape(-1,3)).reshape(-1,4,3)
     body_angle = torch.atan2(body_delta[...,0],(-body_delta[...,2]).clamp_min(1e-6))
@@ -2075,7 +4227,8 @@ def _context(env, asset_cfg, hip_cfg, knee_cfg, sensor_cfg, contact_sensor_cfg,
         robot.data.body_lin_vel_w[:,asset_cfg.body_ids],robot.data.root_lin_vel_b,
         robot.data.root_quat_w,command,relax,env.scene[sensor_cfg.name].data.pos_w[:,:2])
     _update_rear_swing_stats(env,down,body_angle[:,2:],gravity_angle[:,2:],rear_swing,rear_swing_cost)
-    _update_rear_angle_histograms(env,body_angle[:,2:],gravity_angle[:,2:],rear_load,rear_swing)
+    if _detailed_teacher_diagnostics(env):
+        _update_rear_angle_histograms(env,body_angle[:,2:],gravity_angle[:,2:],rear_load,rear_swing)
     # A gravity-aligned safety lower envelope is a height-map proxy, not an
     # exact collision mesh distance. It alone requires local map validity.
     points = wheels.new_tensor([[x,y,TUNING["body_bottom_z"]] for x in (0.10,0.22,0.34) for y in (-0.16,0,0.16)])
@@ -2099,33 +4252,43 @@ def _context(env, asset_cfg, hip_cfg, knee_cfg, sensor_cfg, contact_sensor_cfg,
                   rear_forward=rear_forward, body_angle=body_angle, gravity_angle=gravity_angle,
                   entry_retract_gain=entry["gain"], entry_range_cost=entry["cost"],
                   entry_front_lead_reward=entry["lead_reward"],
+                  entry_front_progress_reward=entry["lead_progress_reward"],
+                  entry_sequence_reward=entry["sequence_reward"],
+                  entry_wheel_spacing_left_cost=entry["wheel_spacing_cost"][:, 0],
+                  entry_wheel_spacing_right_cost=entry["wheel_spacing_cost"][:, 1],
+                  descent_wheel_shank_cost=0.5 * (entry["shank_cost"].mean(-1) + entry["shank_cost"].amax(-1)),
+                  descent_front_posture_cost=descent_front_posture_cost,
                   entry_rear_early_transfer_cost=entry["early_rear_transfer_cost"],
                   body_gap=body_gap, body_gap_m=gap, body_gap_valid=gap_valid, load=load, rear_load=rear_load)
     env._m20_gait_context = cached
     # Once per control step, independently of how many reward terms use it.
+    detailed = _detailed_teacher_diagnostics(env)
     stats = getattr(env, "_m20_gait_stats", None)
     if stats is None:
-        stats = {name: torch.zeros(env.num_envs, device=env.device) for name in
-                 ("turn_steps", "turn_clearance_sum", "turn_reach_sum", "turn_size_sum",
-                  "rear_support_samples", "rear_extension_sum", "rear_fold_samples",
-                  "down_steps", "turn_yaw_error_sum", "up_steps", "front_support_samples",
-                  "front_extension_sum", "front_knee_abs_sum", "front_fold_samples",
-                  "front_swing_samples", "front_swing_fold_samples")}
+        names = ("rear_support_samples", "rear_extension_sum", "rear_fold_samples", "down_steps")
+        if detailed:
+            names += ("turn_steps", "turn_clearance_sum", "turn_reach_sum", "turn_size_sum",
+                      "turn_yaw_error_sum", "up_steps", "front_support_samples",
+                      "front_extension_sum", "front_knee_abs_sum", "front_fold_samples",
+                      "front_swing_samples", "front_swing_fold_samples")
+        stats = {name: torch.zeros(env.num_envs, device=env.device) for name in names}
         env._m20_gait_stats = stats
     reset = env.episode_length_buf <= 1
     for value in stats.values():
         value[reset] = 0
+    rear_samples = load[:, 2:] & down[:, None]
+    stats["rear_support_samples"] += rear_samples.sum(dim=1)
+    stats["rear_extension_sum"] += (extension[:, 2:] * rear_samples.float()).sum(dim=1)
+    stats["rear_fold_samples"] += ((fold > 0) & rear_samples).sum(dim=1)
+    stats["down_steps"] += down.float()
+    if not detailed:
+        return cached
     valid_turn = turn & ground_valid.all(dim=1)
     stats["turn_steps"] += valid_turn.float()
     stats["turn_clearance_sum"] += torch.where(valid_turn, clearance.clamp_min(0).mean(dim=1), 0)
     stats["turn_reach_sum"] += torch.where(valid_turn, reach.mean(dim=1), 0)
     stats["turn_size_sum"] += size.mean(dim=1) * turn.float()
     stats["turn_yaw_error_sum"] += (robot.data.root_ang_vel_b[:, 2] - command[:, 2]).abs() * valid_turn.float()
-    rear_samples = load[:, 2:] & down[:, None]
-    stats["rear_support_samples"] += rear_samples.sum(dim=1)
-    stats["rear_extension_sum"] += (extension[:, 2:] * rear_samples.float()).sum(dim=1)
-    stats["rear_fold_samples"] += ((fold > 0) & rear_samples).sum(dim=1)
-    stats["down_steps"] += down.float()
     stats["up_steps"] += up.float()
     stats["front_support_samples"] += front_support.sum(dim=1)
     stats["front_extension_sum"] += (extension[:, :2] * front_support.float()).sum(dim=1)
@@ -2153,6 +4316,13 @@ def ascent_front_fold_cost(env, asset_cfg, hip_cfg, knee_cfg, sensor_cfg, contac
     """
     c = _context(env, asset_cfg, hip_cfg, knee_cfg, sensor_cfg, contact_sensor_cfg)
     return (c["front_fold"] + c["front_swing_fold"]).mean(dim=1)
+
+
+def descent_front_posture_cost(env, asset_cfg, hip_cfg, knee_cfg, sensor_cfg, contact_sensor_cfg):
+    """Limit excess front reach during the first three descending transfers."""
+    _stair_step_completion_events(env, asset_cfg, sensor_cfg, contact_sensor_cfg)
+    return _context(env, asset_cfg, hip_cfg, knee_cfg, sensor_cfg,
+                    contact_sensor_cfg)["descent_front_posture_cost"].mean(dim=1)
 
 
 def compact_turn_air_time(env, command_name, sensor_cfg, asset_cfg, threshold,
@@ -2227,6 +4397,107 @@ def descent_entry_position_band(depth,relax):
     return lower,upper
 
 
+def _same_side_interleg_distances(env, wheels):
+    """Wheel-center and rear-wheel-to-front-shank distances (capsule proxy).
+
+    The segment joins knee and axle origins; the 0.20 m threshold includes
+    the wheel radius, shank thickness/offset and a margin. This is a soft
+    conservative envelope, not a mesh contact detector.
+    """
+    robot = env.scene["robot"]
+    ids = getattr(env, "_m20_front_knee_body_ids", None)
+    if ids is None:
+        ids, _ = robot.find_bodies(["fl_knee", "fr_knee"], preserve_order=True)
+        if len(ids) != 2:
+            raise ValueError("M20 interleg guard requires fl_knee and fr_knee bodies")
+        env._m20_front_knee_body_ids = ids
+    knee = robot.data.body_pos_w[:, ids]
+    segment = wheels[:, :2] - knee
+    rear = wheels[:, 2:]
+    t = ((rear - knee) * segment).sum(-1) / segment.square().sum(-1).clamp_min(1.0e-6)
+    nearest = knee + t.clamp(0.0, 1.0)[..., None] * segment
+    return (torch.linalg.vector_norm(wheels[:, :2] - rear, dim=-1),
+            torch.linalg.vector_norm(rear - nearest, dim=-1))
+
+
+def _same_side_interleg_closing_speeds(env, wheels, wheel_velocity):
+    """Positive speed means separation is shrinking, including front motion.
+
+    A moving knee changes the nearest point on the shank segment. Using that
+    point's interpolated velocity catches rear-wheel/front-calf approaches
+    which wheel-center closing speed alone can miss.
+    """
+    robot = env.scene["robot"]
+    knee_ids = env._m20_front_knee_body_ids
+    knee = robot.data.body_pos_w[:, knee_ids]
+    knee_velocity = robot.data.body_lin_vel_w[:, knee_ids]
+    wheel_delta = wheels[:, :2] - wheels[:, 2:]
+    pair_distance = torch.linalg.vector_norm(wheel_delta, dim=-1).clamp_min(1.0e-6)
+    pair_closing = ((wheel_velocity[:, 2:] - wheel_velocity[:, :2]) * wheel_delta).sum(-1) / pair_distance
+    segment = wheels[:, :2] - knee
+    t = (((wheels[:, 2:] - knee) * segment).sum(-1)
+         / segment.square().sum(-1).clamp_min(1.0e-6)).clamp(0.0, 1.0)
+    nearest = knee + t[..., None] * segment
+    nearest_velocity = knee_velocity + t[..., None] * (wheel_velocity[:, :2] - knee_velocity)
+    shank_delta = nearest - wheels[:, 2:]
+    shank_distance = torch.linalg.vector_norm(shank_delta, dim=-1).clamp_min(1.0e-6)
+    shank_closing = ((wheel_velocity[:, 2:] - nearest_velocity) * shank_delta).sum(-1) / shank_distance
+    return pair_closing, shank_closing
+
+
+def interleg_clearance_cost(distance, margin, critical_margin, scale):
+    """Smooth warning followed by an uncapped quadratic near collision.
+
+    The compact safe band pays zero. A short wheelbase cannot cheaply trade
+    away the last centimetres of clearance after the warning has activated.
+    """
+    warning = (margin - distance).clamp_min(0.0) / scale
+    critical = ((critical_margin - distance).clamp_min(0.0)
+                / TUNING["interleg_critical_scale"])
+    return (2.0 * (torch.sqrt(1.0 + warning.square()) - 1.0)
+            + TUNING["interleg_critical_gain"] * critical.square())
+
+
+def descent_transfer_risk(pair_distance, shank_distance, rear_departing, closing_speed=None,
+                          shank_closing_speed=None):
+    """Allow safe following; brake closing wheel/wheel and wheel/calf motion.
+
+    ``rear_departing`` is the physical transfer/motion mask, never a prescribed
+    front-tread number. Neither forward commands nor fixed support order are
+    required, so a pause or reversal cannot disable a live clearance warning.
+    """
+    if closing_speed is None:
+        closing_speed = torch.zeros_like(pair_distance)
+    if shank_closing_speed is None:
+        shank_closing_speed = closing_speed
+    wheel_lookahead = closing_speed.clamp_min(0.0) * TUNING["entry_transfer_lookahead_s"]
+    if TUNING.get("v1_motion_baseline", False):
+        # v1 used wheel-pair closing speed for both predictive proxies.
+        shank_closing_speed = closing_speed
+    shank_lookahead = shank_closing_speed.clamp_min(0.0) * TUNING["entry_transfer_lookahead_s"]
+    # The larger warning envelope is predictive, not a permanent demand for
+    # a long wheelbase: only a closing rear wheel needs the extra clearance.
+    wheel_limit = TUNING["entry_wheel_spacing_min"] + wheel_lookahead.clamp_max(
+        TUNING["entry_transfer_wheel_guard"] - TUNING["entry_wheel_spacing_min"])
+    shank_limit = TUNING["descent_wheel_shank_min"] + shank_lookahead.clamp_max(
+        TUNING["entry_transfer_shank_guard"] - TUNING["descent_wheel_shank_min"])
+    wheel_risk = interleg_clearance_cost(pair_distance, wheel_limit,
+        TUNING["interleg_wheel_critical"], TUNING["entry_wheel_spacing_scale"])
+    shank_risk = interleg_clearance_cost(shank_distance, shank_limit,
+        TUNING["interleg_shank_critical"], TUNING["descent_wheel_shank_scale"])
+    wheel_near = ((TUNING["entry_transfer_wheel_guard"] - pair_distance)
+                  / (TUNING["entry_transfer_wheel_guard"] - TUNING["entry_wheel_spacing_min"])).clamp(0.0, 1.0)
+    shank_near = ((TUNING["entry_transfer_shank_guard"] - shank_distance)
+                  / (TUNING["entry_transfer_shank_guard"] - TUNING["descent_wheel_shank_min"])).clamp(0.0, 1.0)
+    wheel_braking = wheel_near * (closing_speed.clamp_min(0.0) / TUNING["interleg_closing_speed_scale"]).square()
+    shank_braking = shank_near * (shank_closing_speed.clamp_min(0.0) / TUNING["interleg_closing_speed_scale"]).square()
+    risk = torch.maximum(wheel_risk, shank_risk)
+    risk += TUNING["interleg_braking_mix"] * torch.maximum(wheel_braking, shank_braking)
+    per_side = risk * rear_departing
+    cost = 0.5 * (per_side.mean(-1) + per_side.amax(-1))
+    return cost, ((risk > 0.0) & rear_departing).any(-1)
+
+
 def _descent_entry_retract_context(env,scan,down,wheels,body_delta,ground,valid,loaded,
                                     contact_time,wheel_velocity,root_velocity,root_quat,command,relax,scanner_pos=None):
     """One bounded hip-relative adjustment per physical descending flight entry.
@@ -2246,16 +4517,26 @@ def _descent_entry_retract_context(env,scan,down,wheels,body_delta,ground,valid,
             lead_progress_best=zero(2),lead_progress_initialized=zero().bool(),
             lead_progress_total=zero(2),lead_front_event_total=zero(2),
             lead_pair_paid=zero().bool(),lead_pair_event=zero().bool(),lead_phase_started=zero().bool(),lead_wait_time=zero(),
+            lead_candidate_search_steps=zero(),
+            lead_phase_not_started_steps=zero(),lead_scan_empty_steps=zero(),
+            lead_no_matching_height_steps=zero(),lead_spacing_rejected_steps=zero(),
             lead_attempts=zero(),lead_successes=zero(),lead_phase_samples=zero(),early_rear_transfer_steps=zero(),
             count=torch.zeros(n,dtype=torch.long,device=device),history_xy=zero(64,2),history_heading=zero(64,2),history_top=zero(64),
             stats={k:zero(2) for k in ("samples","x_sum","in_band","too_forward","too_rearward","credit","blocked","transfer_samples","transfer_excess","transfer_swing_samples","transfer_cost_sum","transfer_compact")},
-            started=zero())
+            safety_samples=zero(),safety_side_samples=zero(2),pair_distance_sum=zero(2),shank_distance_sum=zero(2),
+            pair_distance_min=torch.full((n,2),torch.inf,device=device),
+            shank_distance_min=torch.full((n,2),torch.inf,device=device),
+            wheel_low_samples=zero(2),shank_low_samples=zero(2),
+            wheel_critical_samples=zero(2),shank_critical_samples=zero(2),
+            wheel_overlap_proxy_samples=zero(2),shank_overlap_proxy_samples=zero(2),
+            closing_risk_samples=zero(),closing_risk_cost_sum=zero(),closing_motion_samples=zero(),
+            unsafe_transfer_steps=zero(),rear_transfer_steps=zero(),started=zero())
         env._m20_descent_entry_state=state
     reset=env.episode_length_buf<=1
     for key,value in state.items():
         if key=="stats":
             for item in value.values():item[reset]=0
-        else:value[reset]=True if key=="ready" else 0
+        else:value[reset]=True if key=="ready" else (torch.inf if key.endswith("_min") else 0)
     lower,upper=descent_entry_position_band(-body_delta[:,2:,2],relax)
     rear_x=body_delta[:,2:,0]
     error=(lower-rear_x).clamp_min(0)+(rear_x-upper).clamp_min(0)
@@ -2301,6 +4582,9 @@ def _descent_entry_retract_context(env,scan,down,wheels,body_delta,ground,valid,
     state["lead_progress_best"][start]=0;state["lead_progress_initialized"][start]=False
     state["lead_pair_paid"][start]=False;state["lead_pair_event"][start]=False
     state["lead_phase_started"][start]=False;state["lead_wait_time"][start]=0
+    state["lead_candidate_search_steps"][start]=0
+    state["lead_phase_not_started_steps"][start]=0;state["lead_scan_empty_steps"][start]=0
+    state["lead_no_matching_height_steps"][start]=0;state["lead_spacing_rejected_steps"][start]=0
     state["lead_phase_samples"][start]=0;state["early_rear_transfer_steps"][start]=0
     state["active"]|=start;state["ready"][start]=False
     # Each rear foot loses its entrance bonus permanently on leaving this top.
@@ -2323,18 +4607,32 @@ def _descent_entry_retract_context(env,scan,down,wheels,body_delta,ground,valid,
     descent=getattr(env,"_m20_stair_step_state",None)
     lead_front_event=torch.zeros(n,2,dtype=torch.bool,device=device)
     lead_progress_gain=torch.zeros(n,2,device=device)
+    lead_sequence_event=torch.zeros(n,dtype=torch.bool,device=device)
     early_rear_transfer=torch.zeros(n,dtype=torch.bool,device=device)
     state["lead_pair_event"].zero_()
     if descent is not None:
         candidate_delta=scan["ascending_edges_upper_z"]-scan["ascending_edges_lower_z"]
         candidate_xy=scanner_pos[:,None,:]+heading[:,None,:]*scan["ascending_edges_x"][None,:,None]
         candidate_distance=((candidate_xy-descent["edge_xy"][:,None,:])*descent["heading"][:,None,:]).sum(-1)
-        next_edge=(scan["edge_geometry"]&(candidate_delta < 0.0)&
-            ((scan["ascending_edges_lower_z"]-descent["target_z"][:,None]).abs() < TUNING["riser_height_tolerance"])&
-            (candidate_distance >= TUNING["entry_lead_min_spacing"])&
-            (candidate_distance <= TUNING["entry_lead_max_spacing"]))
+        descending_edge=scan["edge_geometry"]&(candidate_delta < 0.0)
+        matching_height=descending_edge&(
+            (scan["ascending_edges_lower_z"]-descent["target_z"][:,None]).abs()
+            < TUNING["riser_height_tolerance"])
+        in_spacing=((candidate_distance >= TUNING["entry_lead_min_spacing"])
+                    &(candidate_distance <= TUNING["entry_lead_max_spacing"]))
+        next_edge=matching_height&in_spacing
         nearest=torch.where(next_edge,candidate_distance,torch.inf).argmin(dim=1)
         found=next_edge.any(dim=1)&state["active"]&descent["active"]&~descent["up"]
+        entry_active=state["active"]&descent["active"]&~descent["up"]
+        front_phase_ready=entry_active&descent["front_reached"].all(-1)
+        searching=front_phase_ready&~state["lead_valid"]
+        state["lead_candidate_search_steps"]+=searching
+        state["lead_phase_not_started_steps"]+=entry_active&~descent["front_reached"].all(-1)
+        state["lead_scan_empty_steps"]+=searching&~scan["edge_geometry"].any(-1)
+        state["lead_no_matching_height_steps"]+=(searching&scan["edge_geometry"].any(-1)
+                                                    &~matching_height.any(-1))
+        state["lead_spacing_rejected_steps"]+=(searching&matching_height.any(-1)
+                                                 &~(matching_height&in_spacing).any(-1))
         latch=found&~state["lead_valid"]
         state["lead_xy"][latch]=candidate_xy[latch,nearest[latch]]
         state["lead_target_z"][latch]=scan["ascending_edges_upper_z"][latch,nearest[latch]]
@@ -2355,9 +4653,9 @@ def _descent_entry_retract_context(env,scan,down,wheels,body_delta,ground,valid,
         lead_z_error=(wheels[:,:2,2]-(state["lead_target_z"][:,None]+front_radius)).abs()
         lead_score=torch.exp(-0.5*((lead_x_error/TUNING["entry_lead_x_scale"]).square()+
             (lead_z_error/TUNING["entry_lead_z_scale"]).square()))
-        # Keep front-foot shaping active through rear unloading. Stable rear
-        # support is still required for touchdown credit; the separate early
-        # transfer cost preserves the desired front-before-rear sequence.
+        # The optional historical touchdown objective still requires stable
+        # rear support. Its reward weights are zero in the compact-posture
+        # teacher; the independent transfer cost protects physical clearance.
         progress_active=lead_phase
         initialize_progress=progress_active&~state["lead_progress_initialized"]
         state["lead_progress_best"][initialize_progress]=lead_score[initialize_progress]
@@ -2376,9 +4674,10 @@ def _descent_entry_retract_context(env,scan,down,wheels,body_delta,ground,valid,
         state["lead_front_paid"]|=lead_front_event
         state["lead_progress_total"]+=lead_progress_gain
         state["lead_front_event_total"]+=lead_front_event
-        state["lead_pair_event"]=state["active"]&state["lead_front_paid"].all(-1)&~state["lead_pair_paid"]
+        state["lead_pair_event"]=state["active"]&state["lead_front_paid"].all(-1)&rear_stable_top.all(-1)&~state["lead_pair_paid"]
         state["lead_pair_paid"]|=state["lead_pair_event"]
         state["lead_successes"]+=state["lead_pair_event"]
+        lead_sequence_event=state["lead_pair_event"]
         lead_phase_before_pair=(state["active"]&state["lead_phase_started"]&
             state["lead_valid"]&~state["lead_pair_paid"])
         early_rear_transfer=lead_phase_before_pair&~rear_stable_top.all(-1)
@@ -2388,6 +4687,12 @@ def _descent_entry_retract_context(env,scan,down,wheels,body_delta,ground,valid,
         state["lead_wait_time"]+=waiting*env.step_dt
     lead_expired=state["lead_phase_started"]&(state["lead_wait_time"]>=TUNING["entry_lead_wait_timeout"])
     transfer_done=state["settled"].all(-1)&(~state["lead_phase_started"]|state["lead_pair_paid"]|lead_expired)
+    second_tread_objective = any(TUNING[key] > 0 for key in (
+        "entry_front_lead_weight", "entry_front_progress_weight", "entry_sequence_weight"))
+    if not second_tread_objective:
+        # With that objective disabled, two safely landed rear wheels complete
+        # entry immediately; do not keep its old second-tread waiting timeout.
+        transfer_done = state["settled"].all(-1)
     state["active"] &= near&aligned&~transfer_done
     # Only a new flat landing with no active descending transfer rearms the
     # detector. The physical-entry history also blocks retreat/reentry farming.
@@ -2435,15 +4740,79 @@ def _descent_entry_retract_context(env,scan,down,wheels,body_delta,ground,valid,
     stats["transfer_swing_samples"]+=guard&~loaded[:,2:]
     stats["transfer_cost_sum"]+=cost
     stats["transfer_compact"]+=guard&~loaded[:,2:]&(compact_cost>0)
-    lead_reward=(lead_progress_gain.sum(-1)+0.5*lead_front_event.float().sum(-1)
-        +2.0*state["lead_pair_event"].float())
+    # Keep the three learning signals separate so TensorBoard can show whether
+    # shaping, stable touchdown, or the complete front-before-rear sequence fires.
+    lead_progress_reward=lead_progress_gain.sum(-1)
+    lead_reward=0.5*lead_front_event.float().sum(-1)
+    sequence_reward=2.0*lead_sequence_event.float()
+    # Soft center-distance margin for each same-side front/rear wheel pair.
+    # 0.28 m leaves 10 cm over the 0.18 m sum of nominal wheel radii.
+    pair_distance, shank_distance = _same_side_interleg_distances(env, wheels)
+    spacing_cost=interleg_clearance_cost(pair_distance,TUNING["entry_wheel_spacing_min"],
+        TUNING["interleg_wheel_critical"],TUNING["entry_wheel_spacing_scale"])
+    # Keep safety shaping throughout descent, including the same-tread phase
+    # after the entry ledger has completed.
+    safety_down = down.clone()
+    if phase is not None:
+        safety_down |= phase["active"]
+    spacing_cost=spacing_cost*safety_down[:, None].float()
+    shank_cost = interleg_clearance_cost(shank_distance,TUNING["descent_wheel_shank_min"],
+        TUNING["interleg_shank_critical"],TUNING["descent_wheel_shank_scale"]) * safety_down[:, None]
+    rear_departing = safety_down[:, None] & (~loaded[:, 2:] | ~on_top)
+    closing_speed, shank_closing_speed = _same_side_interleg_closing_speeds(env,wheels,wheel_velocity)
+    closing_motion = safety_down[:, None] & (
+        torch.maximum(closing_speed,shank_closing_speed)>TUNING["interleg_closing_gate"])
+    # A front wheel moving backwards toward a planted rear wheel is just as
+    # hazardous as rear swing. Physical relative motion covers both cases.
+    motion_guard = rear_departing if TUNING.get("v1_motion_baseline", False) else rear_departing | closing_motion
+    unsafe_transfer_cost, unsafe_transfer = descent_transfer_risk(
+        pair_distance, shank_distance, motion_guard, closing_speed, shank_closing_speed)
+    _, unsafe_rear_transfer = descent_transfer_risk(
+        pair_distance, shank_distance, rear_departing, closing_speed, shank_closing_speed)
+    safety_side = safety_down[:,None] & torch.isfinite(pair_distance) & torch.isfinite(shank_distance)
+    state["safety_samples"] += safety_down
+    state["safety_side_samples"] += safety_side
+    state["pair_distance_sum"] += torch.where(safety_side,pair_distance,0.0)
+    state["shank_distance_sum"] += torch.where(safety_side,shank_distance,0.0)
+    state["pair_distance_min"] = torch.minimum(state["pair_distance_min"],torch.where(safety_side,pair_distance,torch.inf))
+    state["shank_distance_min"] = torch.minimum(state["shank_distance_min"],torch.where(safety_side,shank_distance,torch.inf))
+    state["wheel_low_samples"] += safety_side & (pair_distance<TUNING["entry_wheel_spacing_min"])
+    state["shank_low_samples"] += safety_side & (shank_distance<TUNING["descent_wheel_shank_min"])
+    state["wheel_critical_samples"] += safety_side & (pair_distance<TUNING["interleg_wheel_critical"])
+    state["shank_critical_samples"] += safety_side & (shank_distance<TUNING["interleg_shank_critical"])
+    state["wheel_overlap_proxy_samples"] += safety_side & (pair_distance<2*TUNING["wheel_radius"])
+    state["shank_overlap_proxy_samples"] += safety_side & (shank_distance<TUNING["wheel_radius"]+TUNING["interleg_shank_proxy_radius"])
+    state["closing_motion_samples"] += motion_guard.any(-1)
+    state["closing_risk_samples"] += unsafe_transfer
+    state["closing_risk_cost_sum"] += unsafe_transfer_cost
+    state["rear_transfer_steps"] += rear_departing.any(-1)
+    state["unsafe_transfer_steps"] += unsafe_rear_transfer
     return dict(gain=gain.mean(-1),cost=cost.mean(-1),lead_reward=lead_reward,
-        early_rear_transfer_cost=early_rear_transfer.float())
+        lead_progress_reward=lead_progress_reward,
+        sequence_reward=sequence_reward, wheel_spacing_cost=spacing_cost, shank_cost=shank_cost,
+        early_rear_transfer_cost=unsafe_transfer_cost)
 
 
 def stair_descent_entry_retract(env,asset_cfg,hip_cfg,knee_cfg,sensor_cfg,contact_sensor_cfg):
     """Once-only progress toward a supported hip-relative rear-wheel band."""
-    return _context(env,asset_cfg,hip_cfg,knee_cfg,sensor_cfg,contact_sensor_cfg)["entry_retract_gain"]/env.step_dt
+    gain = _context(env,asset_cfg,hip_cfg,knee_cfg,sensor_cfg,contact_sensor_cfg)["entry_retract_gain"]
+    return gain * _stair_forward_command_gate(env) / env.step_dt
+
+
+def _descent_entry_guide_scale(env) -> float:
+    """Linear training-iteration schedule for the optional front-lead shaping."""
+    schedule = getattr(env, "_m20_descent_entry_guide_schedule", None)
+    if not schedule:
+        return 1.0
+    steps_per_iteration = max(int(schedule["steps_per_iteration"]), 1)
+    iteration = int(schedule.get("iteration_offset", 0)) + int(env.common_step_counter) // steps_per_iteration
+    guided_iterations = max(int(schedule["guided_iterations"]), 0)
+    decay_iterations = max(int(schedule["decay_iterations"]), 0)
+    if iteration < guided_iterations:
+        return 1.0
+    if decay_iterations == 0:
+        return 0.0
+    return max(0.0, 1.0 - (iteration - guided_iterations) / decay_iterations)
 
 
 def stair_descent_entry_position_cost(env,asset_cfg,hip_cfg,knee_cfg,sensor_cfg,contact_sensor_cfg):
@@ -2452,13 +4821,40 @@ def stair_descent_entry_position_cost(env,asset_cfg,hip_cfg,knee_cfg,sensor_cfg,
 
 
 def stair_descent_entry_front_lead_reward(env,asset_cfg,hip_cfg,knee_cfg,sensor_cfg,contact_sensor_cfg):
-    """Reward front-foot progress toward the second tread and stable support there."""
-    return _context(env,asset_cfg,hip_cfg,knee_cfg,sensor_cfg,contact_sensor_cfg)["entry_front_lead_reward"]/env.step_dt
+    """Reward each front wheel's stable touchdown on the second tread."""
+    reward = _context(env,asset_cfg,hip_cfg,knee_cfg,sensor_cfg,contact_sensor_cfg)["entry_front_lead_reward"]
+    return reward * _descent_entry_guide_scale(env) * _stair_forward_command_gate(env) / env.step_dt
+
+
+def stair_descent_entry_front_progress_reward(env,asset_cfg,hip_cfg,knee_cfg,sensor_cfg,contact_sensor_cfg):
+    """Dense, non-repeating potential gain as the front wheels approach tread two."""
+    reward = _context(env,asset_cfg,hip_cfg,knee_cfg,sensor_cfg,contact_sensor_cfg)["entry_front_progress_reward"]
+    return reward * _descent_entry_guide_scale(env) * _stair_forward_command_gate(env) / env.step_dt
+
+
+def stair_descent_entry_sequence_reward(env,asset_cfg,hip_cfg,knee_cfg,sensor_cfg,contact_sensor_cfg):
+    """One-time reward when both fronts stabilize on tread two with both rears on top."""
+    reward = _context(env,asset_cfg,hip_cfg,knee_cfg,sensor_cfg,contact_sensor_cfg)["entry_sequence_reward"]
+    return reward * _descent_entry_guide_scale(env) * _stair_forward_command_gate(env) / env.step_dt
+
+
+def stair_descent_entry_wheel_spacing_left_cost(env,asset_cfg,hip_cfg,knee_cfg,sensor_cfg,contact_sensor_cfg):
+    """Penalize left front/rear wheel centers entering the collision margin."""
+    return _context(env,asset_cfg,hip_cfg,knee_cfg,sensor_cfg,contact_sensor_cfg)["entry_wheel_spacing_left_cost"]
+
+
+def stair_descent_entry_wheel_spacing_right_cost(env,asset_cfg,hip_cfg,knee_cfg,sensor_cfg,contact_sensor_cfg):
+    """Penalize right front/rear wheel centers entering the collision margin."""
+    return _context(env,asset_cfg,hip_cfg,knee_cfg,sensor_cfg,contact_sensor_cfg)["entry_wheel_spacing_right_cost"]
 
 
 def stair_descent_entry_rear_early_transfer_cost(env,asset_cfg,hip_cfg,knee_cfg,sensor_cfg,contact_sensor_cfg):
-    """Penalize rear departure before the front axle has reached the second tread."""
+    """Retain transfer protection when wheel or shank separation is unsafe."""
     return _context(env,asset_cfg,hip_cfg,knee_cfg,sensor_cfg,contact_sensor_cfg)["entry_rear_early_transfer_cost"]
+
+
+def stair_descent_wheel_shank_cost(env,asset_cfg,hip_cfg,knee_cfg,sensor_cfg,contact_sensor_cfg):
+    return _context(env,asset_cfg,hip_cfg,knee_cfg,sensor_cfg,contact_sensor_cfg)["descent_wheel_shank_cost"]
 
 
 def descent_rear_forward_cost(env, asset_cfg, hip_cfg, knee_cfg, sensor_cfg, contact_sensor_cfg):
@@ -2471,31 +4867,68 @@ def ascent_front_body_clearance_cost(env, asset_cfg, hip_cfg, knee_cfg, sensor_c
     return _context(env,asset_cfg,hip_cfg,knee_cfg,sensor_cfg,contact_sensor_cfg)["body_gap"]
 
 
+def _update_descent_front_posture_stats(env, level_index, support, swing,
+                                        extension, forward, knee_abs, knee_error, cost, reference_forward):
+    """Track front-leg reach and posture cost separately for the first three drops."""
+    state = getattr(env, "_m20_descent_front_posture_stats", None)
+    if state is None or state["support_samples"].shape[0] != env.num_envs:
+        state = {}
+        metrics = ("samples", "forward_sum", "cost_sum", "reference_sum",
+                   "reach_excess_sum", "reach_excess_samples", "extension_sum",
+                   "knee_abs_sum", "knee_error_sum")
+        for phase in ("support", "swing"):
+            for metric in metrics:
+                state[f"{phase}_{metric}"] = torch.zeros(env.num_envs, 3, device=env.device)
+        env._m20_descent_front_posture_stats = state
+    reset = env.episode_length_buf <= 1
+    for value in state.values():
+        value[reset] = 0.0
+    for level in range(3):
+        level_mask = level_index == level
+        for phase, mask in (("support", support), ("swing", swing)):
+            selected = mask & level_mask[:, None]
+            state[f"{phase}_samples"][:, level] += selected.sum(dim=1)
+            state[f"{phase}_forward_sum"][:, level] += (forward * selected).sum(dim=1)
+            state[f"{phase}_extension_sum"][:, level] += (extension * selected).sum(dim=1)
+            state[f"{phase}_knee_abs_sum"][:, level] += (knee_abs * selected).sum(dim=1)
+            state[f"{phase}_knee_error_sum"][:, level] += (knee_error * selected).sum(dim=1)
+            state[f"{phase}_cost_sum"][:, level] += (cost * selected).sum(dim=1)
+            margin = TUNING[f"descent_front_{phase}_forward_margin"]
+            excess = (forward - reference_forward - margin).clamp_min(0.0)
+            state[f"{phase}_reference_sum"][:, level] += (reference_forward * selected).sum(dim=1)
+            state[f"{phase}_reach_excess_sum"][:, level] += (excess * selected).sum(dim=1)
+            state[f"{phase}_reach_excess_samples"][:, level] += ((excess > 0.0) & selected).sum(dim=1)
+
+
 def _update_pose_stats(env,up,down,front_a,front_load,front_air,loaded_cost,air_cost,
                        rear_b,rear_g,rear_load,rear_cost,gap,gap_valid,load,ground_valid):
-    names = ("front_loaded_samples","front_loaded_a_sum","front_loaded_bad",
-             "front_swing_samples","front_swing_a_sum","front_swing_bad",
-             "rear_loaded_samples","rear_b_sum","rear_g_sum","rear_bad",
+    detailed = _detailed_teacher_diagnostics(env)
+    names = ("rear_loaded_samples","rear_b_sum","rear_g_sum","rear_bad",
              "rear_entry_samples","rear_entry_b_sum","rear_entry_g_sum")
+    if detailed:
+        names += ("front_loaded_samples","front_loaded_a_sum","front_loaded_bad",
+                  "front_swing_samples","front_swing_a_sum","front_swing_bad")
     state = getattr(env,"_m20_pose_stats",None)
     if state is None:
         state = {name:torch.zeros(env.num_envs,2,device=env.device) for name in names}
-        state.update({name:torch.zeros(env.num_envs,device=env.device) for name in
-                      ("gap_samples","gap_sum","gap_bad","up_steps","down_steps","loaded_without_local_map")})
-        state["front_loaded_a_min"] = torch.full((env.num_envs,2),torch.pi,device=env.device)
-        state["front_swing_a_min"] = torch.full((env.num_envs,2),torch.pi,device=env.device)
+        if detailed:
+            state.update({name:torch.zeros(env.num_envs,device=env.device) for name in
+                          ("gap_samples","gap_sum","gap_bad","up_steps","down_steps","loaded_without_local_map")})
+            state["front_loaded_a_min"] = torch.full((env.num_envs,2),torch.pi,device=env.device)
+            state["front_swing_a_min"] = torch.full((env.num_envs,2),torch.pi,device=env.device)
         state["rear_b_max"] = torch.full((env.num_envs,2),-torch.pi,device=env.device)
         state["rear_g_max"] = torch.full((env.num_envs,2),-torch.pi,device=env.device)
         env._m20_pose_stats = state
     reset = env.episode_length_buf <= 1
     for key,value in state.items():
         value[reset] = torch.pi if key.endswith("_min") else (-torch.pi if key.endswith("_max") else 0)
-    state["up_steps"] += up; state["down_steps"] += down
-    for phase,mask,cost in (("loaded",front_load,loaded_cost),("swing",front_air,air_cost)):
-        state[f"front_{phase}_samples"] += mask
-        state[f"front_{phase}_a_sum"] += front_a*mask
-        state[f"front_{phase}_bad"] += (cost>0)&mask
-        state[f"front_{phase}_a_min"] = torch.minimum(state[f"front_{phase}_a_min"],torch.where(mask,front_a,torch.pi))
+    if detailed:
+        state["up_steps"] += up; state["down_steps"] += down
+        for phase,mask,cost in (("loaded",front_load,loaded_cost),("swing",front_air,air_cost)):
+            state[f"front_{phase}_samples"] += mask
+            state[f"front_{phase}_a_sum"] += front_a*mask
+            state[f"front_{phase}_bad"] += (cost>0)&mask
+            state[f"front_{phase}_a_min"] = torch.minimum(state[f"front_{phase}_a_min"],torch.where(mask,front_a,torch.pi))
     state["rear_loaded_samples"] += rear_load
     state["rear_b_sum"] += rear_b*rear_load; state["rear_g_sum"] += rear_g*rear_load
     state["rear_bad"] += (rear_cost>0)&rear_load
@@ -2510,14 +4943,30 @@ def _update_pose_stats(env,up,down,front_a,front_load,front_air,loaded_cost,air_
     mask = rear_load & entry[:,None]
     state["rear_entry_samples"] += mask
     state["rear_entry_b_sum"] += rear_b*mask; state["rear_entry_g_sum"] += rear_g*mask
-    state["gap_samples"] += gap_valid
-    state["gap_sum"] += torch.where(gap_valid,gap,0)
-    state["gap_bad"] += gap_valid&(gap<TUNING["body_gap_target"])
-    state["loaded_without_local_map"] += (load&~ground_valid&(up|down)[:,None]).sum(-1)
+    if detailed:
+        state["gap_samples"] += gap_valid
+        state["gap_sum"] += torch.where(gap_valid,gap,0)
+        state["gap_bad"] += gap_valid&(gap<TUNING["body_gap_target"])
+        state["loaded_without_local_map"] += (load&~ground_valid&(up|down)[:,None]).sum(-1)
 
 
-def gait_quality_metrics(env,env_ids):
+def _detailed_gait_quality_metrics(env,env_ids):
     result = _legacy_gait_quality_metrics(env,env_ids)
+    def weighted(name,total,count):
+        # The training logger pools these sufficient statistics across reset
+        # batches before writing a scalar. Empty third-drop batches therefore
+        # cannot masquerade as perfect posture or dilute an observed mean.
+        result[name] = total/count.clamp_min(1)
+        result[f"__weighted_total__/{name}"] = total
+        result[f"__weighted_count__/{name}"] = count
+
+    def minimum(name,values,valid):
+        count = valid.sum().float()
+        value = torch.where(valid,values,torch.inf).amin() if values.numel() else count.new_zeros(())
+        result[name] = torch.where(count>0,value,0.0)
+        result[f"__minimum_value__/{name}"] = result[name]
+        result[f"__minimum_count__/{name}"] = count
+
     state = getattr(env,"_m20_pose_stats",None)
     if state is None:
         return result
@@ -2555,6 +5004,28 @@ def gait_quality_metrics(env,env_ids):
     result["front_body_gap_mean_m"] = sums["gap_sum"]/sums["gap_samples"].clamp_min(1)
     result["front_body_gap_low_fraction"] = sums["gap_bad"]/sums["gap_samples"].clamp_min(1)
     result["loaded_without_local_map_samples"] = sums["loaded_without_local_map"]
+    descent_pose = getattr(env, "_m20_descent_front_posture_stats", None)
+    if descent_pose is not None:
+        descent_sums = {key: value[env_ids].sum(0) for key, value in descent_pose.items()}
+        for level in range(3):
+            for phase in ("support", "swing"):
+                count = descent_sums[f"{phase}_samples"][level]
+                prefix = f"descent_step{level + 1}_front_{phase}"
+                result[f"{prefix}_samples"] = count
+                result[f"{prefix}_valid"] = (count>0).float()
+                result[f"{prefix}_observed_episodes"] = (
+                    descent_pose[f"{phase}_samples"][env_ids,level]>0).sum().float()
+                for name,numerator in (
+                    ("hip_wheel_length_mean_m","extension_sum"),
+                    ("forward_reach_mean_m","forward_sum"),
+                    ("knee_abs_mean_rad","knee_abs_sum"),
+                    ("knee_deviation_mean_rad","knee_error_sum"),
+                    ("posture_cost_mean","cost_sum"),
+                    ("reference_forward_mean_m","reference_sum"),
+                    ("reach_excess_mean_m","reach_excess_sum"),
+                    ("reach_excess_fraction","reach_excess_samples"),
+                ):
+                    weighted(f"{prefix}_{name}",descent_sums[f"{phase}_{numerator}"][level],count)
     swing = getattr(env,"_m20_rear_swing_stats",None)
     if swing is not None:
         ss = {k:v[env_ids].sum(0) for k,v in swing.items()}
@@ -2584,7 +5055,53 @@ def gait_quality_metrics(env,env_ids):
         result["descent_entry_front_lead_attempts"]=lead_attempts
         result["descent_entry_front_lead_successes"]=lead_successes
         result["descent_entry_front_lead_success_rate"]=lead_successes/lead_attempts.clamp_min(1)
-        result["descent_entry_rear_early_transfer_fraction"]=entry["early_rear_transfer_steps"][env_ids].sum()/lead_phase
+        # Legacy style metric: leaving the top before both fronts settle on
+        # tread two is not itself unsafe, and that style objective is disabled.
+        legacy_early = entry["early_rear_transfer_steps"][env_ids].sum()/lead_phase
+        result["descent_entry_rear_early_transfer_fraction"]=legacy_early
+        result["descent_legacy_front_second_tread_early_follow_fraction"]=legacy_early
+        result["descent_legacy_front_second_tread_objective_enabled"]=float(any(
+            TUNING[key]>0 for key in ("entry_front_lead_weight","entry_front_progress_weight","entry_sequence_weight")))
+        transfers = entry["rear_transfer_steps"][env_ids].sum()
+        result["descent_rear_transfer_samples"] = transfers
+        result["descent_rear_transfer_valid"] = (transfers>0).float()
+        weighted("descent_unsafe_rear_transfer_fraction",entry["unsafe_transfer_steps"][env_ids].sum(),transfers)
+        motion_count = entry["closing_motion_samples"][env_ids].sum()
+        result["descent_transfer_or_closing_samples"] = motion_count
+        weighted("descent_transfer_or_closing_risk_fraction",entry["closing_risk_samples"][env_ids].sum(),motion_count)
+        weighted("descent_transfer_or_closing_cost_mean",entry["closing_risk_cost_sum"][env_ids].sum(),motion_count)
+        result["descent_safety_samples"] = entry["safety_samples"][env_ids].sum()
+        for side, i in (("left", 0), ("right", 1)):
+            safety_count = entry["safety_side_samples"][env_ids,i].sum()
+            observed = entry["safety_side_samples"][env_ids,i]>0
+            result[f"descent_{side}_safety_samples"] = safety_count
+            result[f"descent_{side}_safety_valid"] = (safety_count>0).float()
+            result[f"descent_{side}_safety_observed_episodes"] = observed.sum().float()
+            for name,numerator in (
+                ("wheel_center_distance_mean_m","pair_distance_sum"),
+                ("rear_wheel_front_shank_distance_mean_m","shank_distance_sum"),
+                ("wheel_margin_violation_fraction","wheel_low_samples"),
+                ("shank_margin_violation_fraction","shank_low_samples"),
+                ("wheel_critical_clearance_fraction","wheel_critical_samples"),
+                ("shank_critical_clearance_fraction","shank_critical_samples"),
+                ("wheel_overlap_proxy_fraction","wheel_overlap_proxy_samples"),
+                ("shank_overlap_proxy_fraction","shank_overlap_proxy_samples"),
+            ):
+                weighted(f"descent_{side}_{name}",entry[numerator][env_ids,i].sum(),safety_count)
+            for name,buffer in (("wheel_center_distance","pair_distance_min"),
+                                ("rear_wheel_front_shank_distance","shank_distance_min")):
+                values = entry[buffer][env_ids,i]
+                minimum(f"descent_{side}_{name}_min_m",values,observed)
+                weighted(f"descent_{side}_{name}_episode_min_mean_m",
+                    torch.where(observed,values,0.0).sum(),observed.sum().float())
+        candidate_search=entry["lead_candidate_search_steps"][env_ids].sum().clamp_min(1)
+        result["descent_entry_lead_phase_not_started_steps"]=entry["lead_phase_not_started_steps"][env_ids].sum()
+        result["descent_entry_lead_scan_empty_steps"]=entry["lead_scan_empty_steps"][env_ids].sum()
+        result["descent_entry_lead_no_matching_height_steps"]=entry["lead_no_matching_height_steps"][env_ids].sum()
+        result["descent_entry_lead_spacing_rejected_steps"]=entry["lead_spacing_rejected_steps"][env_ids].sum()
+        result["descent_entry_lead_scan_empty_fraction"]=entry["lead_scan_empty_steps"][env_ids].sum()/candidate_search
+        result["descent_entry_lead_no_matching_height_fraction"]=entry["lead_no_matching_height_steps"][env_ids].sum()/candidate_search
+        result["descent_entry_lead_spacing_rejected_fraction"]=entry["lead_spacing_rejected_steps"][env_ids].sum()/candidate_search
         progress=entry["lead_progress_total"][env_ids].sum(0)
         front_events=entry["lead_front_event_total"][env_ids].sum(0)
         for i,leg in enumerate(("fl","fr")):
@@ -2609,7 +5126,7 @@ def gait_quality_metrics(env,env_ids):
     return result
 
 
-def stair_step_completion_metrics(env,env_ids):
+def _detailed_stair_step_completion_metrics(env,env_ids):
     result = _legacy_step_completion_metrics(env,env_ids)
     state = getattr(env,"_m20_ascent_state",None)
     if state is None:
@@ -2659,17 +5176,233 @@ def stair_step_completion_metrics(env,env_ids):
     return result
 
 
+def _descent_gait_metrics(env, env_ids):
+    """Keep descent sequence, loaded posture and rear swing visible by default."""
+    result = {}
+
+    def weighted(name, total, count):
+        result[name] = total / count.clamp_min(1)
+        result[f"__weighted_total__/{name}"] = total
+        result[f"__weighted_count__/{name}"] = count
+
+    gait = getattr(env, "_m20_gait_stats", None)
+    if gait is not None:
+        s = {key: gait[key][env_ids].sum() for key in (
+            "down_steps", "rear_support_samples", "rear_extension_sum", "rear_fold_samples")}
+        result["descent_samples"] = s["down_steps"]
+        result["rear_support_samples"] = s["rear_support_samples"]
+        weighted("rear_extension_mean_m", s["rear_extension_sum"], s["rear_support_samples"])
+        weighted("rear_fold_support_fraction", s["rear_fold_samples"], s["rear_support_samples"])
+
+    pose = getattr(env, "_m20_pose_stats", None)
+    if pose is not None:
+        samples = pose["rear_loaded_samples"][env_ids].sum(0)
+        count = samples.sum()
+        result["rear_forward_samples"] = count
+        weighted("rear_forward_excess_fraction", pose["rear_bad"][env_ids].sum(), count)
+        for coord, label in (("b", "body_b"), ("g", "gravity_g")):
+            angles = torch.rad2deg(pose[f"rear_{coord}_sum"][env_ids].sum(0))
+            weighted(f"rear_{label}_mean_deg", angles.sum(), count)
+            peaks = pose[f"rear_{coord}_max"][env_ids]
+            peak = peaks.amax() if peaks.numel() else count.new_zeros(())
+            result[f"rear_{coord}_max_deg"] = torch.rad2deg(torch.where(count > 0, peak, 0.0))
+            for i, leg in enumerate(("hl", "hr")):
+                weighted(f"{leg}_{label}_mean_deg", angles[i], samples[i])
+        for i, leg in enumerate(("hl", "hr")):
+            result[f"{leg}_loaded_samples"] = samples[i]
+            weighted(f"{leg}_forward_excess_fraction", pose["rear_bad"][env_ids, i].sum(), samples[i])
+        entry_samples = pose["rear_entry_samples"][env_ids].sum()
+        result["rear_entry_samples"] = entry_samples
+        for coord in ("b", "g"):
+            weighted(f"rear_entry_{coord}_mean_deg",
+                     torch.rad2deg(pose[f"rear_entry_{coord}_sum"][env_ids].sum()), entry_samples)
+
+    swing = getattr(env, "_m20_rear_swing_stats", None)
+    if swing is not None:
+        samples = swing["samples"][env_ids].sum(0)
+        count = samples.sum()
+        result["rear_swing_samples"] = count
+        weighted("rear_swing_excess_fraction", swing["bad"][env_ids].sum(), count)
+        for coord in ("b", "g"):
+            weighted(f"rear_swing_{coord}_positive_mean_deg",
+                     torch.rad2deg(swing[f"{coord}_sum"][env_ids].sum()), count)
+            peaks = swing[f"{coord}_max"][env_ids]
+            result[f"rear_swing_{coord}_max_deg"] = (
+                torch.rad2deg(peaks.amax()) if peaks.numel() else count.new_zeros(()))
+        for i, leg in enumerate(("hl", "hr")):
+            weighted(f"{leg}_swing_excess_fraction", swing["bad"][env_ids, i].sum(), samples[i])
+
+    entry = getattr(env, "_m20_descent_entry_state", None)
+    if entry is not None:
+        result["descent_entry_started"] = entry["started"][env_ids].sum()
+        attempts = entry["lead_attempts"][env_ids].sum()
+        successes = entry["lead_successes"][env_ids].sum()
+        phase = entry["lead_phase_samples"][env_ids].sum()
+        result["descent_entry_front_lead_attempts"] = attempts
+        result["descent_entry_front_lead_successes"] = successes
+        result["descent_entry_front_lead_phase_samples"] = phase
+        weighted("descent_entry_front_lead_success_rate", successes, attempts)
+        # This is a sequence/style measurement, independently of safety.
+        early = entry["early_rear_transfer_steps"][env_ids].sum()
+        weighted("descent_entry_rear_early_transfer_fraction", early, phase)
+        weighted("descent_legacy_front_second_tread_early_follow_fraction", early, phase)
+        result["descent_legacy_front_second_tread_objective_enabled"] = float(any(
+            TUNING[key] > 0 for key in ("entry_front_lead_weight", "entry_front_progress_weight", "entry_sequence_weight")))
+        for i, leg in enumerate(("fl", "fr")):
+            result[f"{leg}_entry_lead_progress_gain"] = entry["lead_progress_total"][env_ids, i].sum()
+            result[f"{leg}_entry_lead_stable_events"] = entry["lead_front_event_total"][env_ids, i].sum()
+        for i, leg in enumerate(("hl", "hr")):
+            s = {key: value[env_ids, i].sum() for key, value in entry["stats"].items()}
+            result[f"{leg}_entry_samples"] = s["samples"]
+            result[f"{leg}_entry_retract_credit"] = s["credit"]
+            result[f"{leg}_entry_transfer_samples"] = s["transfer_samples"]
+            for name, field in (("x_mean_m", "x_sum"), ("in_band_fraction", "in_band"),
+                                ("too_forward_fraction", "too_forward"), ("too_rearward_fraction", "too_rearward"),
+                                ("blocked_fraction", "blocked")):
+                weighted(f"{leg}_entry_{name}", s[field], s["samples"])
+            for name, field in (("excess_fraction", "transfer_excess"),
+                                ("swing_fraction", "transfer_swing_samples"),
+                                ("cost_mean", "transfer_cost_sum")):
+                weighted(f"{leg}_entry_transfer_{name}", s[field], s["transfer_samples"])
+            weighted(f"{leg}_entry_transfer_compact_fraction", s["transfer_compact"], s["transfer_swing_samples"])
+    return result
+
+
+def _core_gait_quality_metrics(env, env_ids):
+    """Reduce descent gait, posture and collision-risk statistics.
+
+    Detailed ascent/turn angles and histograms remain optional. Descent
+    sequence and rear support/swing statistics are always available.
+    """
+    result = {}
+
+    def weighted(name, total, count):
+        result[name] = total / count.clamp_min(1)
+        result[f"__weighted_total__/{name}"] = total
+        result[f"__weighted_count__/{name}"] = count
+
+    posture = getattr(env, "_m20_descent_front_posture_stats", None)
+    if posture is not None:
+        for phase in ("support", "swing"):
+            fields = ("samples", "forward_sum", "reference_sum", "reach_excess_sum",
+                      "reach_excess_samples", "cost_sum", "extension_sum", "knee_abs_sum", "knee_error_sum")
+            sums = {key: posture[f"{phase}_{key}"][env_ids].sum(0) for key in fields}
+            episodes = (posture[f"{phase}_samples"][env_ids] > 0).sum(0).float()
+            for level in range(3):
+                prefix = f"descent_step{level + 1}_front_{phase}"
+                count = sums["samples"][level]
+                result[f"{prefix}_samples"] = count
+                result[f"{prefix}_valid"] = (count > 0).float()
+                result[f"{prefix}_observed_episodes"] = episodes[level]
+                for name, field in (
+                    ("forward_reach_mean_m", "forward_sum"),
+                    ("reference_forward_mean_m", "reference_sum"),
+                    ("reach_excess_mean_m", "reach_excess_sum"),
+                    ("reach_excess_fraction", "reach_excess_samples"),
+                    ("posture_cost_mean", "cost_sum"),
+                    ("hip_wheel_length_mean_m", "extension_sum"),
+                    ("knee_abs_mean_rad", "knee_abs_sum"),
+                    ("knee_deviation_mean_rad", "knee_error_sum"),
+                ):
+                    weighted(f"{prefix}_{name}", sums[field][level], count)
+
+    entry = getattr(env, "_m20_descent_entry_state", None)
+    if entry is not None:
+        transfers = entry["rear_transfer_steps"][env_ids].sum()
+        result["descent_rear_transfer_samples"] = transfers
+        weighted("descent_unsafe_rear_transfer_fraction",
+                 entry["unsafe_transfer_steps"][env_ids].sum(), transfers)
+        closing = entry["closing_motion_samples"][env_ids].sum()
+        result["descent_transfer_or_closing_samples"] = closing
+        weighted("descent_transfer_or_closing_risk_fraction",
+                 entry["closing_risk_samples"][env_ids].sum(), closing)
+        weighted("descent_transfer_or_closing_cost_mean",
+                 entry["closing_risk_cost_sum"][env_ids].sum(), closing)
+        for side, i in (("left", 0), ("right", 1)):
+            samples = entry["safety_side_samples"][env_ids, i]
+            count = samples.sum()
+            observed = samples > 0
+            result[f"descent_{side}_safety_samples"] = count
+            for name, field in (
+                ("wheel_center_distance_mean_m", "pair_distance_sum"),
+                ("rear_wheel_front_shank_distance_mean_m", "shank_distance_sum"),
+                ("wheel_margin_violation_fraction", "wheel_low_samples"),
+                ("shank_margin_violation_fraction", "shank_low_samples"),
+                ("wheel_critical_clearance_fraction", "wheel_critical_samples"),
+                ("shank_critical_clearance_fraction", "shank_critical_samples"),
+                ("wheel_overlap_proxy_fraction", "wheel_overlap_proxy_samples"),
+                ("shank_overlap_proxy_fraction", "shank_overlap_proxy_samples"),
+            ):
+                weighted(f"descent_{side}_{name}", entry[field][env_ids, i].sum(), count)
+            for name, field in (("wheel_center_distance", "pair_distance_min"),
+                                ("rear_wheel_front_shank_distance", "shank_distance_min")):
+                values = entry[field][env_ids, i]
+                observations = observed.sum().float()
+                minimum = (torch.where(observed, values, torch.inf).amin()
+                           if values.numel() else observations.new_zeros(()))
+                key = f"descent_{side}_{name}_min_m"
+                result[key] = torch.where(observations > 0, minimum, 0.0)
+                result[f"__minimum_value__/{key}"] = result[key]
+                result[f"__minimum_count__/{key}"] = observations
+                weighted(f"descent_{side}_{name}_episode_min_mean_m",
+                         torch.where(observed, values, 0.0).sum(), observations)
+    result.update(_descent_gait_metrics(env, env_ids))
+    return result
+
+
+def gait_quality_metrics(env, env_ids):
+    detailed = _detailed_teacher_diagnostics(env)
+    result = (_detailed_gait_quality_metrics(env, env_ids) if detailed
+              else _core_gait_quality_metrics(env, env_ids))
+    result.update(descent_front_pair_metrics(env, env_ids))
+    return export_teacher_metrics(result, result.keys())
+
+
+def stair_step_completion_metrics(env, env_ids):
+    if _detailed_teacher_diagnostics(env):
+        result = _detailed_stair_step_completion_metrics(env, env_ids)
+    else:
+        # Keep traversal progress without sorting a 64-riser ledger for old
+        # strict-sequence/longest-run diagnostics at every environment reset.
+        result = {}
+        up = getattr(env, "_m20_ascent_state", None)
+        if up is not None:
+            attempts = up["front_count"][env_ids].float()
+            result["up_attempts"] = attempts.mean()
+            result["up_success_rate"] = up["front_successes"][env_ids].sum() / attempts.sum().clamp_min(1)
+            result["up_whole_body_crossings"] = up["task_crossings_total"][env_ids].mean()
+            known = torch.arange(64, device=env.device)[None] < up["map_count"][env_ids, None]
+            result["up_whole_body_crossing_coverage"] = (
+                (up["map_task_paid"][env_ids] & known).sum().float() / known.sum().clamp_min(1)
+            )
+            for axle, name in enumerate(("front", "rear")):
+                result[f"up_{name}_unsafe_events"] = up["unsafe_total"][env_ids, axle].float().mean()
+                result[f"up_{name}_landing_coverage"] = (
+                    (up["map_paid"][env_ids, :, axle] & known).sum().float() / known.sum().clamp_min(1)
+                )
+        down = getattr(env, "_m20_stair_step_state", None)
+        if down is not None:
+            attempts = down["down_attempts"][env_ids]
+            successes = down["down_successes"][env_ids]
+            result["down_attempts"] = attempts.mean()
+            result["down_successes"] = successes.mean()
+            result["down_success_rate"] = successes.sum() / attempts.sum().clamp_min(1)
+    return export_teacher_metrics(result, result.keys())
+
+
 # =============================================================================
 # 7. Terrain curriculum and per-terrain level metrics
 # =============================================================================
 
-def stair_terrain_level_mean(env, env_ids, terrain_name: str) -> torch.Tensor:
+def stair_terrain_level_mean(env, env_ids, terrain_name: str, detailed_only: bool = False) -> torch.Tensor | None:
     """Mean current row level for one terrain type, or the full population.
 
     Isaac Lab assigns terrain types to columns using cumulative proportions.
     Recreate that assignment from the active generator configuration so a
     type's curve follows the same environments through level changes.
     """
+    if detailed_only and not _detailed_teacher_diagnostics(env):
+        return None
     terrain = env.scene.terrain
     levels = terrain.terrain_levels.float()
     if terrain_name == "overall":
@@ -2700,33 +5433,104 @@ def stair_terrain_level_mean(env, env_ids, terrain_name: str) -> torch.Tensor:
     return levels[selected].mean()
 
 
+def teacher_action_smooth_l2(env) -> torch.Tensor:
+    """Second action difference with episode age, including exact-zero targets.
+
+    A zero action is a valid controller target. Masking history by its numeric
+    value makes a repeated nonzero/zero oscillation escape this cost. Keep the
+    rough-task curriculum scaling, but isolate this correction to the teacher.
+    """
+    from .rewards import get_gait_level_tensor
+
+    step = int(env.common_step_counter)
+    cached = getattr(env, "_m20_action_smooth_cache", None)
+    if cached is not None and cached["step"] == step:
+        return cached["cost"]
+    action = env.action_manager.action
+    previous = env.action_manager.prev_action
+    previous_previous = getattr(env, "_m20_action_smooth_previous_previous", None)
+    if previous_previous is None or previous_previous.shape != action.shape:
+        previous_previous = torch.zeros_like(action)
+        env._m20_action_smooth_history_steps = torch.zeros_like(env.episode_length_buf)
+    history_steps = env._m20_action_smooth_history_steps
+    history_steps[env.episode_length_buf <= 1] = 0
+    second_difference = action - 2.0 * previous + previous_previous
+    # RSL-RL can randomize the initial episode age. A large age at the first
+    # call does not mean this reward already has a complete action history.
+    valid_history = (env.episode_length_buf >= 3) & (history_steps >= 2)
+    cost = second_difference.square().sum(dim=1) * valid_history
+    cost *= get_gait_level_tensor(env)
+    history_steps.add_(1).clamp_max_(2)
+    env._m20_action_smooth_previous_previous = previous.clone()
+    env._m20_action_smooth_cache = {"step": step, "cost": cost}
+    return cost
+
+
 def stair_distance_terrain_levels(
     env,
     env_ids,
     min_commanded_translation_m: float,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
-    """Apply the M20 distance curriculum requested for the stair course.
+    """Adjust difficulty from the full motion opportunity.
 
-    Drop one level when displacement is below half a terrain tile; promote one
-    level after reaching half the commanded episode distance. Promotion wins
-    if the two thresholds overlap. Episodes with almost no translational
-    command exposure keep their level.
+    Promote at half the requested episode path; demote only below one quarter
+    (up to half a tile). Stops and intentional reversals otherwise retain the
+    level. The net-request coherence gate excludes out-and-back / turning
+    practice, whose small final displacement is intentional. Net displacement
+    still prevents back-and-forth physical motion from farming promotions.
+    The explicit zero_stop_v2 stage additionally requires observed, successful
+    stair holds before promotion and caps its training terrain level at three.
     """
     asset = env.scene[asset_cfg.name]
     terrain = env.scene.terrain
-    command = env.command_manager.get_command("base_velocity")[env_ids]
     distance = torch.linalg.vector_norm(
         asset.data.root_pos_w[env_ids, :2] - env.scene.env_origins[env_ids, :2], dim=1
     )
-    command_speed = torch.linalg.vector_norm(command[:, :2], dim=1)
-    promotion_distance = command_speed * env.max_episode_length_s * 0.5
     command_term = env.command_manager.get_term("base_velocity")
     commanded_translation = command_term.episode_commanded_translation_m[env_ids]
-    has_translation_opportunity = commanded_translation >= min_commanded_translation_m
-    move_up = has_translation_opportunity & (command_speed > 0.1) & (distance >= promotion_distance)
+    commanded_net = torch.linalg.vector_norm(
+        command_term.episode_commanded_translation_w[env_ids], dim=1
+    )
+    coherence = commanded_net / commanded_translation.clamp_min(1.0e-6)
+    has_translation_opportunity = commanded_translation >= max(float(min_commanded_translation_m), 1.0)
+    coherent_request = coherence >= 0.5
+    eligible = has_translation_opportunity & coherent_request
+    promotion_distance = 0.5 * commanded_translation
+    move_up = eligible & (distance >= promotion_distance)
+    if TUNING.get("zero_stop_v5", False):
+        stop = getattr(env, '_m20_zero_stop', None)
+        exposed = torch.zeros_like(move_up)
+        if stop is not None:
+            exposed = stop['stats']['stair']['samples'][env_ids] >= 50
+        types = terrain.terrain_types[env_ids]
+        terrain_names = tuple(terrain.cfg.terrain_generator.sub_terrains)
+        proportions = command_term.vel_command_b.new_tensor([
+            terrain.cfg.terrain_generator.sub_terrains[name].proportion for name in terrain_names])
+        cuts = proportions.cumsum(0)/proportions.sum()
+        column_fraction = types.float()/terrain.cfg.terrain_generator.num_cols+.001
+        kind = torch.searchsorted(cuts, column_fraction)
+        stair_kind = torch.zeros_like(move_up)
+        for i, name in enumerate(terrain_names):
+            if name in ('pyramid_stairs', 'pyramid_stairs_inv'):
+                stair_kind |= kind == i
+        move_up &= (~stair_kind | exposed) & (terrain.terrain_levels[env_ids] < TUNING['zero_stop_max_terrain_level'])
+    elif TUNING.get("zero_stop_v2", False):
+        stop = getattr(env, "_m20_zero_stop", None)
+        ready = torch.zeros_like(move_up)
+        if stop is not None:
+            s = stop["stats"]["stair"]
+            count = s["samples"][env_ids]
+            ready = ((count >= 50) & (s["success"][env_ids] / count.clamp_min(1.) >= .5)
+                     & (s["drift"][env_ids] / count.clamp_min(1.) <= .05))
+        # Stage 1 is deliberately conservative: motion alone must not promote
+        # environments whose stair stops have never been observed or passed.
+        move_up &= ready & (terrain.terrain_levels[env_ids] < TUNING["zero_stop_max_terrain_level"])
     tile_half_length = terrain.cfg.terrain_generator.size[0] * 0.5
-    move_down = has_translation_opportunity & (distance < tile_half_length) & ~move_up
+    demotion_distance = torch.minimum(
+        0.25 * commanded_translation, torch.full_like(commanded_translation, tile_half_length)
+    )
+    move_down = eligible & (distance < demotion_distance) & ~move_up
     terrain.update_env_origins(env_ids, move_up, move_down)
 
     mean_level = torch.mean(terrain.terrain_levels.float())
