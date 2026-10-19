@@ -23,7 +23,9 @@ exported/
 **/logs/*
 logs/
 .scratch/
-docs/
+# Publish only the technical roadmap; keep all other docs local.
+/docs/*
+!/docs/TECHNICAL_IMPROVEMENT_ROADMAP_CN.md
 outputs/
 **/recordings/*
 **/output/*
