@@ -63,7 +63,7 @@ def ledger_case(skip=False, weak=False):
 
 def check_pooling():
     ns=production_namespace()
-    pool=import_file('engineering_metric_pool',SOURCE/'metric_aggregation.py').pool_episode_metrics
+    pool=import_file('engineering_metric_pool',SOURCE/'utils/metric_aggregation.py').pool_episode_metrics
     keys=('samples','heading_sum','heading_signed_sum','heading_outside','yaw_rate_sum','yaw_rate_signed_sum','yaw_rate_max')
     stats={k:torch.zeros(2) for k in keys};stats['samples'][1]=10;stats['heading_sum'][1]=math.pi/2
     env=SimpleNamespace(device='cpu',_m20_descent_direction_state={'stats':stats})
@@ -102,7 +102,7 @@ def check_preservation():
 
 
 def check_contract():
-    pre=import_file('engineering_preflight',SOURCE/'m20_preflight.py')
+    pre=import_file('engineering_preflight',SOURCE/'utils/m20_preflight.py')
     tuning=production_namespace()['TUNING']
     deploy=ROOT/'deploy/deploy_mujoco/deploy_mujoco.py'
     result=pre.validate_control_contract(tuning,deploy)

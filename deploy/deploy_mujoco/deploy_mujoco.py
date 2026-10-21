@@ -147,6 +147,24 @@ def load_actor(checkpoint: Path) -> MLPModel:
         config = manifest.get("actor_model_config", {})
         extra = dict(stop_std_factor=config.get("stop_std_factor", .1),
                      stop_hidden_dims=config.get("stop_hidden_dims", [128, 64]))
+    elif manifest.get("m20_profile") in ("ascent_entry_v1", "ascent_entry_v1_stage2", "ascent_entry_v1_stage3", "ascent_entry_v1_stage4", "ascent_entry_v1_stage5"):
+        actor_type = (ascent_adaptive_module().AscentAdaptiveMLPModel if manifest.get('m20_profile') == 'ascent_entry_v1_stage5' else
+                      ascent_sequence_module().AscentSequenceMLPModel if manifest.get('m20_profile') == 'ascent_entry_v1_stage4' else
+                      ascent_landing_module().AscentLandingMLPModel if manifest.get('m20_profile') == 'ascent_entry_v1_stage3'
+                      else ascent_entry_module().AscentEntryMLPModel)
+        obs["motion_control"] = torch.zeros(1,3)
+        config = manifest.get("actor_model_config",{})
+        extra = dict(residual_hidden_dims=config.get('residual_hidden_dims',[128,64]),
+                     entry_hidden_dims=config.get('entry_hidden_dims',[128,64]),
+                     entry_limits=manifest.get('new_branch_limits_action_units'))
+        if manifest.get('m20_profile') in ('ascent_entry_v1_stage3', 'ascent_entry_v1_stage4', 'ascent_entry_v1_stage5'):
+            extra.update(landing_hidden_dims=config.get('landing_hidden_dims', [128, 64]),
+                         landing_limits=manifest.get('landing_limits_action_units'))
+        if manifest.get('m20_profile') in ('ascent_entry_v1_stage4', 'ascent_entry_v1_stage5'):
+            extra.update(sequence_hidden_dims=config.get('sequence_hidden_dims', [128, 64]),
+                         sequence_limits=manifest.get('sequence_limits_action_units'))
+        if manifest.get('m20_profile') == 'ascent_entry_v1_stage5':
+            extra['adaptive_exploration'] = config.get('adaptive_exploration', manifest.get('adaptive_exploration_action_std'))
     elif manifest.get("m20_profile") == "idle_stop_motion_v1":
         actor_type = motion_residual_module().MotionResidualMLPModel
         obs["motion_control"] = torch.zeros(1, 3)
@@ -169,29 +187,49 @@ def load_actor(checkpoint: Path) -> MLPModel:
     return actor
 
 
-def stop_branch_module():
-    """Load shared pure-Torch code without importing IsaacLab task registration."""
+def _training_loader():
+    """Share implementation packages with training without starting IsaacLab."""
     import importlib.util
-    name = "m20_shared_stop_branch"
+    name = 'm20_training_module_loader'
     if name not in sys.modules:
-        spec = importlib.util.spec_from_file_location(name, REPO_ROOT / "source/rl_training/rl_training/stop_branch.py")
+        path = REPO_ROOT / 'source/rl_training/rl_training/utils/module_loader.py'
+        spec = importlib.util.spec_from_file_location(name, path)
         module = importlib.util.module_from_spec(spec)
         sys.modules[name] = module
         spec.loader.exec_module(module)
     return sys.modules[name]
+
+
+def training_module(name):
+    return _training_loader().load_module(name)
+
+
+def training_source(name):
+    return _training_loader().source_path(name)
+
+
+def stop_branch_module():
+    return training_module('stop_branch')
 
 
 def motion_residual_module():
-    """Load the shared residual actor without importing IsaacLab tasks."""
-    import importlib.util
-    name = "m20_motion_residual_actor"
-    if name not in sys.modules:
-        spec = importlib.util.spec_from_file_location(
-            name, REPO_ROOT / "source/rl_training/rl_training/motion_residual_actor.py")
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[name] = module
-        spec.loader.exec_module(module)
-    return sys.modules[name]
+    return training_module('motion_residual_actor')
+
+
+def ascent_entry_module():
+    return training_module('ascent_entry_actor')
+
+
+def ascent_landing_module():
+    return training_module('ascent_landing_actor')
+
+
+def ascent_sequence_module():
+    return training_module('ascent_sequence_actor')
+
+
+def ascent_adaptive_module():
+    return training_module('ascent_adaptive_actor')
 
 
 def actor_inputs(contract, data, effective_command, previous_action, actor, requested_command=None):

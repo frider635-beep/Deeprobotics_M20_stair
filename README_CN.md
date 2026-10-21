@@ -1,12 +1,28 @@
 # M20 楼梯与多地形运动训练
 
-[English](README.md) · 更新日期：**2026-10-19**
+[English](README.md) · 更新日期：**2026-10-20**
 
 当前教师训练工程记为 **v0 基线**，保留已有任务、profile 和 checkpoint 的兼容版本标记。常用程序见[工具清单](scripts/tools/README.md)。
 
 本工程基于 [DeepRoboticsLab/rl_training](https://github.com/DeepRoboticsLab/rl_training) 与 Isaac Lab，包含 M20 轮式预训练、特权楼梯教师训练、MuJoCo 部署、遥测、回归评测和实验性感知学生接口。
 
 当前微调方向是以 `pre_train/teacher_baseline_idle_stop.pt` 为基准，保留用户已观察到的停车能力，学习运动阶段的横移与下楼前几级碰撞修正。相关代码已实现；现有记录**尚不能证明新训练的策略已解决这些问题**。
+
+2026-10-20另注册独立上楼步态任务 **`Rough-Deeprobotics-M20-StairTeacher-v1`**，自动使用`ascent_entry_v1`，完整冻结`pre_train/teacher_baseline_.pt`的基础网络与运动残差，仅训练新增上楼修正分支。v1包含入阶相位/落点引导、200 Hz接触滑移约束和60/20/20入口采样；v0任务及下文历史流程保留。实现、证据与验收边界见[v1实施说明](docs/test_docs/07_上楼步态校正/v1_20261020/实施说明.md)。候选训练完成不等于步态验收通过。
+
+```bash
+OMP_NUM_THREADS=4 python -u scripts/reinforcement_learning/rsl_rl/train.py --task Rough-Deeprobotics-M20-StairTeacher-v1 --init_actor_from pre_train/teacher_baseline_.pt --init_critic_from pre_train/teacher_baseline_.pt --run_name ascent_entry_v1 --num_envs 512 --max_iterations 1000 --seed 42 --device cuda:0 --headless
+```
+
+2000轮复核后，第二阶段通过同一v1任务的显式`--m20_profile ascent_entry_v1_stage2`启用，继承完整v1 Actor及可选Critic权重、重建优化器和计数，强化前四阶逐轮稳定支撑、前后轮独立滑移与困难入口采样。Actor 244+3、Critic 285+3及修正限幅保持原样；原`ascent_entry_v1`默认行为保留。新命令及验证证据见[第二阶段调整说明](docs/test_docs/07_上楼步态校正/v1_20261020/stage2_20261020/调整说明.md)。
+
+第二阶段800轮复核后，新增显式`--m20_profile ascent_entry_v1_stage3`：冻结完整第二阶段Actor（包括其`entry_mlp`），增加零输出初始化的入口落阶分支`247→128→64→16`，提前引导前两阶落轮并扩大入口修正范围。观测仍为Actor 244+3、Critic 285+3，**Actor结构新增一个分支**。推荐从第二阶段`model_600.pt`重新初始化，先训练400轮；日志继续写入`deeprobotics_m20_stair_teacher_v1_stage2/`。训练命令、CPU验证及几何分析局限见[第三阶段调整说明](docs/test_docs/07_上楼步态校正/v1_20261020/stage3_20261020/调整说明.md)。尚未验证新训练的步态效果。
+
+验证约定：按用户要求，不主动运行GPU短测；使用CPU、静态检查和已有数据分析，正式GPU训练由用户在终端自行启动。
+
+第三阶段400轮复核后新增`--m20_profile ascent_entry_v1_stage4`：冻结完整第三阶段Actor并增加零输出顺序修正分支，奖励同阶两前轮先后支撑、四轮完整逐阶推进、支撑裕度和到顶后放平前行，不固定前后轮阶差。新增入口速度课程，保留已有减滑约束；CPU反例、PPO集成、观察器离线重放与零分支MuJoCo保持检查通过，尚未运行第四阶段GPU训练或验证训练效果。初始化模型、手动命令及验证边界见[第四阶段调整说明](docs/test_docs/07_上楼步态校正/v1_20261020/stage4_20261020/调整说明.md)。
+
+检查点目录约定：后续v1改进训练、进度复核和候选选择默认使用`logs/rsl_rl/deeprobotics_m20_stair_teacher_v1_stage2/`下对应运行的检查点；`deeprobotics_m20_stair_teacher_v1/`保留为历史对照。选择模型时核对运行配置与checkpoint元数据。
 
 ## 任务与网络接口
 
@@ -16,6 +32,7 @@
 | `Rough-Deeprobotics-M20-v0` | 粗糙地形速度跟踪 |
 | `Rough-Deeprobotics-M20-PreTeacher-v0` | 轮式预训练 |
 | `Rough-Deeprobotics-M20-StairTeacher-v0` | 带特权信息的楼梯与混合地形教师 |
+| `Rough-Deeprobotics-M20-StairTeacher-v1` | 独立上楼入阶步态修正，完整继承带运动残差的baseline |
 | `Rough-Deeprobotics-M20-StairStudent-v0` | 实验性感知接口，尚无完整蒸馏流程 |
 
 | 教师配置 | Actor 输入 | Critic 输入 | 策略结构 |
@@ -23,6 +40,9 @@
 | 普通教师；`v1_stop` 至 `v1_stop_v4` | 244 | 285 | 共享 `244→512→256→128→16` MLP；部分配置另存训练辅助组 |
 | `v1_stop_v5` | 244＋24 | 285＋24 | 冻结基准，新增 `268→128→64→16` 零指令分支 |
 | `idle_stop_motion_v1` | 244＋3 | 285＋3 | 冻结停车基准，新增 `247→128→64→16` 运动残差分支 |
+| v1任务；`ascent_entry_v1` | 244＋3 | 285＋3 | 冻结完整运动策略，新增 `247→128→64→16` 上楼修正分支 |
+| v1任务；`ascent_entry_v1_stage2` | 244＋3 | 285＋3 | 同原v1结构，更新其上楼修正分支 |
+| v1任务；`ascent_entry_v1_stage3` | 244＋3 | 285＋3 | 冻结完整第二阶段Actor，另增 `247→128→64→16` 入口落阶分支 |
 
 教师原输入为 57 维本体/命令/历史量加 187 点高度扫描，仍输出 12 个腿位置动作和 4 个轮速度动作。学生 actor/critic 为 618 维，另有 244 维教师查询组。维数相同不代表命令语义和控制器版本相同。
 
@@ -130,12 +150,27 @@ tensorboard --logdir logs/rsl_rl/deeprobotics_m20_stair_teacher
 
 需要详细统计时在训练命令后追加 `env.teacher_detailed_diagnostics=true`；该项只调整诊断，不改变奖励或任务难度。
 
+## v1 上楼第五阶段（2026-10-21）
+
+`ascent_entry_v1_stage5` 先建立双前轮从第一阶开始的同阶先后支撑，再将任务扩展到整段楼梯和不同阶高、踏深。采用真实接触失败终止、提前准备、接触后结算的落地信用，以及经过 CPU MuJoCo 验证的初期示例；课程从 10/30 cm 扩展到 10–25 cm 阶高、25–35 cm 踏深，另保留固定 15/30 cm 参考列。
+
+从第三阶段 `2026-10-20_17-01-23_ascent_entry_v1_stage3/model_1100.pt` 新建实验。Actor 仍为 244+3 维，Critic 增加训练专用状态后为300维；不能跨 profile 直接 resume 第四阶段。
+
+```bash
+conda activate isaaclab
+bash scripts/train_ascent_stage5.sh
+```
+
+脚本先做 CPU 预检查；`bash scripts/train_ascent_stage5.sh --check-only` 仅检查、不启动训练。默认4096环境、2000轮；用 `M20_STAGE5_ENVS`、`M20_STAGE5_ITERS` 调整。示例文件在本地 `docs/test_docs/07_上楼步态校正/v1_20261021/stage5_20261021/verified_contact_demonstrations`，未随 Git 发布，新克隆需另行准备。
+
+本次完成CPU动力学示例、真实PPO更新、断点恢复与isaaclab Python环境预检查；没有做GPU/Isaac端到端启动测试，没有开始第五阶段正式训练。实现和局部示例通过不代表完整上楼步态已学会。详细证据见本地[改进与验证](docs/test_docs/07_上楼步态校正/v1_20261021/stage5_20261021/改进与验证.md)和[初始化对比](docs/test_docs/07_上楼步态校正/v1_20261021/stage5_20261021/初始化检查点对比.md)。
+
 ## 代码与开发记录
 
 - [训练源码说明与整理记录](source/rl_training/rl_training/README.md)：模块职责、任务/profile 依赖、兼容文件及删除依据。
 - [stair_teacher.py](source/rl_training/rl_training/tasks/manager_based/locomotion/velocity/mdp/stair_teacher.py)：几何、逐阶账本、奖励、命令与诊断；运行时软包络参数维护在 `TUNING`。
-- [stair_teacher_env_cfg.py](source/rl_training/rl_training/tasks/manager_based/locomotion/velocity/config/wheeled/deeprobotics_m20/stair_teacher_env_cfg.py)：观测、实体和默认奖励；[v1_stop_profile.py](source/rl_training/rl_training/v1_stop_profile.py) 应用配置覆盖。
-- [stop_branch.py](source/rl_training/rl_training/stop_branch.py)、[motion_residual_actor.py](source/rl_training/rl_training/motion_residual_actor.py)、[stair_guarded_ppo.py](source/rl_training/rl_training/stair_guarded_ppo.py)：自定义网络与 PPO 扩展。
+- [stair_teacher_env_cfg.py](source/rl_training/rl_training/tasks/manager_based/locomotion/velocity/config/wheeled/deeprobotics_m20/stair_teacher_env_cfg.py)：观测、实体和默认奖励；[v1_stop_profile.py](source/rl_training/rl_training/tasks/manager_based/locomotion/velocity/config/wheeled/deeprobotics_m20/profiles/v1_stop_profile.py) 应用配置覆盖。
+- [stop_branch.py](source/rl_training/rl_training/models/stop_branch.py)、[motion_residual_actor.py](source/rl_training/rl_training/models/motion_residual_actor.py)、[stair_guarded_ppo.py](source/rl_training/rl_training/algorithms/stair_guarded_ppo.py)：自定义网络与 PPO 扩展。
 - [deploy_mujoco.py](deploy/deploy_mujoco/deploy_mujoco.py) 与[评估工具](scripts/tools)：部署及回归。
 - [技术改进路线：截至 2026-10-19](docs/TECHNICAL_IMPROVEMENT_ROADMAP_CN.md)：时间线、改动、证据、退化与待完成事项。
 

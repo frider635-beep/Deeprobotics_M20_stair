@@ -45,6 +45,17 @@ gym.register(
 
 
 gym.register(
+    id="Rough-Deeprobotics-M20-StairTeacher-v1",
+    entry_point="rl_training.tasks.manager_based.locomotion.velocity.envs.ascent_entry_env:AscentEntryRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.stair_teacher_v1_env_cfg:DeeproboticsM20StairTeacherV1EnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.stair_teacher_v1_ppo_cfg:DeeproboticsM20StairTeacherV1PPORunnerCfg",
+    },
+)
+
+
+gym.register(
     id="Rough-Deeprobotics-M20-PreTeacher-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,

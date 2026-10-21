@@ -23,13 +23,18 @@ PROFILE_VERSIONS = {PROFILE: VERSION, "v1_stop_v2": VERSION_V2,
                     "v1_stop_v3": VERSION_V3,
                     "v1_stop_v3_target_control": VERSION_V3 + "_target_control",
                     "v1_stop_v4": VERSION_V4, "v1_stop_v5": VERSION_V5,
-                    "idle_stop_motion_v1": VERSION_V6}
+                    "idle_stop_motion_v1": VERSION_V6,
+                    "ascent_entry_v1": "m20_ascent_entry_20261020_v1",
+                    "ascent_entry_v1_stage2": "m20_ascent_entry_20261020_v1_stage2",
+                    "ascent_entry_v1_stage3": "m20_ascent_landing_20261020_v1_stage3",
+                    "ascent_entry_v1_stage4": "m20_ascent_sequence_20261020_v1_stage4",
+                    "ascent_entry_v1_stage5": "m20_ascent_adaptive_20261021_v1_stage5"}
 PROFILES = tuple(PROFILE_VERSIONS)
 
 
 def uses_stop_metadata(profile):
-    return profile in PROFILES and profile not in (PROFILE, "idle_stop_motion_v1")
-BASELINE_PATH = Path(__file__).with_name("v1_stop_baseline.json")
+    return profile in PROFILES and profile not in (PROFILE, "idle_stop_motion_v1", "ascent_entry_v1", "ascent_entry_v1_stage2", "ascent_entry_v1_stage3", "ascent_entry_v1_stage4", "ascent_entry_v1_stage5")
+BASELINE_PATH = Path(__file__).parent / "data" / "v1_stop_baseline.json"
 
 
 def baseline():
@@ -60,6 +65,21 @@ def configure_tuning(tuning, profile=PROFILE):
 
 
 def apply_profile(env_cfg, agent_cfg, profile=PROFILE):
+    if profile == 'ascent_entry_v1_stage5':
+        from .ascent_adaptive_profile import apply_profile as adaptive_profile
+        return adaptive_profile(env_cfg, agent_cfg)
+    if profile == 'ascent_entry_v1_stage4':
+        from .ascent_sequence_profile import apply_profile as sequence_profile
+        return sequence_profile(env_cfg, agent_cfg)
+    if profile == 'ascent_entry_v1_stage3':
+        from .ascent_landing_profile import apply_profile as landing_profile
+        return landing_profile(env_cfg, agent_cfg)
+    if profile == 'ascent_entry_v1_stage2':
+        from .ascent_entry_stage2_profile import apply_profile as stage2_profile
+        return stage2_profile(env_cfg, agent_cfg)
+    if profile == 'ascent_entry_v1':
+        from .ascent_entry_profile import apply_profile as ascent_profile
+        return ascent_profile(env_cfg,agent_cfg)
     from isaaclab.managers import CurriculumTermCfg, RewardTermCfg, SceneEntityCfg
     from rl_training.tasks.manager_based.locomotion.velocity.mdp import stair_teacher as teacher
     from rl_training.tasks.manager_based.locomotion.velocity.mdp import rewards
@@ -220,6 +240,38 @@ def apply_profile(env_cfg, agent_cfg, profile=PROFILE):
 
 
 def validate_initialization(init_actor, preserve_actor, profile=PROFILE, stop_teacher=None):
+    if profile == 'ascent_entry_v1_stage5':
+        from rl_training.algorithms.initialization.ascent_adaptive_init import validate_source
+        if not init_actor: raise ValueError('Stage5 requires a validated warm start')
+        validate_source(init_actor, preserve_actor)
+        return
+    if profile == 'ascent_entry_v1_stage4':
+        from rl_training.algorithms.initialization.ascent_sequence_init import validate_source
+        if not init_actor:
+            raise ValueError('Stage4 requires a complete stage3 checkpoint')
+        validate_source(init_actor, preserve_actor)
+        return
+    if profile == 'ascent_entry_v1_stage3':
+        from rl_training.algorithms.initialization.ascent_landing_init import validate_source
+        if not init_actor:
+            raise ValueError('Stage3 requires a complete stage2 checkpoint')
+        validate_source(init_actor, preserve_actor)
+        return
+    if profile == 'ascent_entry_v1_stage2':
+        from rl_training.algorithms.initialization.ascent_entry_stage2_init import validate_checkpoint
+        if not init_actor:
+            raise ValueError('Stage2 requires --init_actor_from a complete v1 ascent checkpoint')
+        validate_checkpoint(init_actor)
+        if preserve_actor and Path(preserve_actor).resolve() != Path(init_actor).resolve():
+            raise ValueError('Stage2 preserves its complete initialized v1 actor')
+        return
+    if profile == 'ascent_entry_v1':
+        expected = 'db341fd21914d7b5846ea110992332d66b41a224b38ae4d032d5d665f30f2512'
+        if not init_actor or hashlib.sha256(Path(init_actor).expanduser().read_bytes()).hexdigest()!=expected:
+            raise ValueError('ascent_entry_v1 must inherit the recorded pre_train/teacher_baseline_.pt including its motion residual')
+        if preserve_actor and Path(preserve_actor).resolve()!=Path(init_actor).resolve():
+            raise ValueError('ascent_entry_v1 preserves the complete initialization checkpoint')
+        return
     expected = baseline()["actor_sha256"]
     expected_init = (QUIET_ACTOR_SHA256 if profile == "v1_stop_v4" else
                      IDLE_STOP_ACTOR_SHA256 if profile == "idle_stop_motion_v1" else expected)

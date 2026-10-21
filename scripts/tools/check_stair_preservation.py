@@ -14,7 +14,7 @@ from rsl_rl.storage import RolloutStorage
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT/'source/rl_training'))
 import importlib.util
-spec = importlib.util.spec_from_file_location("stair_guarded_ppo", ROOT/"source/rl_training/rl_training/stair_guarded_ppo.py")
+spec = importlib.util.spec_from_file_location("stair_guarded_ppo", ROOT/"source/rl_training/rl_training/algorithms/stair_guarded_ppo.py")
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 StairGuardedPPO = module.StairGuardedPPO

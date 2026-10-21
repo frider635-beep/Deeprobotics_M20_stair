@@ -295,6 +295,10 @@ class StairGuardedPPO(PPO):
                 loss = loss+self.stop_regularization_coefficient*self.actor.stop_regularization()
             if self.motion_regularization_coefficient > 0 and self.guard_updates >= self.critic_warmup_iterations:
                 loss = loss+self.motion_regularization_coefficient*self.actor.motion_regularization()
+            # Optional stage5 contact demonstrations use the same optimizer
+            # and clipping as PPO. Other profiles install no auxiliary hook.
+            if hasattr(self, 'policy_auxiliary_loss') and self.guard_updates >= self.critic_warmup_iterations:
+                loss = loss+self.policy_auxiliary_loss()
 
             # Symmetry loss
             if self.symmetry:

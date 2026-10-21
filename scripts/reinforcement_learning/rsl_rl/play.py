@@ -179,6 +179,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     task_name = args_cli.task.split(":")[-1]
     # override configurations with non-hydra CLI arguments
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
+    is_ascent_v1=task_name=='Rough-Deeprobotics-M20-StairTeacher-v1'
+    if is_ascent_v1:
+        from rl_training.tasks.manager_based.locomotion.velocity.config.wheeled.deeprobotics_m20.profiles.ascent_entry_profile import configure_agent
+        configure_agent(agent_cfg)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else 50
 
     runner_class_name = getattr(agent_cfg, "class_name", "OnPolicyRunner")
@@ -191,7 +195,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # spawn the robot randomly in the grid (instead of their terrain levels)
     # reduce the number of terrains to save memory
-    if env_cfg.scene.terrain.terrain_generator is not None:
+    if env_cfg.scene.terrain.terrain_generator is not None and not is_ascent_v1:
         env_cfg.scene.terrain.terrain_generator.num_rows = 5
         env_cfg.scene.terrain.terrain_generator.num_cols = 5
         env_cfg.scene.terrain.terrain_generator.curriculum = False
@@ -207,6 +211,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         env_cfg.curriculum.command_levels = None
 
     if args_cli.keyboard:
+        if is_ascent_v1:
+            raise ValueError('v1 uses raw-command-gated residuals; use deploy_mujoco.py --viewer for keyboard control')
         env_cfg.scene.num_envs = 1
         env_cfg.terminations.time_out = None
         env_cfg.commands.base_velocity.debug_vis = False
@@ -228,6 +234,23 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         resume_path = retrieve_file_path(args_cli.checkpoint)
     else:
         resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
+
+    if is_ascent_v1:
+        saved_profile = (torch.load(resume_path, map_location='cpu', weights_only=True)
+                         .get('m20_training_manifest') or {}).get('m20_profile')
+        if saved_profile == 'ascent_entry_v1_stage2':
+            from rl_training.tasks.manager_based.locomotion.velocity.config.wheeled.deeprobotics_m20.profiles.ascent_entry_stage2_profile import apply_profile as apply_stage2
+            apply_stage2(env_cfg, agent_cfg)
+        elif saved_profile == 'ascent_entry_v1_stage3':
+            from rl_training.tasks.manager_based.locomotion.velocity.config.wheeled.deeprobotics_m20.profiles.ascent_landing_profile import apply_profile as apply_landing
+            apply_landing(env_cfg, agent_cfg)
+        elif saved_profile == 'ascent_entry_v1_stage5':
+            from rl_training.tasks.manager_based.locomotion.velocity.config.wheeled.deeprobotics_m20.profiles.ascent_adaptive_profile import apply_profile as apply_adaptive
+            apply_adaptive(env_cfg, agent_cfg, evaluation=True)
+        elif saved_profile == 'ascent_entry_v1_stage4':
+            from rl_training.tasks.manager_based.locomotion.velocity.config.wheeled.deeprobotics_m20.profiles.ascent_sequence_profile import apply_profile as apply_sequence
+            apply_sequence(env_cfg, agent_cfg)
+            env_cfg.ascent_sequence_training_ramp = False
 
     log_dir = os.path.dirname(resume_path)
 
@@ -260,6 +283,19 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     train_cfg = agent_cfg.to_dict()
     if version.parse(installed_version) >= version.parse("5.0.0"):
         train_cfg = cli_args.convert_rsl_rl_cfg_dict(train_cfg)
+    if is_ascent_v1:
+        train_cfg['actor'].update(class_name='rl_training.models.ascent_entry_actor:AscentEntryMLPModel',
+                                  residual_hidden_dims=[128,64],entry_hidden_dims=[128,64])
+        train_cfg['obs_groups'].update(actor=['policy','motion_control'],critic=['critic','motion_control'])
+        if saved_profile in ('ascent_entry_v1_stage3', 'ascent_entry_v1_stage4', 'ascent_entry_v1_stage5'):
+            train_cfg['actor'].update(class_name='rl_training.models.ascent_landing_actor:AscentLandingMLPModel',
+                                      landing_hidden_dims=[128, 64])
+        if saved_profile in ('ascent_entry_v1_stage4', 'ascent_entry_v1_stage5'):
+            train_cfg['actor'].update(class_name='rl_training.models.ascent_sequence_actor:AscentSequenceMLPModel',
+                                      sequence_hidden_dims=[128, 64])
+    if is_ascent_v1 and saved_profile == 'ascent_entry_v1_stage5':
+        train_cfg['actor'].update(class_name='rl_training.models.ascent_adaptive_actor:AscentAdaptiveMLPModel')
+        train_cfg['obs_groups']['critic'] = ['critic', 'motion_control', 'ascent_control']
     runner_class = resolve_callable(runner_class_name) if is_custom_runner else OnPolicyRunner
     ppo_runner = runner_class(env, train_cfg, log_dir=None, device=agent_cfg.device)
     ppo_runner.load(resume_path)
@@ -269,7 +305,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
 
-    if version.parse(installed_version) >= version.parse("4.0.0"):
+    if is_ascent_v1:
+        # Generic exporters accept one observation tensor and would discard
+        # the raw-command gate. Keep checkpoint-native inference explicit.
+        print('[INFO] v1 playback keeps the policy244 + raw_command3 checkpoint interface; generic single-input export skipped.')
+        policy_nn=None
+    elif version.parse(installed_version) >= version.parse("4.0.0"):
         # Use runner-native exporters for rsl-rl >= 4.0.0
         ppo_runner.export_policy_to_jit(path=export_model_dir, filename="policy.pt")
         ppo_runner.export_policy_to_onnx(path=export_model_dir, filename="policy.onnx")

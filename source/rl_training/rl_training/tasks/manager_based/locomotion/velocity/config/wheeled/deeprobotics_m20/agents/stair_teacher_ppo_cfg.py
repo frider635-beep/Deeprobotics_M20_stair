@@ -9,7 +9,7 @@ from .rsl_rl_ppo_cfg import DeeproboticsM20RoughPPORunnerCfg
 
 @configclass
 class StairPreservationAlgorithmCfg(RslRlPpoAlgorithmCfg):
-    class_name: str = "rl_training.stair_guarded_ppo:StairGuardedPPO"
+    class_name: str = "rl_training.algorithms.stair_guarded_ppo:StairGuardedPPO"
     anchor_coefficient: float = 0.03
     critic_warmup_iterations: int = 50
     reference_std_multiplier: float = 1.10
@@ -32,7 +32,7 @@ class DeeproboticsM20StairTeacherPPORunnerCfg(DeeproboticsM20RoughPPORunnerCfg):
         if type(self) is not DeeproboticsM20StairTeacherPPORunnerCfg:
             return
         settings = self.algorithm.to_dict()
-        settings.update(class_name="rl_training.stair_guarded_ppo:StairGuardedPPO",
+        settings.update(class_name="rl_training.algorithms.stair_guarded_ppo:StairGuardedPPO",
                         learning_rate=5.0e-5, schedule="fixed", entropy_coef=0.0005,
                         clip_param=0.1)
         self.algorithm = StairPreservationAlgorithmCfg(**settings)

@@ -192,7 +192,7 @@ def import_file(name, path):
 
 
 def check_pooling():
-    pool = import_file("m20_pooling_counterexamples", ROOT / "source/rl_training/rl_training/metric_aggregation.py").pool_episode_metrics
+    pool = import_file("m20_pooling_counterexamples", ROOT / "source/rl_training/rl_training/utils/metric_aggregation.py").pool_episode_metrics
     prefix = "Curriculum/zero_command_hold/"
     mean, rms, minimum = prefix + "speed", prefix + "delta", prefix + "distance"
     rows = [

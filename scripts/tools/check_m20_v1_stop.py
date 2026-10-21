@@ -21,7 +21,7 @@ from check_stair_preservation import models, StairGuardedPPO
 
 ROOT = Path(__file__).resolve().parents[2]
 SRC = ROOT / 'source/rl_training/rl_training'
-profile = import_file('m20_v1_stop_profile_checks', SRC / 'v1_stop_profile.py')
+profile = import_file('m20_v1_stop_profile_checks', SRC / 'tasks/manager_based/locomotion/velocity/config/wheeled/deeprobotics_m20/profiles/v1_stop_profile.py')
 
 
 def namespace():

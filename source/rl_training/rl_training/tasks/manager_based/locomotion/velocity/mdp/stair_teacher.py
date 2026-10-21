@@ -20,8 +20,9 @@ import torch
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.math import quat_apply, quat_apply_inverse, yaw_quat
 
-from rl_training.teacher_diagnostics import export_teacher_metrics
-from rl_training import stop_coverage, stop_branch
+from rl_training.utils.teacher_diagnostics import export_teacher_metrics
+from .stop import stop_coverage
+from rl_training.models import stop_branch
 
 from .commands import UniformThresholdVelocityCommand
 from .descent_front_pair import descent_front_pair_metrics, stair_descent_front_pair_cost

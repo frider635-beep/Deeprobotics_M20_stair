@@ -24,7 +24,7 @@ SOURCE = ROOT / "source/rl_training/rl_training/tasks/manager_based/locomotion/v
 
 def production_namespace():
     spec = importlib.util.spec_from_file_location(
-        "m20_test_diagnostics", ROOT / "source/rl_training/rl_training/teacher_diagnostics.py")
+        "m20_test_diagnostics", ROOT / "source/rl_training/rl_training/utils/teacher_diagnostics.py")
     diagnostics = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(diagnostics)
     pair_spec = importlib.util.spec_from_file_location(
