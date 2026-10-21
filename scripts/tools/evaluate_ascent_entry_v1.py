@@ -152,6 +152,8 @@ def main():
         expected = actor.m20_training_manifest.get('frozen_stage2_state_sha256')
         if not expected or actor.source_state_digest() != expected:
             raise ValueError('Complete stage2 source policy changed or has no frozen-state digest')
+    if getattr(actor, 'uses_merged_ascent', False):
+        d.training_module('algorithms.initialization.ascent_unified_init').validate_source(args.candidate)
     if getattr(actor, 'uses_sequence', False):
         expected = actor.m20_training_manifest.get('frozen_stage3_state_sha256')
         if not expected or actor.sequence_source_digest() != expected:
@@ -181,7 +183,7 @@ def main():
             pairs.append(pair)
             (args.output_dir/'paired_progress.json').write_text(json.dumps(pairs,indent=2)+'\n')
     checks=acceptance(pairs)
-    if getattr(actor, 'uses_sequence', False):
+    if getattr(actor, 'uses_sequence', False) or getattr(actor, 'uses_merged_ascent', False):
         checks.update(front_same_tread_sequence_full_flight=all(
             p['candidate']['sequence']['front_same_tread_sequential_full_flight'] == 1. for p in pairs),
             no_front_early_advance=all(p['candidate']['sequence']['front_early_advance_count'] == 0 for p in pairs),

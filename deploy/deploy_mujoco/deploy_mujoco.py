@@ -147,8 +147,15 @@ def load_actor(checkpoint: Path) -> MLPModel:
         config = manifest.get("actor_model_config", {})
         extra = dict(stop_std_factor=config.get("stop_std_factor", .1),
                      stop_hidden_dims=config.get("stop_hidden_dims", [128, 64]))
-    elif manifest.get("m20_profile") in ("ascent_entry_v1", "ascent_entry_v1_stage2", "ascent_entry_v1_stage3", "ascent_entry_v1_stage4", "ascent_entry_v1_stage5"):
-        actor_type = (ascent_adaptive_module().AscentAdaptiveMLPModel if manifest.get('m20_profile') == 'ascent_entry_v1_stage5' else
+    elif manifest.get('m20_profile') == 'ascent_entry_v1_stage7':
+        actor_type = training_module('models.ascent_unified_actor').AscentUnifiedMLPModel
+        obs['motion_control'] = torch.zeros(1,3)
+        config = manifest.get('actor_model_config', {})
+        extra = dict(residual_hidden_dims=[128,64],unified_hidden_dims=config.get('unified_hidden_dims',[256,128]),
+            unified_limits=manifest.get('unified_limits_action_units'),
+            adaptive_exploration=manifest.get('adaptive_exploration_action_std'))
+    elif manifest.get("m20_profile") in ("ascent_entry_v1", "ascent_entry_v1_stage2", "ascent_entry_v1_stage3", "ascent_entry_v1_stage4", "ascent_entry_v1_stage5", "ascent_entry_v1_stage6"):
+        actor_type = (ascent_adaptive_module().AscentAdaptiveMLPModel if manifest.get('m20_profile') in ('ascent_entry_v1_stage5', 'ascent_entry_v1_stage6') else
                       ascent_sequence_module().AscentSequenceMLPModel if manifest.get('m20_profile') == 'ascent_entry_v1_stage4' else
                       ascent_landing_module().AscentLandingMLPModel if manifest.get('m20_profile') == 'ascent_entry_v1_stage3'
                       else ascent_entry_module().AscentEntryMLPModel)
@@ -157,13 +164,13 @@ def load_actor(checkpoint: Path) -> MLPModel:
         extra = dict(residual_hidden_dims=config.get('residual_hidden_dims',[128,64]),
                      entry_hidden_dims=config.get('entry_hidden_dims',[128,64]),
                      entry_limits=manifest.get('new_branch_limits_action_units'))
-        if manifest.get('m20_profile') in ('ascent_entry_v1_stage3', 'ascent_entry_v1_stage4', 'ascent_entry_v1_stage5'):
+        if manifest.get('m20_profile') in ('ascent_entry_v1_stage3', 'ascent_entry_v1_stage4', 'ascent_entry_v1_stage5', 'ascent_entry_v1_stage6'):
             extra.update(landing_hidden_dims=config.get('landing_hidden_dims', [128, 64]),
                          landing_limits=manifest.get('landing_limits_action_units'))
-        if manifest.get('m20_profile') in ('ascent_entry_v1_stage4', 'ascent_entry_v1_stage5'):
+        if manifest.get('m20_profile') in ('ascent_entry_v1_stage4', 'ascent_entry_v1_stage5', 'ascent_entry_v1_stage6'):
             extra.update(sequence_hidden_dims=config.get('sequence_hidden_dims', [128, 64]),
                          sequence_limits=manifest.get('sequence_limits_action_units'))
-        if manifest.get('m20_profile') == 'ascent_entry_v1_stage5':
+        if manifest.get('m20_profile') in ('ascent_entry_v1_stage5', 'ascent_entry_v1_stage6'):
             extra['adaptive_exploration'] = config.get('adaptive_exploration', manifest.get('adaptive_exploration_action_std'))
     elif manifest.get("m20_profile") == "idle_stop_motion_v1":
         actor_type = motion_residual_module().MotionResidualMLPModel

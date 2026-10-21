@@ -18,12 +18,17 @@ import deploy_mujoco as deployment
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--checkpoint', type=Path, required=True)
-    parser.add_argument('--demonstration', type=Path, nargs='+', required=True)
+    parser.add_argument('--profile', choices=('stage5', 'stage6'), default='stage5')
+    parser.add_argument('--demonstration', type=Path, nargs='+')
     parser.add_argument('--output', type=Path)
     args = parser.parse_args()
+    if args.profile == 'stage5' and not args.demonstration:
+        parser.error('Stage5 preflight requires --demonstration')
+    if args.profile == 'stage6' and args.demonstration:
+        parser.error('Stage6 does not reuse demonstrations without swing-alternation verification')
     torch.set_num_threads(1)
     module = deployment.ascent_adaptive_module()
-    init = deployment.training_module('ascent_adaptive_init')
+    init = deployment.training_module('algorithms.initialization.ascent_alternating_init' if args.profile == 'stage6' else 'ascent_adaptive_init')
     demo = deployment.training_module('ascent_adaptive_demo')
     provenance = init.validate_source(args.checkpoint)
     saved = torch.load(args.checkpoint, map_location='cpu', weights_only=True)
@@ -43,9 +48,9 @@ def main():
         assert torch.equal(actor(obs), source(obs))
         assert torch.isfinite(critic(obs)).all()
     holder = SimpleNamespace(actor=actor, device='cpu', update=lambda: {}, save=lambda: {}, load=lambda *args: None)
-    demo.attach_demonstrations(holder, args.demonstration)
+    demo.attach_demonstrations(holder, args.demonstration, coefficient=0. if args.profile == 'stage6' else .5)
     authority = demo.validate_demo_authority(holder)
-    result = dict(profile='ascent_entry_v1_stage5', source=provenance, actor_dimensions=[247, 16],
+    result = dict(profile='ascent_entry_v1_'+args.profile, source=provenance, actor_dimensions=[247, 16],
         critic_dimensions=[300, 1], trainable_branch='sequence_mlp',
         frozen_source_exact=True, demonstrations=holder._contact_demo_manifest,
         demonstration_authority=authority, isaac_started=False, training_started=False,

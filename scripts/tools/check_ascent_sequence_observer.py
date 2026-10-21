@@ -24,14 +24,20 @@ def main():
     inputs.add_argument('--comparison-json', type=Path)
     parser.add_argument('--model-label', default='stage3_1100')
     parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--profile', choices=('stage4', 'stage5'), default='stage4')
+    parser.add_argument('--profile', choices=('stage4', 'stage5', 'stage6'), default='stage4')
+    parser.add_argument('--cases', nargs='+', help='Replay selected case names only')
     args = parser.parse_args(); torch.set_num_threads(1)
-    mdp = deployment.training_module('ascent_adaptive_mdp' if args.profile == 'stage5' else 'ascent_sequence_mdp')
+    module_name = {'stage4': 'ascent_sequence_mdp', 'stage5': 'ascent_adaptive_mdp',
+                   'stage6': 'tasks.manager_based.locomotion.velocity.mdp.ascent.ascent_alternating_mdp'}[args.profile]
+    mdp = deployment.training_module(module_name)
     if args.comparison_json:
         entries = [r for r in json.loads(args.comparison_json.read_text())['rows'] if r['model'] == args.model_label]
         report = {'pairs': [dict(case=Path(r['raw_dir']).name, raw_dir=r['raw_dir']) for r in entries]}
     else:
         report = json.loads((args.evaluation_dir/'evaluation.json').read_text())
+    if args.cases:
+        report['pairs'] = [pair for pair in report['pairs'] if pair['case'] in args.cases]
+        if not report['pairs']: parser.error('No requested cases exist in the evaluation')
     rows = []
     for pair in report['pairs']:
         folder = Path(pair['raw_dir']) if 'raw_dir' in pair else args.evaluation_dir/pair['case']
@@ -55,12 +61,12 @@ def main():
                  action_manager=NS(action=torch.zeros(1, 16)))
         command = torch.zeros(1, 3)
         env.command_manager = NS(get_command=lambda name: command)
-        if args.profile == 'stage5':
+        if args.profile in ('stage5', 'stage6'):
             env.cfg.ascent_adaptive_training = True
             env.cfg.ascent_adaptive_geometry = True
             env.cfg.ascent_adaptive_height_grid = [[height]*10]
             env.cfg.ascent_adaptive_depth_grid = [[depth]*10]
-            observer = mdp.AdaptivePhysicsObserver(env)
+            observer = mdp.AlternatingPhysicsObserver(env) if args.profile == 'stage6' else mdp.AdaptivePhysicsObserver(env)
         else:
             observer = mdp.SequencePhysicsObserver(env)
         env._ascent_entry_observer = observer
@@ -96,7 +102,7 @@ def main():
                 result = mdp.context(env)
                 assert result is mdp.context(env)
                 assert all(torch.isfinite(v).all() for v in result.values())
-                if args.profile == 'stage5':
+                if args.profile in ('stage5', 'stage6'):
                     if failure_seen_at_sample:
                         assert all(result[key].item() == 0. for key in ('ordered', 'paired', 'dwell', 'landing_credit', 'top_front', 'top_rear', 'top_forward'))
                     failure_seen_at_sample = observer.sequence.failed.item()
@@ -104,14 +110,19 @@ def main():
                 sampled += 1
         metrics = mdp.metrics(env, None)
         selected = mdp.metrics(env, slice(None))
-        assert all(torch.equal(metrics[k], selected[k]) for k in metrics)
-        assert all(torch.isfinite(v).all() for v in mdp.metrics(env, torch.tensor([], dtype=torch.long)).values())
-        assert all(torch.isfinite(v).all() for v in metrics.values())
-        assert reward_totals['ordered'] > 0 and reward_totals['missing'] > 0
-        if args.profile == 'stage5':
+        assert all(torch.equal(torch.as_tensor(metrics[k]), torch.as_tensor(selected[k])) for k in metrics)
+        assert all(torch.isfinite(torch.as_tensor(v)).all() for v in mdp.metrics(env, torch.tensor([], dtype=torch.long)).values())
+        assert all(torch.isfinite(torch.as_tensor(v)).all() for v in metrics.values())
+        if args.profile != 'stage6':
+            assert reward_totals['ordered'] > 0 and reward_totals['missing'] > 0
+        if args.profile in ('stage5', 'stage6'):
             assert observer.sequence.failed.item()
-            assert reward_totals['failure'] == 1.
-            if not args.comparison_json: assert reward_totals['paired'] == 0.
+            if args.profile == 'stage6':
+                assert reward_totals['failure']+reward_totals['alternating_turn'] >= 1.
+                assert not observer.positive_gate.any()
+            else:
+                assert reward_totals['failure'] == 1.
+                if not args.comparison_json: assert reward_totals['paired'] == 0.
             assert reward_totals['landing_credit'] >= 0.  # FL1 can be a real earlier success.
         else:
             assert observer.sequence.covered[:, :2, :4].sum().item() == 6, 'Replay adapter changed known entry coverage'
@@ -120,7 +131,7 @@ def main():
                'reward_integrals': reward_totals, 'metrics': {k: float(v) for k, v in metrics.items()}}
         observer.reset(torch.tensor([0]))
         assert not observer.sequence.covered.any() and not observer.top.front_paid.any()
-        if args.profile == 'stage5':
+        if args.profile in ('stage5', 'stage6'):
             assert observer.stats['adaptive_opportunity'].sum() == 0.
             assert not observer.sequence.failed.any() and observer.adaptive_action_age.sum() == 0
         else:

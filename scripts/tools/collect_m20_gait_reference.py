@@ -135,10 +135,13 @@ def run_case(actor, args, speed, offset):
                 bounded = (torch.tanh(actor.residual_mlp(torch.cat((obs["policy"], obs["motion_control"]), -1)))
                            .squeeze(0).cpu().numpy()) if getattr(actor, "uses_motion_control", False) else np.zeros(16)
                 entry_bounded = (torch.tanh(actor.entry_mlp(torch.cat((obs['policy'],obs['motion_control']),-1)))
-                                 .squeeze(0).cpu().numpy()) if getattr(actor,'uses_ascent_entry',False) else np.zeros(16)
+                                 .squeeze(0).cpu().numpy()) if hasattr(actor,'entry_mlp') else np.zeros(16)
                 landing_telemetry = ({'landing_bounded': actor._landing_bounded[0].cpu().numpy(),
                                       'landing_gate': float(actor._landing_gate[0])}
                                      if getattr(actor, 'uses_landing', False) else {})
+                if getattr(actor, 'uses_merged_ascent', False):
+                    landing_telemetry.update(unified_bounded=actor._unified_bounded[0].cpu().numpy(),
+                                             unified_gate=float(actor._unified_gate[0]))
                 if getattr(actor, 'uses_sequence', False):
                     landing_telemetry.update(sequence_bounded=actor._sequence_bounded[0].cpu().numpy(),
                                              sequence_gate=float(actor._sequence_gate[0]))

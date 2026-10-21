@@ -127,6 +127,8 @@ class Stage2PhysicsObserver(EntryPhysicsObserver):
         slip, support, _, _ = contact_patch_velocity(data.body_com_pos_w[:, self.wheels],
             data.body_com_lin_vel_w[:, self.wheels], data.body_ang_vel_w[:, self.wheels],
             torch.stack(points, 1), torch.stack(forces, 1))
+        # Reuse the same physical contact calculation in later observers.
+        self.contact_slip, self.contact_support = slip, support
         supported = slip*support*active[:, None]
         self.stats['stage2_front_slip_sum'] += supported[:, :2].sum(-1)
         self.stats['stage2_rear_slip_sum'] += supported[:, 2:].sum(-1)

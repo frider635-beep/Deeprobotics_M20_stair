@@ -64,7 +64,7 @@ def attach_demonstrations(algorithm, paths=None, coefficient=.5, decay_updates=8
         elapsed = max(0, self.guard_updates-self.critic_warmup_iterations)
         factor = max(0., 1.-elapsed/decay_updates)
         if self._contact_demo is None or factor == 0. or coefficient == 0.:
-            return self.actor.sequence_mlp[-1].weight.sum()*0.
+            return next(self.actor.parameters()).new_zeros(())
         data = self._contact_demo
         index = torch.randint(len(data['policy']), (min(128, len(data['policy'])),), device=self.device)
         obs = TensorDict({k: data[k][index] for k in ('policy', 'motion_control')}, batch_size=[len(index)])

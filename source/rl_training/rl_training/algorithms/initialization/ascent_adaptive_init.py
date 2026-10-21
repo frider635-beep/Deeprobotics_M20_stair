@@ -9,7 +9,7 @@ from .ascent_entry_stage2_init import BASELINE_SHA256
 from ...models.ascent_sequence_actor import SEQUENCE_LIMITS
 
 
-def validate_source(path, preserve=None):
+def validate_source(path, preserve=None, accepted_profiles=('ascent_entry_v1_stage4', 'ascent_entry_v1_stage5')):
     path = Path(path).expanduser().resolve()
     saved = torch.load(path, map_location='cpu', weights_only=True)
     manifest = saved.get('m20_training_manifest') or {}
@@ -22,7 +22,7 @@ def validate_source(path, preserve=None):
     if profile == 'ascent_entry_v1_stage3':
         from .ascent_sequence_init import validate_source as validate_stage3
         return validate_stage3(path, preserve)
-    if profile not in ('ascent_entry_v1_stage4', 'ascent_entry_v1_stage5'):
+    if profile not in accepted_profiles:
         raise ValueError('Stage5 initializes from original baseline, complete stage3/4/5; no cross-profile resume')
     state = saved['actor_state_dict']
     if manifest.get('frozen_full_baseline_sha256') != BASELINE_SHA256:
@@ -60,7 +60,7 @@ def validate_source(path, preserve=None):
 def load_initialized_actor(actor, saved):
     profile = (saved.get('m20_training_manifest') or {}).get('m20_profile')
     state = saved['actor_state_dict']
-    if profile in ('ascent_entry_v1_stage4', 'ascent_entry_v1_stage5'):
+    if profile in ('ascent_entry_v1_stage4', 'ascent_entry_v1_stage5', 'ascent_entry_v1_stage6'):
         actor.load_state_dict(state, strict=True)
     elif profile == 'ascent_entry_v1_stage3':
         actor.load_stage3_checkpoint(state)

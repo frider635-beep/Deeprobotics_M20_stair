@@ -20,7 +20,7 @@ def curriculum_state(env):
 class AdaptivePhysicsObserver(Stage2PhysicsObserver):
     def __init__(self, env):
         super().__init__(env)
-        self.sequence = StrictSequenceLedger(env.num_envs, env.device, targets=env.cfg.ascent_sequence_step_count)
+        self.sequence = getattr(self, 'ledger_type', StrictSequenceLedger)(env.num_envs, env.device, targets=env.cfg.ascent_sequence_step_count)
         self.top = TopTransition(env.num_envs, env.device)
         self.top_ready = torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
         self.top_posture = torch.zeros(env.num_envs, device=env.device)
@@ -73,7 +73,7 @@ class AdaptivePhysicsObserver(Stage2PhysicsObserver):
         events = self.sequence.update_strict(level, self.support, position[..., 0], first,
                                              active, env.physics_dt, goals, period)
         self.active_time += active*env.physics_dt
-        deadline = self.active_time.new_tensor(DEADLINES)[curriculum_state(env).skill]
+        deadline = self.active_time.new_tensor(getattr(curriculum_state(env), 'deadlines', DEADLINES))[curriculum_state(env).skill]
         expired = active & ~self.sequence.failed & (self.active_time > deadline)
         self.sequence.failed |= expired
         events['failure'] = torch.maximum(events['failure'], expired.float())
@@ -191,7 +191,8 @@ def critic_state(env):
         history[:, 5] = observer.sequence.failed.float()
         history[:, 6] = observer.active_time/24.
         history[:, 7] = observer.prefix_ready.float()
-    result = torch.cat((torch.stack((height/.25, depth/.35, prefix, state.skill.float()/3.), -1), history), -1)
+    skill_scale = max(len(getattr(state, 'prefixes', (2, 4, 6, 18)))-1, 1)
+    result = torch.cat((torch.stack((height/.25, depth/.35, prefix, state.skill.float()/skill_scale), -1), history), -1)
     return result*(env.scene.terrain.terrain_types < 8)[:, None]
 
 

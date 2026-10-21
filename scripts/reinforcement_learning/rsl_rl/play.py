@@ -244,6 +244,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         elif saved_profile == 'ascent_entry_v1_stage3':
             from rl_training.tasks.manager_based.locomotion.velocity.config.wheeled.deeprobotics_m20.profiles.ascent_landing_profile import apply_profile as apply_landing
             apply_landing(env_cfg, agent_cfg)
+        elif saved_profile == 'ascent_entry_v1_stage7':
+            from rl_training.tasks.manager_based.locomotion.velocity.config.wheeled.deeprobotics_m20.profiles.ascent_unified_profile import apply_profile as apply_unified
+            apply_unified(env_cfg, agent_cfg, evaluation=True)
+        elif saved_profile == 'ascent_entry_v1_stage6':
+            from rl_training.tasks.manager_based.locomotion.velocity.config.wheeled.deeprobotics_m20.profiles.ascent_alternating_profile import apply_profile as apply_alternating
+            apply_alternating(env_cfg, agent_cfg, evaluation=True)
         elif saved_profile == 'ascent_entry_v1_stage5':
             from rl_training.tasks.manager_based.locomotion.velocity.config.wheeled.deeprobotics_m20.profiles.ascent_adaptive_profile import apply_profile as apply_adaptive
             apply_adaptive(env_cfg, agent_cfg, evaluation=True)
@@ -287,15 +293,21 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         train_cfg['actor'].update(class_name='rl_training.models.ascent_entry_actor:AscentEntryMLPModel',
                                   residual_hidden_dims=[128,64],entry_hidden_dims=[128,64])
         train_cfg['obs_groups'].update(actor=['policy','motion_control'],critic=['critic','motion_control'])
-        if saved_profile in ('ascent_entry_v1_stage3', 'ascent_entry_v1_stage4', 'ascent_entry_v1_stage5'):
+        if saved_profile in ('ascent_entry_v1_stage3', 'ascent_entry_v1_stage4', 'ascent_entry_v1_stage5', 'ascent_entry_v1_stage6'):
             train_cfg['actor'].update(class_name='rl_training.models.ascent_landing_actor:AscentLandingMLPModel',
                                       landing_hidden_dims=[128, 64])
-        if saved_profile in ('ascent_entry_v1_stage4', 'ascent_entry_v1_stage5'):
+        if saved_profile in ('ascent_entry_v1_stage4', 'ascent_entry_v1_stage5', 'ascent_entry_v1_stage6'):
             train_cfg['actor'].update(class_name='rl_training.models.ascent_sequence_actor:AscentSequenceMLPModel',
                                       sequence_hidden_dims=[128, 64])
-    if is_ascent_v1 and saved_profile == 'ascent_entry_v1_stage5':
+    if is_ascent_v1 and saved_profile in ('ascent_entry_v1_stage5', 'ascent_entry_v1_stage6'):
         train_cfg['actor'].update(class_name='rl_training.models.ascent_adaptive_actor:AscentAdaptiveMLPModel')
         train_cfg['obs_groups']['critic'] = ['critic', 'motion_control', 'ascent_control']
+    if is_ascent_v1 and saved_profile == 'ascent_entry_v1_stage7':
+        for key in ('entry_hidden_dims','landing_hidden_dims','sequence_hidden_dims'):
+            train_cfg['actor'].pop(key, None)
+        train_cfg['actor'].update(class_name='rl_training.models.ascent_unified_actor:AscentUnifiedMLPModel',
+            unified_hidden_dims=[256,128])
+        train_cfg['obs_groups']['critic'] = ['critic','motion_control','ascent_control']
     runner_class = resolve_callable(runner_class_name) if is_custom_runner else OnPolicyRunner
     ppo_runner = runner_class(env, train_cfg, log_dir=None, device=agent_cfg.device)
     ppo_runner.load(resume_path)

@@ -35,6 +35,7 @@ docker/artifacts/
 *.tmp
 
 # Training checkpoints (keep local, never commit)
+pre_train/
 **/checkpoint/
 **/checkpoints/
 *.pt

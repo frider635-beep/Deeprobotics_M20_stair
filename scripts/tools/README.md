@@ -116,3 +116,15 @@ python scripts/tools/check_m20_evaluation_cli.py
 ### 训练包目录与兼容性检查
 
 `python scripts/tools/check_training_package_layout.py` 验证迁移后的模块位置、旧导入别名与规范导入的对象一致性、内部导入路径及 JSON 资源。该检查跳过 Isaac 任务发现，不启动仿真或训练。目录和逐文件迁移表见 [训练包说明](../../source/rl_training/rl_training/README.md)。
+
+### Stage6 左右交替奖励检查
+
+`check_ascent_alternating.py --source-checkpoint <stage5 checkpoint> --output <report.json> --fixture-checkpoint <test_fixture.pt>` 覆盖连续起摆、奖励门控、速度课程、实际CPU PPO更新与checkpoint恢复。`check_ascent_sequence_observer.py --profile stage6`可重放既有数据，`--cases`可筛选工况。`preflight_ascent_stage5.py --profile stage6 --checkpoint <checkpoint>`只做CPU初始化预检，无需旧示范。
+
+`check_ascent_reward_manager.py --output <json>`：使用本机 IsaacLab 的奖励管理器和 `RotationGaitSymmetry` 实际类定义，在 CPU 场景适配器上复现旧报错并验证 Stage6 类奖励的初始化、正奖励门控及部分环境 reset；不启动 Kit/PhysX。
+
+### Stage7 合并与验证
+
+`merge_ascent_branches.py --source <旧checkpoint> --data <采集目录...> --output <新checkpoint>`将三个旧上楼分支的合成动作蒸馏到单个MLP；按完整零偏移工况留出验证，不启动PPO。`--warm-start`可对迁移模型用更多状态继续拟合。它是动作函数迁移，不是理想步态示范认证。
+
+`check_ascent_unified.py --checkpoint <Stage7 checkpoint> --output <json>`检查真实单分支合并、基础权重、3阶桥接与固定4阶组、双速度升级、前后轮同阶约束、领先轮等待配对、CPU PPO更新和课程恢复。训练中新增`Curriculum/ascent_unified/`下的失败分类、逐轮第3/4阶覆盖及周期诊断。

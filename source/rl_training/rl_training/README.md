@@ -101,3 +101,11 @@ bash scripts/train_ascent_stage5.sh --check-only
 以上命令在仓库根目录、配置好依赖的 Python 环境中执行。目录检查覆盖真实模块导入、历史别名对象一致性、内部导入路径与 JSON 读取；CPU 预检覆盖 Stage5 初始化与示范数据。
 
 本次还通过 Stage2、Stage4、Stage5 现有 CPU 回归，包含实际 PPO 更新与 checkpoint 保存/恢复；未启动 Isaac/PhysX 或正式训练。目录迁移本身不更改奖励、课程参数、策略权重键或 checkpoint 文件。
+
+## Stage6 连续左右交替
+
+`ascent_entry_v1_stage6` 的奖励与课程位于 `mdp/ascent/ascent_alternating*.py`，配置位于 `config/wheeled/deeprobotics_m20/profiles/ascent_alternating_profile.py`，初始化校验位于 `algorithms/initialization/ascent_alternating_init.py`。正奖励统一受前、后腿各自连续左右交替前提约束；原Stage5 profile保留。
+
+### Stage7 统一上楼修正
+
+`models/ascent_unified_actor.py`保留冻结的原始`mlp`与`residual_mlp`，用一个247→256→128→16的`unified_mlp`替代三个上楼修正分支。`ascent_unified_profile.py`注册独立profile `ascent_entry_v1_stage7`；`mdp/ascent/ascent_unified.py`实现2/3/4/6/18阶课程与双轴同阶记账，`ascent_unified_mdp.py`提供成对落脚引导和失败诊断。旧模型需经`merge_ascent_branches.py`离线迁移，不能直接按Stage7恢复。
