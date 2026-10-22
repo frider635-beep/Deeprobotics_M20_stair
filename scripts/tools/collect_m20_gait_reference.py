@@ -111,14 +111,14 @@ def run_case(actor, args, speed, offset):
                           stair_count=args.stair_count, stair_start=None)
     model = d.load_model(args.model, cfg)
     contract = d.M20Contract(model, cfg.terrain_config)
-    if contract.terrain.kind != "ascent":
-        raise ValueError("Reference acquisition requires an ascending staircase")
+    if contract.terrain.kind not in {"ascent", "descent"}:
+        raise ValueError("Reference acquisition requires a staircase")
     data = mujoco.MjData(model)
     contract.reset(data)
     data.qpos[int(contract.root_joint.qposadr[0])] += offset
     mujoco.mj_forward(model, data)
     legacy = d.use_checkpoint_control_profile(SimpleNamespace(legacy_heading_hold=False), actor)
-    hold = d.HeadingHoldController(contract, enabled=True, legacy=legacy)
+    hold = d.make_heading_hold(contract, actor, enabled=True, legacy=legacy)
     records, policies = {}, {}
     previous = np.zeros(d.ACTION_DIM, dtype=np.float32)
     jac = np.zeros((3, model.nv))
@@ -142,6 +142,9 @@ def run_case(actor, args, speed, offset):
                 if getattr(actor, 'uses_merged_ascent', False):
                     landing_telemetry.update(unified_bounded=actor._unified_bounded[0].cpu().numpy(),
                                              unified_gate=float(actor._unified_gate[0]))
+                if getattr(actor, 'uses_path_control', False) or getattr(actor, 'uses_path_feedback', False):
+                    landing_telemetry.update(path_control=contract._path_control[0].cpu().numpy(),
+                                             descent_gate=float(actor._descent_gate[0]))
                 if getattr(actor, 'uses_sequence', False):
                     landing_telemetry.update(sequence_bounded=actor._sequence_bounded[0].cpu().numpy(),
                                              sequence_gate=float(actor._sequence_gate[0]))
@@ -201,7 +204,7 @@ def run_case(actor, args, speed, offset):
             if np.max(np.abs(wheel_pos[:, 1])) + d.WHEEL_RADIUS >= contract.terrain.course_width / 2:
                 run_status = "left_course"
                 break
-            if np.all(wheel_pos[:, 0] > contract.terrain.goal_x + .4):
+            if np.all(wheel_pos[:, 0] > contract.terrain.goal_x + getattr(args, "exit_distance", .4)):
                 run_status = "cleared_stairs"
                 break
     np.savez_compressed(folder / "physics.npz", **{key: np.asarray(value) for key, value in records.items()})
@@ -209,7 +212,7 @@ def run_case(actor, args, speed, offset):
     summary = dict(case=name, speed_m_s=speed, spawn_x_offset_m=offset, status=run_status,
                    settle_s=args.settle, requested_duration_s=args.duration, duration_s=float(data.time),
                    physics_samples=len(records["time"]), policy_samples=len(policies["time"]),
-                   final_xyz=pos.tolist(), control_profile="legacy_v1" if legacy else "filtered_v4",
+                   final_xyz=pos.tolist(), control_profile=("legacy_v1_path_v1" if (getattr(actor, "uses_path_control", False) or getattr(actor, "uses_path_feedback", False)) else "legacy_v1" if legacy else "filtered_v4"),
                    terrain=cfg.terrain_config.summary(), model_nv=model.nv, model_nq=model.nq,
                    final_qpos=data.qpos.tolist(), final_qvel=data.qvel.tolist())
     (folder / "case.json").write_text(json.dumps(summary, indent=2) + "\n")

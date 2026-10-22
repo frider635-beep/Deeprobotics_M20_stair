@@ -8,6 +8,7 @@ rl_training/
 ├── algorithms/
 │   ├── stair_guarded_ppo.py    # PPO 扩展
 │   └── initialization/        # checkpoint 校验、初始化、示范训练挂接
+├── control/                   # 训练和部署共用的路径反馈（纯 Torch）
 ├── models/                    # 策略网络与停止控制分支
 ├── utils/                     # 日志、指标、诊断、预检、兼容和 CPU 加载工具
 ├── actuator/                  # 执行器
@@ -18,6 +19,7 @@ rl_training/
     ├── mdp/
     │   ├── stair_teacher.py   # 共用教师逻辑
     │   ├── ascent/            # 上楼奖励、逐阶账本、课程、物理观测器
+    │   ├── path/              # 上下楼路径观测、代价与下楼课程
     │   └── stop/              # 停止课程覆盖统计
     └── config/wheeled/deeprobotics_m20/
         ├── __init__.py        # M20 任务注册
@@ -109,3 +111,24 @@ bash scripts/train_ascent_stage5.sh --check-only
 ### Stage7 统一上楼修正
 
 `models/ascent_unified_actor.py`保留冻结的原始`mlp`与`residual_mlp`，用一个247→256→128→16的`unified_mlp`替代三个上楼修正分支。`ascent_unified_profile.py`注册独立profile `ascent_entry_v1_stage7`；`mdp/ascent/ascent_unified.py`实现2/3/4/6/18阶课程与双轴同阶记账，`ascent_unified_mdp.py`提供成对落脚引导和失败诊断。旧模型需经`merge_ascent_branches.py`离线迁移，不能直接按Stage7恢复。
+
+
+### Stage8 上下楼路径修正
+
+`ascent_entry_v1_stage8_fixed` 保持Stage7 Actor247/Critic300及全部网络state键名、形状、参数总数。`models/stair_path_actor.py`复用现有统一MLP的16个输出，以前30轮关闭、后800轮线性增加的非训练门控开放下楼；保留参考策略的下楼权限恒为零。下楼限幅及探索尺度是非持久控制常量，不添加可训练参数。只训练原统一MLP的98,448个参数和Critic。
+
+`control/stair_path.py`共用训练与部署的路径反馈，位置与法向速度通过已有有效vy进入policy244，原始command3继续单独作为门控输入。内部6维诊断状态不进入Actor或Critic。`mdp/path/stair_path_mdp.py`负责双方向路径代价、横移失败、到平台稳定前行与下楼课程；所有正向上楼奖励仍经过连续交替门控，逐轮不漏阶和同阶配对记账继续保留。通过路径边界失败的环境不能作为上楼课程成功。
+
+`profiles/stair_path_profile.py`生成13列：8上楼、1平地、4下楼，上下楼均含20/25/30/35cm踏深。每列踏深在所有阶高保持固定，20cm上楼首次从10cm阶高、4阶前缀开始。`algorithms/initialization/stair_path_init.py`严格加载原model11400，不扩展权重，迁移10→13列课程进度并重置结果窗口。`prepare_stair_path.py`只提供可选的相同权重加控制元数据的评估文件，正式训练直接使用原model11400。
+
+旧扩维版本仅保留于`models/legacy/stair_path_expanded_actor.py`供MuJoCo历史回放，不作为当前训练方案。CPU真实PPO、GPU短测与MuJoCo复测证据见本地 `docs/test_docs/07_上楼步态校正/v1_20261022/stage8_fixed/改进与验证.md`。
+
+后续改进优先处理奖励、控制反馈、门控、课程和数据分布，保护已形成的步态；固定输入方案有明确对照瓶颈证据后才考虑改变网络结构或输入输出维度。
+
+### 固定输入版本的奖励修订v2
+
+`mdp/path/stair_path_objectives.py`集中实现可独立验证的目标：有效XY命令跟踪、平滑的受控回线速度目标、按承重轮分别计算的横向/纵向接触滑移，以及入口与第3→4阶强调的max合并（上限1.5）。只在当前路径profile启用；原Stage7及更早profile保持原行为。
+
+路径位置/速度/滑移权重为−1.5/−0.25/−0.4，旧Stage2前后轮滑移和旧下楼横移权重为0；原连续上楼前后轮滑移−0.65/−0.55保留。下楼新增0.5倍纵向滑移分量（0.20m/s归一化），横向滑移按0.15m/s归一化；上楼已有完整切向滑移惩罚，通用项不再重复纵向。新日志包括ascent/descent的`longitudinal_contact_slip_m_s`及`return_velocity_error_m_s`。
+
+训练版本附加`_reward_v2`且记录奖励语义与代码SHA；网络版本和state结构不变。原固定输入v1仍能初始化权重，完整恢复要求相同奖励版本。工具`check_stair_path_objectives.py`验证正常滚动、纵向空转、单轮打滑、腾空轮排除、镜像/旋转一致和回线方向，真实训练启动另以已验证的model11400做隔离短测；不重复测试用户指定的model12100。

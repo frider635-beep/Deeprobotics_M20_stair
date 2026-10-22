@@ -51,6 +51,8 @@ class StairGuardedPPO(PPO):
         self.reference_actor = copy.deepcopy(self.actor)
         self.reference_actor.load_state_dict(actor_state, strict=True)
         self.reference_actor.eval().requires_grad_(False)
+        if hasattr(self.reference_actor, "set_preservation_reference"):
+            self.reference_actor.set_preservation_reference()
         if self.actor.obs_dim != 244:
             raise ValueError("Preservation mask requires the stair teacher 57+187 layout")
         if not hasattr(self.actor.distribution, 'log_std_param'):
@@ -111,6 +113,8 @@ class StairGuardedPPO(PPO):
             # corrected by this refinement. Normal flat motion keeps a guard.
             weight = torch.where(uneven, self.anchor_stair_weight, 1.0)
             weight = torch.where(stopping, self.anchor_stop_weight, weight)
+            if hasattr(self.actor, "preservation_weights"):
+                weight = self.actor.preservation_weights(observations)
         predicted = self.actor(observations)
         error = ((predicted-target)/std).square().mean(-1)
         return (weight*error).mean()
@@ -180,6 +184,8 @@ class StairGuardedPPO(PPO):
                 self.set_reference(loaded_dict['actor_state_dict'])
             if getattr(self.actor, 'frozen_motion', False):
                 self.guard_updates = int(loaded_dict.get('preservation_updates', 0))
+        if hasattr(self.actor, "set_update_iteration"):
+            self.actor.set_update_iteration(self.guard_updates)
         return result
 
     def _guarded_update(self) -> dict[str, float]:

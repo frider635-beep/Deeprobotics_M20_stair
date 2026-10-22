@@ -165,6 +165,26 @@ bash scripts/train_ascent_stage5.sh
 
 本次完成CPU动力学示例、真实PPO更新、断点恢复与isaaclab Python环境预检查；没有做GPU/Isaac端到端启动测试，没有开始第五阶段正式训练。实现和局部示例通过不代表完整上楼步态已学会。详细证据见本地[改进与验证](docs/test_docs/07_上楼步态校正/v1_20261021/stage5_20261021/改进与验证.md)和[初始化对比](docs/test_docs/07_上楼步态校正/v1_20261021/stage5_20261021/初始化检查点对比.md)。
 
+## v1 第八阶段：固定输入的上下楼路径修正（2026-10-22）
+
+当前使用 `--m20_profile ascent_entry_v1_stage8_fixed`。保留Stage7 Actor的247维输入、统一MLP的247→256→128→16结构和Critic的300维输入；所有网络参数键名、形状及总数保持不变。启动链路已用原始model_11400.pt验证；按用户后续要求，正式训练直接加载同一次Stage7训练的最新model_12100.pt，使用新优化器，不重复本轮验证。旧的253/306维Stage8方案已撤回，不再作为训练入口；旧文件仍可通过MuJoCo兼容加载器回放。
+
+依次改进路径反馈、下楼门控、奖励及多尺寸课程。横向位置/速度反馈经现有有效vy通道进入策略，原始指令独立用于门控，保留legacy航向控制。下楼复用统一MLP的16个输出，以固定限幅和非训练参数的时间调度开放权限：前30轮为零，之后800轮线性增加。保留上楼输出约束，20/25cm窄踏面适当降低旧动作保留权重。上下楼路径偏差、横向速度和接触横滑均有代价，偏离路径后不能计为课程成功。上楼连续左右交替、逐轮不漏阶、同阶先后和到顶放平要求继续保留，不固定前后轮相隔级数。
+
+13列地形包含8列上楼、1列平地、4列下楼，**上下楼均覆盖20/25/30/35cm踏深**，阶高课程为10/12/15/18/20/25cm。新增20cm上楼从10cm阶高、4阶任务开始，课程降级不会把20cm踏深改宽；25cm上楼列最低阶高15cm。下楼各踏深按0.5/0.7m/s两档速度分别累计成功，均达到最近8次至少6次成功才升级，连续3次失败降级。
+
+在仓库根目录、现有isaaclab环境执行：
+
+```bash
+OMP_NUM_THREADS=4 python -u scripts/reinforcement_learning/rsl_rl/train.py --task Rough-Deeprobotics-M20-StairTeacher-v1 --m20_profile ascent_entry_v1_stage8_fixed --init_actor_from logs/rsl_rl/deeprobotics_m20_stair_teacher_v1_stage2/2026-10-21_18-29-16_ascent_entry_v1_stage7/model_12100.pt --init_critic_from logs/rsl_rl/deeprobotics_m20_stair_teacher_v1_stage2/2026-10-21_18-29-16_ascent_entry_v1_stage7/model_12100.pt --run_name ascent_entry_v1_stage8_fixed_from12100_reward_v2 --num_envs 4096 --max_iterations 12000 --seed 42 --device cuda:0 --headless
+```
+
+建议先训练500–1000轮复测默认楼梯及20/25cm踏深，同时查看上下楼横移、左右偏航、落阶覆盖、同阶先后、左右交替和平台过渡。固定输入版本的实现及实测证据见本地 `docs/test_docs/07_上楼步态校正/v1_20261022/stage8_fixed/改进与验证.md`；初始化与短测不代表正式续训后的完整步态验收。
+
+当前奖励修订为 `m20_stair_path_rewards_20261022_v2`：路径反馈激活时XY跟踪采用有效指令，离线时允许受控回线、近线时抑制横向速度；路径位置权重−1.5，横向速度−0.25，接触滑移−0.4。关闭旧Stage2前后轮滑移项及旧下楼横移项，入口强调合入保留的连续上楼滑移项；下楼接触滑移增加纵向分量，上楼纵向仍由连续前后轮滑移项负责。航向、前进/停滞奖励及步态约束保持原配置。新增分方向纵向滑移与回线速度误差日志，网络及20/25/30/35cm课程保持原配置。修订后的实现与验证见本地 `docs/test_docs/07_上楼步态校正/v1_20261022/stage8_reward_v2/改进与验证.md`。
+
+奖励修订会记录在manifest中。旧奖励版本完整`--resume`会被拒绝，需使用Actor/Critic初始化和新优化器；正式启动仍按用户要求直接加载原Stage7的model12100，不重复验证该检查点。
+
 ## 代码与开发记录
 
 - [训练源码说明与整理记录](source/rl_training/rl_training/README.md)：模块职责、任务/profile 依赖、兼容文件及删除依据。

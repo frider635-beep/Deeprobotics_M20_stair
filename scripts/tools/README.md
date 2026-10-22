@@ -128,3 +128,16 @@ python scripts/tools/check_m20_evaluation_cli.py
 `merge_ascent_branches.py --source <旧checkpoint> --data <采集目录...> --output <新checkpoint>`将三个旧上楼分支的合成动作蒸馏到单个MLP；按完整零偏移工况留出验证，不启动PPO。`--warm-start`可对迁移模型用更多状态继续拟合。它是动作函数迁移，不是理想步态示范认证。
 
 `check_ascent_unified.py --checkpoint <Stage7 checkpoint> --output <json>`检查真实单分支合并、基础权重、3阶桥接与固定4阶组、双速度升级、前后轮同阶约束、领先轮等待配对、CPU PPO更新和课程恢复。训练中新增`Curriculum/ascent_unified/`下的失败分类、逐轮第3/4阶覆盖及周期诊断。
+
+
+## Stage8 上下楼路径修正（2026-10-22）
+
+- `prepare_stair_path.py --source SOURCE_STAGE7.pt --output NEW_STAGE8.pt`：在同一统一修正网络中增加6维路径输入，零初始化新增输入列与下楼输出增益，核对基础权重、维度和迁移输出。不覆盖已有checkpoint。
+- `check_stair_path.py --checkpoint NEW_STAGE8.pt --source SOURCE_STAGE7.pt --output RESULT.json`：检查实际MLP数量、迁移函数、下楼梯度、真实CPU PPO、冻结基础、保存/恢复、训练/部署批量/单例反馈一致性、MuJoCo缓存、下楼驻足奖励防护和双速度课程，含10列源课程到13列新课程的迁移与断点布局校验。
+- `evaluate_stair_path.py --source SOURCE_STAGE7.pt --candidate NEW_STAGE8.pt --output-dir NEW_DIRECTORY`：上/下楼、两速度、三起点的接触与路径对照。默认20阶15/30cm，平台记录延后1.2m；上楼单独统计四轮落稳、同阶先后、连续交替、平台联合通过。`--height`/`--depth`改变尺寸；`--reuse-source-report`可复用checkpoint哈希、几何、速度与起点均匹配的原始源策略工况，报告记录来源哈希。
+
+`collect_m20_gait_reference.py`现在也可采集下楼，使用checkpoint指定控制器，Stage8额外记录`path_control`和`descent_gate`。旧`analyze_m20_gait_reference.py`的递增台阶事件定义用于上楼，下楼路径分析优先用`evaluate_stair_path.py`，不要将上楼落阶逻辑直接套用到下楼。
+
+当前路径工具采用固定网络版本：`prepare_stair_path.py`逐张量原样复制Actor/Critic，仅附加控制元数据；`check_stair_path.py`验证相同键名、形状、参数总数和真实PPO/断点恢复；`evaluate_stair_path.py`分别记录横移与理想步态，含上下楼20cm踏深。正式训练无需运行prepare，直接加载原model_11400.pt。
+
+`check_stair_path_objectives.py --output <json>`验证当前奖励修订v2的行为反例：有效/原始命令选择、受控回线与远离路线、正常滚动与纵向空转、单轮打滑/腾空排除、左右镜像/参考路线旋转、入口强调不重复放大。该工具不加载model12100，不启动训练。

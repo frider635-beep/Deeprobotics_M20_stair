@@ -30,12 +30,13 @@ PROFILE_VERSIONS = {PROFILE: VERSION, "v1_stop_v2": VERSION_V2,
                     "ascent_entry_v1_stage4": "m20_ascent_sequence_20261020_v1_stage4",
                     "ascent_entry_v1_stage5": "m20_ascent_adaptive_20261021_v1_stage5",
                     "ascent_entry_v1_stage6": "m20_ascent_alternating_20261021_v1_stage6_geom_v2",
-                    "ascent_entry_v1_stage7": "m20_ascent_unified_20261021_v1_stage7"}
+                    "ascent_entry_v1_stage7": "m20_ascent_unified_20261021_v1_stage7",
+                    "ascent_entry_v1_stage8_fixed": "m20_stair_path_fixed247_20261022_v1_stage8_reward_v2"}
 PROFILES = tuple(PROFILE_VERSIONS)
 
 
 def uses_stop_metadata(profile):
-    return profile in PROFILES and profile not in (PROFILE, "idle_stop_motion_v1", "ascent_entry_v1", "ascent_entry_v1_stage2", "ascent_entry_v1_stage3", "ascent_entry_v1_stage4", "ascent_entry_v1_stage5", "ascent_entry_v1_stage6", "ascent_entry_v1_stage7")
+    return profile in PROFILES and profile not in (PROFILE, "idle_stop_motion_v1", "ascent_entry_v1", "ascent_entry_v1_stage2", "ascent_entry_v1_stage3", "ascent_entry_v1_stage4", "ascent_entry_v1_stage5", "ascent_entry_v1_stage6", "ascent_entry_v1_stage7", "ascent_entry_v1_stage8_fixed")
 BASELINE_PATH = Path(__file__).parent / "data" / "v1_stop_baseline.json"
 
 
@@ -48,7 +49,7 @@ def configure_tuning(tuning, profile=PROFILE):
     if profile not in PROFILES:
         raise ValueError(f"Unknown stop profile: {profile}")
     tuning.update(baseline()["tuning"])
-    tuning.update(v1_motion_baseline=True, ascent_heading_tolerance=0.0,
+    tuning.update(v1_motion_baseline=True, stair_path_feedback=False, ascent_heading_tolerance=0.0,
                   ascent_straight_motion_weight=0.0, descent_front_pair_weight=0.0,
                   descent_entry_pause_probability=0.0, interleg_critical_gain=0.0,
                   interleg_braking_mix=0.0)
@@ -67,6 +68,9 @@ def configure_tuning(tuning, profile=PROFILE):
 
 
 def apply_profile(env_cfg, agent_cfg, profile=PROFILE):
+    if profile == 'ascent_entry_v1_stage8_fixed':
+        from .stair_path_profile import apply_profile as path_profile
+        return path_profile(env_cfg, agent_cfg)
     if profile == 'ascent_entry_v1_stage7':
         from .ascent_unified_profile import apply_profile as unified_profile
         return unified_profile(env_cfg, agent_cfg)
@@ -248,6 +252,11 @@ def apply_profile(env_cfg, agent_cfg, profile=PROFILE):
 
 
 def validate_initialization(init_actor, preserve_actor, profile=PROFILE, stop_teacher=None):
+    if profile == 'ascent_entry_v1_stage8_fixed':
+        from rl_training.algorithms.initialization.stair_path_init import validate_source
+        if not init_actor: raise ValueError('Stage8 requires a Stage7 or migrated Stage8 checkpoint')
+        validate_source(init_actor, preserve_actor)
+        return
     if profile == 'ascent_entry_v1_stage7':
         from rl_training.algorithms.initialization.ascent_unified_init import validate_source
         if not init_actor: raise ValueError('Stage7 requires a consolidated checkpoint')

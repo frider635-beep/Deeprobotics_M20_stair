@@ -70,7 +70,7 @@ def run_case(actor, name, cli):
         c, s = math.cos(yaw_offset/2), math.sin(yaw_offset/2)
         data.qpos[root_q:root_q+4] = [c*w-s*z, c*x-s*y, c*y+s*x, c*z+s*w]
         d.mujoco.mj_forward(model, data)
-    hold = d.HeadingHoldController(contract, enabled=not cli.disable_heading_hold,
+    hold = d.make_heading_hold(contract, actor, enabled=not cli.disable_heading_hold,
                                    legacy=d.use_checkpoint_control_profile(cli, actor))
     telemetry = d.StairTelemetry(contract)
     rotation = data.xmat[contract.base_id].reshape(3, 3)

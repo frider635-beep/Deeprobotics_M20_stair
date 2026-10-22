@@ -2298,6 +2298,9 @@ def heading_hold_velocity_commands(env, command_name: str = "base_velocity") -> 
         active = correction_active & ((heading_error.abs() > deadband) | (yaw_rate.abs() > 0.03))
         correction = (kp * heading_error - kd * yaw_rate).clamp(-max_yaw_rate, max_yaw_rate)
         command[:, 2] = torch.where(correction_active, torch.where(active, correction, 0.0), raw_command[:, 2])
+        if TUNING.get("stair_path_feedback", False):
+            from .path.stair_path_mdp import apply_path_command
+            command = apply_path_command(env, command, raw_command, command_name)
         return command
     # Observation and several rewards request this command in the same tick.
     # Recompute from one pre-tick snapshot, so filters never advance once per
@@ -3665,6 +3668,15 @@ def stair_route_track_lin_vel_xy_exp(
     periodic gait clock. Legacy saved calls without gait entities stay native.
     """
     from .rewards import track_lin_vel_xy_exp
+    if TUNING.get('stair_path_feedback', False):
+        from .path.stair_path_mdp import controller
+        from .path.stair_path_objectives import velocity_tracking_reward
+        raw = env.command_manager.get_command(command_name)
+        effective = heading_hold_velocity_commands(env, command_name)
+        control = controller(env)
+        feedback = control.straight & (control.active | (control.correction.abs() > 1.e-6))
+        return velocity_tracking_reward(raw, effective,
+            env.scene[asset_cfg.name].data.root_lin_vel_b[:, :2], feedback, std)
     native = track_lin_vel_xy_exp(env,std,command_name,asset_cfg)
     if TUNING.get("v1_motion_baseline", False):
         # v1's recorded pose_tracking_discount is zero; target is raw XY.

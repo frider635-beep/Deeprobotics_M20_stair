@@ -72,6 +72,11 @@ class AlternatingPhysicsObserver(adaptive.AdaptivePhysicsObserver):
         costs = dense_costs(command[:, 0], data.root_lin_vel_w[:, 0],
             data.root_pos_w[:, 1]-env.scene.env_origins[:, 1], yaw,
             self.contact_slip, self.contact_support, height, depth, progress, self.active_time)
+        if getattr(env.cfg, 'stair_path_merge_entry_slip', False):
+            from ..path.stair_path_objectives import merged_entry_slip_multiplier
+            multiplier = merged_entry_slip_multiplier(progress)
+            costs['front_slip'] *= multiplier
+            costs['rear_slip'] *= multiplier
         covered = self.sequence.covered.long().sum(-1)
         index = (covered-1).clamp_min(0)[..., None]
         landing_time = self.sequence.landing_time.gather(-1, index).squeeze(-1)
@@ -164,8 +169,16 @@ def positive_reward(env, source_func, source_params, require_progress=False):
         if hasattr(observer, 'active_time'):
             speed = env.scene['robot'].data.root_lin_vel_w[:, 0]
             moving = (speed/(.6*command[:, 0].clamp_min(.1))).clamp(0., 1.)
-            grace = (observer.active_time/.5).clamp(0., 1.)
-            observer.moving_factor = torch.where(ascent, 1.-grace+grace*moving, torch.ones_like(moving))
+            progress_required = ascent
+            age = observer.active_time
+            if hasattr(observer, "path_time"):
+                descent = (env.scene.terrain.terrain_types >= 9) & (command[:, 0] > .1)
+                descent &= command[:, 1:].abs().amax(-1) < .1
+                progress_required = ascent | descent
+                age = torch.where(descent, observer.path_time, age)
+                observer.reward_allowed &= ~observer.path_failed
+            grace = (age/.5).clamp(0., 1.)
+            observer.moving_factor = torch.where(progress_required, 1.-grace+grace*moving, torch.ones_like(moving))
         observer.reward_gate_key = step
     value = torch.where(observer.reward_allowed | (value <= 0.), value, torch.zeros_like(value))
     if require_progress:

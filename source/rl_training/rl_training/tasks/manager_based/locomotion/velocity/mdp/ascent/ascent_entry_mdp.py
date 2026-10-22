@@ -23,7 +23,7 @@ def period_error(interval,expected):
     return error.square().clamp_max(4.)
 
 
-def contact_patch_velocity(com_pos, com_velocity, angular_velocity, point, force):
+def contact_patch_velocity(com_pos, com_velocity, angular_velocity, point, force, return_tangent=False):
     valid = torch.isfinite(point).all(-1) & torch.isfinite(force).all(-1)
     point = torch.where(valid[..., None], point, com_pos)
     norm = torch.linalg.vector_norm(force, dim=-1)
@@ -33,7 +33,8 @@ def contact_patch_velocity(com_pos, com_velocity, angular_velocity, point, force
     active = valid & (norm > 5.)
     support = active & (normal[..., 2] > .7) & (force[..., 2] > 5.)
     slip = torch.linalg.vector_norm(tangent, dim=-1)*active
-    return slip, support, active & ~support, normal
+    result = (slip, support, active & ~support, normal)
+    return (*result, tangent) if return_tangent else result
 
 
 class EntryPhysicsObserver:
@@ -108,8 +109,8 @@ class EntryPhysicsObserver:
             forces.append(force[row,index])
         point, force = torch.stack(points,1), torch.stack(forces,1)
         robot = env.scene['robot'].data
-        slip, support, face, normal = contact_patch_velocity(robot.body_com_pos_w[:,self.wheels],
-                    robot.body_com_lin_vel_w[:,self.wheels], robot.body_ang_vel_w[:,self.wheels], point, force)
+        slip, support, face, normal, self.contact_tangent = contact_patch_velocity(robot.body_com_pos_w[:,self.wheels],
+                    robot.body_com_lin_vel_w[:,self.wheels], robot.body_ang_vel_w[:,self.wheels], point, force, return_tangent=True)
         point = torch.nan_to_num(point)
         # Bounded pseudo-Huber: retain initial contact slip without letting a
         # single impact dominate all task progress rewards.

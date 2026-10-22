@@ -147,6 +147,16 @@ def load_actor(checkpoint: Path) -> MLPModel:
         config = manifest.get("actor_model_config", {})
         extra = dict(stop_std_factor=config.get("stop_std_factor", .1),
                      stop_hidden_dims=config.get("stop_hidden_dims", [128, 64]))
+    elif manifest.get('m20_profile') in ('ascent_entry_v1_stage8', 'ascent_entry_v1_stage8_fixed'):
+        expanded = manifest['m20_profile'] == 'ascent_entry_v1_stage8'
+        actor_type = training_module('models.legacy.stair_path_expanded_actor' if expanded else 'models.stair_path_actor').StairPathMLPModel
+        obs['motion_control'] = torch.zeros(1, 3)
+        if expanded: obs['path_control'] = torch.zeros(1, 6)
+        config = manifest.get('actor_model_config', {})
+        extra = dict(residual_hidden_dims=[128,64], unified_hidden_dims=config.get('unified_hidden_dims',[256,128]),
+            unified_limits=manifest.get('unified_limits_action_units'),
+            adaptive_exploration=manifest.get('adaptive_exploration_action_std'),
+            descent_limits=manifest.get('descent_limits_action_units'))
     elif manifest.get('m20_profile') == 'ascent_entry_v1_stage7':
         actor_type = training_module('models.ascent_unified_actor').AscentUnifiedMLPModel
         obs['motion_control'] = torch.zeros(1,3)
@@ -190,6 +200,8 @@ def load_actor(checkpoint: Path) -> MLPModel:
     )
     actor.load_state_dict(state, strict=True)
     actor.eval()
+    if hasattr(actor, 'set_update_iteration'):
+        actor.set_update_iteration(saved.get('preservation_updates', 0))
     actor.m20_training_manifest = saved.get("m20_training_manifest") or {}
     return actor
 
@@ -273,13 +285,17 @@ def actor_inputs(contract, data, effective_command, previous_action, actor, requ
             raise ValueError("MotionResidual requires the raw requested command")
         values['motion_control'] = torch.as_tensor(
             np.asarray(requested_command), dtype=torch.float32).reshape(1, 3)
+    if getattr(actor, 'uses_path_control', False):
+        if not hasattr(contract, '_path_control'):
+            raise RuntimeError('Path actor requires make_heading_hold before actor_inputs')
+        values['path_control'] = contract._path_control.clone()
     return TensorDict(values, batch_size=[1])
 
 
 def use_checkpoint_control_profile(args, actor) -> bool:
     """A stop-only checkpoint retains the v1 motion command convention."""
     manifest = getattr(actor, "m20_training_manifest", {})
-    return bool(getattr(args, "legacy_heading_hold", False) or manifest.get("control_profile") == "legacy_v1")
+    return bool(getattr(args, "legacy_heading_hold", False) or manifest.get("control_profile") in ("legacy_v1", "legacy_v1_path_v1"))
 
 
 def load_model(model_path: Path, args: argparse.Namespace) -> mujoco.MjModel:
@@ -374,6 +390,9 @@ class M20Contract:
         """Raycast static terrain using Isaac's yaw-aligned grid and sensor pose."""
         rotation = data.xmat[self.base_id].reshape(3, 3)
         base_pos = data.xpos[self.base_id]
+        scan_key = (float(data.time), tuple(base_pos), tuple(data.xquat[self.base_id]))
+        if getattr(self, "_scan_cache_key", None) == scan_key:
+            return self._scan_cache.copy()
         ray_z = max(base_pos[2] + SCAN_HEIGHT, self.terrain.ray_top)
         yaw = math.atan2(rotation[1, 0], rotation[0, 0])
         cos_yaw, sin_yaw = math.cos(yaw), math.sin(yaw)
@@ -394,6 +413,7 @@ class M20Contract:
             hit_z = ray_z - distance
             self.last_scan_hits[i] = (xy[0], xy[1], hit_z)
             scan[i] = np.clip(base_pos[2] - hit_z - SCAN_OFFSET, -1.0, 1.0)
+        self._scan_cache_key, self._scan_cache = scan_key, scan.copy()
         return scan
 
     def observe(self, data: mujoco.MjData, command: np.ndarray, previous_action: np.ndarray) -> np.ndarray:
@@ -885,6 +905,61 @@ class HeadingHoldController:
         self._cache_key = cache_key
         self._cached_result = (effective.copy(), dict(info))
         return effective, info
+
+
+class StairPathHeadingHold(HeadingHoldController):
+    """Stage8 retains legacy yaw PD and adds the shared path controller."""
+    def __init__(self, contract, enabled=True, legacy=True, config=None):
+        self.path = training_module('control.stair_path').StairPathController(1, 'cpu', config)
+        super().__init__(contract, enabled=enabled, legacy=legacy)
+        contract._path_control = torch.zeros(1, 6)
+
+    def reset(self):
+        super().reset()
+        self.path.reset(torch.tensor([0]))
+        self._path_key = None
+        self._path_before = None
+        if hasattr(self, 'contract'):
+            self.contract._path_control = torch.zeros(1, 6)
+
+    def update(self, data, requested):
+        import copy
+        effective, info = super().update(data, requested)
+        key = (float(data.time), tuple(float(v) for v in requested),
+               tuple(data.xpos[self.contract.base_id]), tuple(data.xquat[self.contract.base_id]), tuple(data.qvel))
+        if key != self._path_key:
+            if self._path_key is not None and key[0] == self._path_key[0]:
+                self.path = copy.deepcopy(self._path_before)
+            else:
+                self._path_before = copy.deepcopy(self.path)
+            rotation = data.xmat[self.contract.base_id].reshape(3, 3)
+            velocity = np.zeros(6)
+            mujoco.mj_objectVelocity(self.contract.model, data, mujoco.mjtObj.mjOBJ_BODY,
+                                    self.contract.base_id, velocity, 1)
+            tensor = lambda value: torch.as_tensor(np.asarray(value), dtype=torch.float32).reshape(1, -1)
+            yaw = math.atan2(rotation[1, 0], rotation[0, 0])
+            correction, features = self.path.update(tensor(data.xpos[self.contract.base_id, :2]),
+                tensor((rotation@velocity[3:])[:2]), torch.tensor([yaw]), tensor(requested),
+                tensor(self.contract.height_scan(data)), POLICY_DT)
+            self.contract._path_control = features.clone()
+            self._path_key = key
+        if self.enabled and bool(self.path.straight[0]):
+            effective[1] = float(self.path.correction[0])
+        info.update(controller_version='legacy_v1_path_v1', path_active=bool(self.path.active[0]) and self.enabled,
+            path_lateral_error_m=float(self.path.error[0]), path_lateral_speed_m_s=float(self.path.speed[0]),
+            path_lateral_correction_m_s=float(self.path.correction[0]) if self.enabled else 0.,
+            path_target_x_world_m=float(self.path.origin[0, 0]), path_target_y_world_m=float(self.path.origin[0, 1]),
+            path_saturated=bool(self.path.saturated[0]))
+        return effective, info
+
+
+def make_heading_hold(contract, actor, enabled=True, legacy=None):
+    if legacy is None:
+        legacy = use_checkpoint_control_profile(argparse.Namespace(legacy_heading_hold=False), actor)
+    if getattr(actor, 'uses_path_control', False) or getattr(actor, 'uses_path_feedback', False):
+        config = getattr(actor, 'm20_training_manifest', {}).get('stair_path_config')
+        return StairPathHeadingHold(contract, enabled=enabled, legacy=legacy, config=config)
+    return HeadingHoldController(contract, enabled=enabled, legacy=legacy)
 
 
 class StairTelemetry:
@@ -1551,7 +1626,7 @@ def interactive_rollout(args: argparse.Namespace) -> dict:
     pending_policy = False
     show_height_scan = True
     previous_action = np.zeros(ACTION_DIM, dtype=np.float32)
-    heading_hold = HeadingHoldController(contract, enabled=not args.disable_heading_hold,
+    heading_hold = make_heading_hold(contract, actor, enabled=not args.disable_heading_hold,
                                          legacy=getattr(args, "legacy_heading_hold", False))
     telemetry = StairTelemetry(contract)
     telemetry_samples = []
@@ -1774,7 +1849,7 @@ def rollout(args: argparse.Namespace) -> dict:
     print("[TERRAIN] " + json.dumps(args.terrain_config.summary()), flush=True)
     print_deployment_contract(args)
     command = np.array([args.command_x, args.command_y, args.command_yaw], dtype=np.float32)
-    heading_hold = HeadingHoldController(contract, enabled=not args.disable_heading_hold,
+    heading_hold = make_heading_hold(contract, actor, enabled=not args.disable_heading_hold,
                                          legacy=getattr(args, "legacy_heading_hold", False))
     telemetry = StairTelemetry(contract)
     telemetry_samples = []
