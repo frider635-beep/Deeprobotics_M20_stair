@@ -6,7 +6,7 @@ from ..mdp.ascent.ascent_entry_mdp import install_physics_observer
 class AscentEntryRLEnv(ManagerBasedRLEnv):
     def __init__(self,*args,**kwargs):
         super().__init__(*args,**kwargs)
-        if getattr(self.cfg, 'm20_refinement_profile', None) == 'ascent_entry_v1_stage8_fixed':
+        if getattr(self.cfg, 'm20_refinement_profile', None) in ('ascent_entry_v1_stage8_fixed', 'ascent_entry_v1_stage9'):
             from ..mdp.path.stair_path_mdp import install_physics_observer as install_path
             install_path(self)
         elif getattr(self.cfg, 'm20_refinement_profile', None) == 'ascent_entry_v1_stage7':

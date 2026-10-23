@@ -2,8 +2,8 @@
 """MuJoCo sim-to-sim deployment of the M20 stair teacher actor.
 
 With --viewer, the robot starts prone: Z stands, C enters the teacher policy,
-W/S/A/D/Q/E set velocity commands, H toggles the height scan, X lies down,
-R damps, and Esc quits.
+Keypad 8/2/4/6/7/9 set velocity commands, H toggles the height scan, X lies down,
+R or Backspace resets to the initial prone state, and Esc quits.
 Without --viewer, the script runs a fixed-requested-command batch rollout with
 the same heading hold used by interactive policy control.
 The checkpoint was trained with asymmetric PPO: actor=57D proprioception +
@@ -40,7 +40,7 @@ import torch
 from rsl_rl.models import MLPModel
 from tensordict import TensorDict
 
-from keyboard_input import X11WindowKeys
+from keyboard_input import KEYPAD_MOTION, MOTION_KEYS, X11WindowKeys, launch_teleop_viewer
 from terrain_loader import PRESETS, STAIR_OVERRIDES, Terrain, attach_terrain, select_terrain
 
 
@@ -88,6 +88,13 @@ ASCENT_PATH_LATERAL_DEADBAND = 0.03
 ASCENT_PATH_SPEED_DEADBAND = 0.03
 ASCENT_PATH_LATERAL_SLEW = 0.3
 DESCENT_PATH_MAX_LATERAL_SPEED = 0.10
+# Keep the wheel envelope away from the physical course edge.  The policy was
+# trained on a 5 m course, so narrow MuJoCo stairs need an explicit safety
+# margin while the height scan still contains substantial off-course ground.
+COURSE_EDGE_MARGIN = 0.06
+COURSE_EDGE_SOFT_ZONE = 0.72
+COURSE_EDGE_KD = 0.6
+COURSE_EDGE_MAX_INWARD_SPEED = 0.18
 STAIR_STOP_BRAKE_GRACE = 0.4
 STAIR_STOP_KP = 0.5
 STAIR_STOP_KD = 0.5
@@ -109,9 +116,11 @@ PRE_STAND_JOINT_POS = np.array(
 )
 STAND_PHASE_DURATION = 2.5
 TELEOP_KEY_TIMEOUT = 0.5
-TELEOP_VELOCITIES = {"w": (0.7, 0.0, 0.0), "s": (-0.7, 0.0, 0.0),
-                     "a": (0.0, 0.5, 0.0), "d": (0.0, -0.5, 0.0),
-                     "q": (0.0, 0.0, 0.6), "e": (0.0, 0.0, -0.6)}
+TELEOP_VELOCITIES = dict(zip(MOTION_KEYS, (
+    (0.7, 0.0, 0.0), (-0.7, 0.0, 0.0),
+    (0.0, 0.5, 0.0), (0.0, -0.5, 0.0),
+    (0.0, 0.0, 0.6), (0.0, 0.0, -0.6),
+)))
 
 
 def scan_grid() -> np.ndarray:
@@ -342,6 +351,8 @@ class M20Contract:
             raise ValueError("Duplicate or missing M20 joint/actuator mapping")
         self.grid = scan_grid()
         self.last_scan_hits = np.empty((len(self.grid), 3), dtype=np.float64)
+        self.last_scan_outside_fraction = 0.0
+        self.course_edge_guard_active = False
         self.terrain_group = np.array([1, 0, 0, 0, 0, 0], dtype=np.uint8)
         terrain_geoms = [
             i for i in range(model.ngeom)
@@ -413,6 +424,12 @@ class M20Contract:
             hit_z = ray_z - distance
             self.last_scan_hits[i] = (xy[0], xy[1], hit_z)
             scan[i] = np.clip(base_pos[2] - hit_z - SCAN_OFFSET, -1.0, 1.0)
+        # The stair courses are centred on the world Y=0 axis.  Record how
+        # much of the policy's fixed scan grid sees the base plane beside them.
+        # This is diagnostic only; the observation dimensions stay unchanged.
+        self.last_scan_outside_fraction = float(
+            np.mean(np.abs(world_xy[:, 1]) > self.terrain.course_width / 2)
+        )
         self._scan_cache_key, self._scan_cache = scan_key, scan.copy()
         return scan
 
@@ -486,27 +503,44 @@ class TeleopKeyboard:
         self._lock = threading.Lock()
         self._events: deque[str] = deque()
         self._last_motion_press: dict[str, float] = {}
+        self._blocked_motion: set[str] = set()
         self._window_keys = X11WindowKeys.open()
+
+    def on_window_key(self, keycode: int, action: int) -> None:
+        """Receive reserved GLFW press/repeat/release events before native UI."""
+        import glfw
+
+        key = KEYPAD_MOTION.get(keycode)
+        if action == glfw.RELEASE:
+            with self._lock:
+                self._last_motion_press.pop(key, None)
+                self._blocked_motion.discard(key)
+        elif action == glfw.PRESS or (action == glfw.REPEAT and key in TELEOP_VELOCITIES):
+            self.on_keycode(keycode)
 
     def on_keycode(self, keycode: int) -> None:
         with self._lock:
             if self._window_keys is not None:
                 self._window_keys.note_viewer_event()
-                # MuJoCo invokes this callback on PRESS, not GLFW_REPEAT/RELEASE.
-                # Motion keys therefore come from physical state, not a timeout.
-                if 65 <= keycode <= 90 and chr(keycode).lower() in TELEOP_VELOCITIES:
+                # Prefer physical held state when X11 is available; GLFW
+                # press/repeat events are the fallback on other platforms.
+                if keycode in KEYPAD_MOTION:
                     return
         if keycode == 256:  # GLFW escape
             self.on_char("escape")
+        elif keycode == 259:  # GLFW backspace
+            self.on_char("backspace")
+        elif keycode in KEYPAD_MOTION:
+            self.on_char(KEYPAD_MOTION[keycode])
         elif 65 <= keycode <= 90:
             self.on_char(chr(keycode).lower())
 
     def on_char(self, key: str) -> None:
-        key = "escape" if key == "\x1b" else key.lower()
+        key = {"\x1b": "escape", "\x08": "backspace", "\x7f": "backspace"}.get(key, key.lower())
         with self._lock:
             if key in TELEOP_VELOCITIES:
                 self._last_motion_press[key] = time.monotonic()
-            elif key in {"z", "c", "x", "r", "h", "escape"}:
+            elif key in {"z", "c", "x", "r", "backspace", "h", "escape"}:
                 self._events.append(key)
 
     def take_events(self) -> list[str]:
@@ -517,6 +551,9 @@ class TeleopKeyboard:
 
     def clear_motion(self) -> None:
         with self._lock:
+            self._blocked_motion.update(self._last_motion_press)
+            if self._window_keys is not None:
+                self._blocked_motion.update(self._window_keys.pressed())
             self._last_motion_press.clear()
 
     def close(self) -> None:
@@ -525,6 +562,7 @@ class TeleopKeyboard:
                 self._window_keys.close()
                 self._window_keys = None
             self._last_motion_press.clear()
+            self._blocked_motion.clear()
 
     def velocity_command(self) -> np.ndarray:
         now = time.monotonic()
@@ -536,6 +574,8 @@ class TeleopKeyboard:
             pressed = set(self._last_motion_press)
             if self._window_keys is not None:
                 pressed.update(self._window_keys.pressed())
+            self._blocked_motion.intersection_update(pressed)
+            pressed.difference_update(self._blocked_motion)
         command = np.zeros(3, dtype=np.float32)
         for key in pressed:
             command += TELEOP_VELOCITIES[key]
@@ -584,10 +624,11 @@ class TerminalInput:
             self.saved_attrs = None
 
 
-def launch_viewer(model: mujoco.MjModel, data: mujoco.MjData, key_callback=None):
+def launch_viewer(model: mujoco.MjModel, data: mujoco.MjData, keyboard=None):
     from mujoco import viewer as mj_viewer
     existing_threads = set(threading.enumerate())
-    viewer = mj_viewer.launch_passive(model, data, key_callback=key_callback)
+    viewer = (launch_teleop_viewer(model, data, keyboard) if keyboard is not None
+              else mj_viewer.launch_passive(model, data))
     viewer_threads = [thread for thread in threading.enumerate() if thread not in existing_threads]
     return viewer, viewer_threads
 
@@ -905,6 +946,83 @@ class HeadingHoldController:
         self._cache_key = cache_key
         self._cached_result = (effective.copy(), dict(info))
         return effective, info
+
+
+def apply_course_edge_guard(contract: M20Contract, data: mujoco.MjData,
+                            requested: np.ndarray, effective: np.ndarray,
+                            info: dict | None) -> tuple[np.ndarray, dict | None]:
+    """Limit outward lateral motion before the wheel envelope reaches a stair edge.
+
+    This is external command feedback: it preserves the actor and its input
+    shape, and only takes ownership of lateral velocity during commanded
+    forward stair traversal.  The soft boundary is computed from the actual
+    MuJoCo course width and wheel positions, so it also works for 1.0/1.2 m
+    stairs without hard-coding a robot-to-stair offset.
+    """
+    terrain = contract.terrain
+    if (terrain.kind not in {"ascent", "descent"} or terrain.course_width > 1.5
+            or requested[0] <= COMMAND_THRESHOLD
+            or abs(float(requested[1])) > COMMAND_THRESHOLD
+            or abs(float(requested[2])) > COMMAND_THRESHOLD):
+        contract.course_edge_guard_active = False
+        return effective, info
+
+    rotation = data.xmat[contract.base_id].reshape(3, 3)
+    # The generated stair geometry and its width are aligned to world Y;
+    # spawn_yaw describes only the robot's initial heading.
+    normal = np.array([0.0, 1.0])
+    base_xy = data.xpos[contract.base_id, :2]
+    wheels = data.xpos[contract.wheel_body_ids, :2]
+    wheel_offsets = (wheels - base_xy) @ normal
+    footprint = float(np.max(np.abs(wheel_offsets))) + WHEEL_RADIUS
+    base_limit = max(terrain.course_width / 2 - footprint - COURSE_EDGE_MARGIN, 0.04)
+    lateral_error = float(np.dot(base_xy, normal))
+    signed_error = math.copysign(abs(lateral_error), lateral_error) if abs(lateral_error) > 1.e-9 else 0.0
+    soft_limit = base_limit * COURSE_EDGE_SOFT_ZONE
+
+    velocity = np.zeros(6, dtype=np.float64)
+    mujoco.mj_objectVelocity(contract.model, data, mujoco.mjtObj.mjOBJ_BODY,
+                             contract.base_id, velocity, 1)
+    world_velocity = rotation @ velocity[3:]
+    lateral_speed = float(np.dot(world_velocity[:2], normal))
+    was_active = contract.course_edge_guard_active
+    exit_limit = soft_limit * 0.8
+    edge_active = abs(lateral_error) > (exit_limit if was_active else soft_limit)
+    contract.course_edge_guard_active = edge_active
+    outward_speed = max(0.0, lateral_speed * signed_error)
+    target_lateral_speed = 0.0
+    if edge_active:
+        correction_start = exit_limit if was_active else soft_limit
+        correction_fraction = float(np.clip(
+            (abs(lateral_error) - correction_start) / max(base_limit - correction_start, 1.e-6),
+            0.0, 1.0,
+        ))
+        correction_fraction = correction_fraction * correction_fraction * (3.0 - 2.0 * correction_fraction)
+        inward_speed = min(COURSE_EDGE_MAX_INWARD_SPEED,
+                           COURSE_EDGE_MAX_INWARD_SPEED * correction_fraction
+                           + COURSE_EDGE_KD * outward_speed)
+        target_lateral_speed = -math.copysign(inward_speed, signed_error) if signed_error else 0.0
+
+        # Convert the desired world-normal velocity to the body vy command.
+        body_forward = rotation[:2, 0]
+        body_lateral = rotation[:2, 1]
+        lateral_authority = float(np.dot(body_lateral, normal))
+        if abs(lateral_authority) >= 0.5:
+            required_vy = (target_lateral_speed - float(effective[0]) * float(np.dot(body_forward, normal))) / lateral_authority
+            effective = effective.copy()
+            effective[1] = float(np.clip(required_vy, -COURSE_EDGE_MAX_INWARD_SPEED,
+                                         COURSE_EDGE_MAX_INWARD_SPEED))
+
+    if info is not None:
+        contract.height_scan(data)
+        info.update(course_edge_guard_active=edge_active,
+                    course_edge_lateral_error_m=lateral_error,
+                    course_edge_lateral_speed_m_s=lateral_speed,
+                    course_edge_target_lateral_speed_m_s=target_lateral_speed,
+                    course_edge_base_limit_m=base_limit,
+                    course_edge_wheel_footprint_m=footprint,
+                    height_scan_outside_fraction=contract.last_scan_outside_fraction)
+    return effective, info
 
 
 class StairPathHeadingHold(HeadingHoldController):
@@ -1269,6 +1387,13 @@ def export_stair_telemetry(samples: list[dict], args: argparse.Namespace) -> tup
             "path_lateral_speed_m_s": sample["heading_hold"].get("path_lateral_speed_m_s", float("nan")),
             "path_lateral_correction_m_s": sample["heading_hold"].get("path_lateral_correction_m_s", float("nan")),
             "path_feedback_active": sample["heading_hold"].get("path_active", False),
+            "course_edge_guard_active": sample["heading_hold"].get("course_edge_guard_active", False),
+            "course_edge_lateral_error_m": sample["heading_hold"].get("course_edge_lateral_error_m", float("nan")),
+            "course_edge_lateral_speed_m_s": sample["heading_hold"].get("course_edge_lateral_speed_m_s", float("nan")),
+            "course_edge_target_lateral_speed_m_s": sample["heading_hold"].get("course_edge_target_lateral_speed_m_s", float("nan")),
+            "course_edge_base_limit_m": sample["heading_hold"].get("course_edge_base_limit_m", float("nan")),
+            "course_edge_wheel_footprint_m": sample["heading_hold"].get("course_edge_wheel_footprint_m", float("nan")),
+            "height_scan_outside_fraction": sample["heading_hold"].get("height_scan_outside_fraction", float("nan")),
             "stop_feedback_active": sample["heading_hold"].get("stop_feedback_active", False),
             "stop_position_error_x_m": sample["heading_hold"].get("stop_position_error_x_m", float("nan")),
             "stop_position_error_y_m": sample["heading_hold"].get("stop_position_error_y_m", float("nan")),
@@ -1442,6 +1567,7 @@ def export_stair_telemetry(samples: list[dict], args: argparse.Namespace) -> tup
         "- `command_*` 为键盘原始请求；`effective_command_yaw_rad_s` 是策略实际收到的角速度命令。航向误差在策略步起点计算，偏航角在步末采样。",
         "- filtered_v5 在上下楼自动直行时启用路线横向反馈；上楼航向阻尼使用世界水平航向导数，其余模式保留机身Z角速度约定。",
         f"- 上楼自动直行增加路线横向保持：kp={ASCENT_PATH_KP}，kd={ASCENT_PATH_KD}，最大横向速度修正={ASCENT_PATH_MAX_LATERAL_SPEED}m/s，位置/速度死区={ASCENT_PATH_LATERAL_DEADBAND}m/{ASCENT_PATH_SPEED_DEADBAND}m/s，变化率={ASCENT_PATH_LATERAL_SLEW}m/s²。它只修正 vy，保留原始 vx；无积分及固定方向偏置。",
+        f"- MuJoCo 窄楼梯（宽度≤1.5m）额外启用轮廓边界保护：按实时车轮包络和楼梯宽度计算安全横移区，并记录高度图扫到楼梯外地面的比例；不改变策略输入维度。",
         f"- 下楼采用相同路线反馈增益，横向修正限幅为{DESCENT_PATH_MAX_LATERAL_SPEED}m/s；楼梯零指令制动{STAIR_STOP_BRAKE_GRACE}s后锁存位置，恢复速度限幅{STAIR_STOP_MAX_SPEED}m/s，kp/kd={STAIR_STOP_KP}/{STAIR_STOP_KD}。",
         "- 新增机身 roll/pitch、世界平移速度和四个轮心世界坐标，用于区分航向转动、横向滑移及左右前轮落阶时差。",
         "- `*_action_delta_rms` 和 `*_action_second_difference_rms` 是归一化策略动作的一阶、二阶差分 RMS；不除以采样周期。策略控制中断后重新计数。",
@@ -1593,7 +1719,7 @@ def interactive_rollout(args: argparse.Namespace) -> dict:
     print_deployment_contract(args)
     keys = TeleopKeyboard()
     terminal = TerminalInput(keys)
-    viewer, viewer_threads = launch_viewer(model, data, key_callback=keys.on_keycode)
+    viewer, viewer_threads = launch_viewer(model, data, keyboard=keys)
     try:
         with viewer.lock():
             viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
@@ -1601,9 +1727,9 @@ def interactive_rollout(args: argparse.Namespace) -> dict:
             viewer.cam.distance = 3.2
             viewer.cam.elevation = -18.0
         terminal_active = terminal.start()
-        print("[KEYS] Z stand | C teacher policy | X lie down | R damping | H height scan | Esc quit", flush=True)
+        print("[KEYS] Z stand | C teacher policy | X lie down | R/Backspace reset prone | H height scan | Esc quit", flush=True)
         print("[HEIGHTMAP] 187 points: green=local ground, red=higher, blue=lower", flush=True)
-        print("[KEYS] W/S forward/back | A/D left/right | Q/E turn left/right", flush=True)
+        print("[KEYS] Keypad 8/2 forward/back | 4/6 left/right | 7/9 turn left/right (reserved; no viewer shortcuts)", flush=True)
         print(f"[KEYS] Input: MuJoCo window{' or focused terminal' if terminal_active else ''}", flush=True)
         print(f"[KEYS] Window motion: {'hold/release state (X11)' if keys._window_keys is not None else 'repeat events with timeout; use focused terminal if window only reports PRESS'}", flush=True)
         if args.telemetry:
@@ -1657,12 +1783,30 @@ def interactive_rollout(args: argparse.Namespace) -> dict:
                 elif key == "h":
                     show_height_scan = not show_height_scan
                     print(f"[HEIGHTMAP] {'visible' if show_height_scan else 'hidden'}", flush=True)
-                elif key == "r":
+                elif key in {"r", "backspace"}:
+                    with viewer.lock():
+                        contract.reset(data, prone=True)
+                        viewer.perturb.active = 0
+                        viewer.perturb.active2 = 0
                     pending_policy = False
+                    stand_start = lie_start = policy_start = 0.0
+                    stand_initial = lie_initial = None
                     previous_action.fill(0)
                     heading_hold.reset()
                     keys.clear_motion()
-                    enter("damping")
+                    telemetry = StairTelemetry(contract)
+                    telemetry_samples.clear()
+                    if records is not None:
+                        for values in records.values():
+                            values.clear()
+                    transitions.clear()
+                    step = steps_done = 0
+                    start_x = float(data.xpos[contract.base_id, 0])
+                    max_x = start_x
+                    fell_ever = False
+                    enter("prone")
+                    # Discard actions queued before reset, including a queued C.
+                    break
                 elif key == "z":
                     if mode in {"prone", "damping", "lying"}:
                         stand_start = float(data.time)
@@ -1712,6 +1856,9 @@ def interactive_rollout(args: argparse.Namespace) -> dict:
             heading_info = None
             if mode == "policy":
                 command, heading_info = heading_hold.update(data, requested_command)
+                command, heading_info = apply_course_edge_guard(
+                    contract, data, requested_command, command, heading_info
+                )
             applied_action = np.zeros(ACTION_DIM, dtype=np.float32)
             if mode == "policy":
                 with torch.inference_mode():
@@ -1876,6 +2023,9 @@ def rollout(args: argparse.Namespace) -> dict:
             if args.command_segments:
                 command = command_profile_at(args.command_segments, step * POLICY_DT)
             effective_command, heading_info = heading_hold.update(data, command)
+            effective_command, heading_info = apply_course_edge_guard(
+                contract, data, command, effective_command, heading_info
+            )
             with torch.inference_mode():
                 tensor_obs = actor_inputs(contract, data, effective_command, previous_action, actor, command)
                 obs = tensor_obs['policy'].squeeze(0).numpy()
@@ -1987,6 +2137,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tread-depth", type=float, help="Override staircase XML tread_depth (metres)")
     parser.add_argument("--stair-count", type=int, help="Override staircase XML step_count")
     parser.add_argument("--stair-start", type=float, help="Override staircase XML start_x (metres)")
+    parser.add_argument("--course-width", type=float, help="Override staircase XML width (metres)")
     parser.add_argument("--command-x", type=float, default=0.5)
     parser.add_argument("--command-y", type=float, default=0.0)
     parser.add_argument("--command-yaw", type=float, default=0.0)
@@ -2028,8 +2179,8 @@ def parse_args() -> argparse.Namespace:
             args.steps = math.ceil(sum(s["duration_s"] for s in args.command_segments) / POLICY_DT)
     if ((args.steps is not None and args.steps <= 0)
         or any(value is not None and value <= 0 for value in
-               (args.stair_count, args.stair_height, args.tread_depth))):
-        parser.error("steps (when given), stair-count, stair-height, and tread-depth must be positive")
+               (args.stair_count, args.stair_height, args.tread_depth, args.course_width))):
+        parser.error("steps (when given), stair-count, stair-height, tread-depth, and course-width must be positive")
     if args.print_every <= 0 or args.telemetry_every <= 0:
         parser.error("print-every and telemetry-every must be positive")
     return args

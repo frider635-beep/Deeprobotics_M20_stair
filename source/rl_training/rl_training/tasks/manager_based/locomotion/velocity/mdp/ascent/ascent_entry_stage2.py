@@ -85,6 +85,8 @@ class Stage2PhysicsObserver(EntryPhysicsObserver):
         self.ledger.reset(ids)
 
     def observe(self):
+        from .ascent_adaptive import ascent_mask
+
         env = self.env
         if env._sim_step_counter == 0 or self.last_physics_tick == env._sim_step_counter:
             return
@@ -92,7 +94,7 @@ class Stage2PhysicsObserver(EntryPhysicsObserver):
         self.ledger.reset(reset)
         super().observe()
         command = env.command_manager.get_command('base_velocity')
-        active = (env.scene.terrain.terrain_types < 8) & (command[:, 0] > .1)
+        active = ascent_mask(env) & (command[:, 0] > .1)
         active &= (command[:, 1:].abs().amax(-1) < .1)
         data = env.scene['robot'].data
         rise = env.cfg.ascent_entry_height
@@ -189,11 +191,13 @@ def stall_cost(env): return context(env)['stall']
 
 
 def metrics(env, env_ids):
+    from .ascent_adaptive import ascent_mask
+
     observer = env._ascent_entry_observer
     ids = torch.arange(env.num_envs, device=env.device)
     if env_ids is not None:
         ids = ids[env_ids]
-    ids = ids[env.scene.terrain.terrain_types[ids] < 8]
+    ids = ids[ascent_mask(env)[ids]]
     samples = observer.stats['physics_samples'][ids].sum().clamp_min(1.)
     count = max(len(ids), 1)
     return {

@@ -13,7 +13,8 @@ class AlternatingVelocityCommand(SequenceVelocityCommand):
     def _resample_command(self, env_ids):
         super()._resample_command(env_ids)
         ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
-        ids = ids[self._env.scene.terrain.terrain_types[ids] < 8]
+        from rl_training.tasks.manager_based.locomotion.velocity.mdp.ascent.ascent_adaptive import ascent_mask
+        ids = ids[ascent_mask(self._env)[ids]]
         # Train both speeds at every ascent geometry; emphasize the regressed
         # low speed. A command remains fixed through a 24 s ascent episode.
         self.entry_speeds[ids] = torch.where(torch.rand(len(ids), device=self.device) < .6, .5, .7)

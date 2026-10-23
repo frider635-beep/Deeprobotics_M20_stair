@@ -14,6 +14,7 @@ from isaaclab.envs.mdp import reset_root_state_uniform
 import isaaclab.sim as sim_utils
 from rl_training.tasks.manager_based.locomotion.velocity.mdp.ascent import ascent_entry_mdp as entry
 from rl_training.tasks.manager_based.locomotion.velocity.mdp.stair_teacher import StairTeacherVelocityCommand
+from rl_training.tasks.manager_based.locomotion.velocity.mdp.path import stair_path_layout as path_layout
 
 PROFILE = 'ascent_entry_v1'
 VERSION = 'm20_ascent_entry_20261020_v1'
@@ -103,6 +104,8 @@ def reset_entry_root(env, env_ids, pose_range, velocity_range, asset_cfg=SceneEn
 def apply_profile(env_cfg, agent_cfg):
     if getattr(env_cfg,'m20_refinement_profile',None)==PROFILE:
         return configure_agent(agent_cfg)
+    source_terrains = env_cfg.scene.terrain.terrain_generator.sub_terrains
+    env_cfg._m20_general_terrain_sources = path_layout.preserve_general_terrains(source_terrains)
     from .v1_stop_profile import apply_profile as original_profile
     original_profile(env_cfg,agent_cfg,'idle_stop_motion_v1')
     env_cfg.ascent_entry_height, env_cfg.ascent_entry_depth = .15,.30

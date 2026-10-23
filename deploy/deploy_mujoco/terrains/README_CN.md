@@ -21,6 +21,8 @@
 
 每个文件均包含公共参数：`width`、`friction`、`spawn_xy`、`spawn_yaw_deg`，并在注释中说明单位与用途。具体数值以 XML 为准。
 
+参数化上/下楼可用 `--course-width 1.0` 或 `--course-width 1.2` 覆盖路线宽度；该值只作用于本次运行，无需改 XML。遥测会记录扫描落在楼梯边界外的比例和边界保护状态。
+
 ## 调整方法
 
 例如调整楼梯单级高度，只需修改对应 XML 中 `step_height` 的 `data`；全部台阶顶面、平台总高度和下楼出生高度会同步重算。坡度修改 `slope_deg`，水平长度修改 `ramp_length`；坡顶高度由两者计算。
@@ -61,7 +63,7 @@ python deploy/deploy_mujoco/deploy_mujoco.py \
 出生后按 `Z` 起立、`C` 切换策略。各段长度、阶高、坡角、障碍尺寸和摩擦以 XML 为准。
 这里的几何直接由 `geom` 定义，修改公共 `width`、`friction` 元数据不会自动改写已有几何；
 实际表面摩擦在该 XML 的命名 `default` 和局部 `geom` 中设置。
-单类楼梯的 `--stair-height/--tread-depth/--stair-count/--stair-start` 不能覆盖此综合地形。
+单类楼梯的 `--stair-height/--tread-depth/--stair-count/--stair-start/--course-width` 不能覆盖此综合地形。
 
 几何、高程及部署加载检查见 [全地形检查记录](../../../docs/all_terrain_20261007/README_CN.md)。
 
@@ -81,6 +83,6 @@ python deploy/deploy_mujoco/deploy_mujoco.py \
 
 ## 控制与输出
 
-键盘流程：趴下 → `Z` 站起 → `C` 策略；`W/S/A/D/Q/E` 控制速度，`H` 切换 187 点高程显示。
+键盘流程：趴下 → `Z` 站起 → `C` 策略；数字小键盘 `8/2` 前后、`4/6` 左右横移、`7/9` 左右转向；`R` / `Backspace` 重置回初始卧地状态（需重新按 `Z` 起立），`H` 切换 187 点高程显示。
 
 终点字段只做沿 +X 的几何越线统计，未检查是否绕过障碍；侧向、倒退测试应查看实际轨迹、姿态和跌倒情况。调整地形不会改变 Actor/控制契约，也不代表已验证策略的全地形能力。

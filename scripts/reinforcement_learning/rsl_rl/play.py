@@ -244,9 +244,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         elif saved_profile == 'ascent_entry_v1_stage3':
             from rl_training.tasks.manager_based.locomotion.velocity.config.wheeled.deeprobotics_m20.profiles.ascent_landing_profile import apply_profile as apply_landing
             apply_landing(env_cfg, agent_cfg)
-        elif saved_profile == 'ascent_entry_v1_stage8_fixed':
+        elif saved_profile in ('ascent_entry_v1_stage8_fixed', 'ascent_entry_v1_stage9'):
             from rl_training.tasks.manager_based.locomotion.velocity.config.wheeled.deeprobotics_m20.profiles.stair_path_profile import apply_profile as apply_path
-            apply_path(env_cfg, agent_cfg, evaluation=True)
+            apply_path(env_cfg, agent_cfg, evaluation=True, profile=saved_profile)
             env_cfg.stair_path_config = torch.load(resume_path, map_location='cpu', weights_only=True)['m20_training_manifest']['stair_path_config']
         elif saved_profile == 'ascent_entry_v1_stage7':
             from rl_training.tasks.manager_based.locomotion.velocity.config.wheeled.deeprobotics_m20.profiles.ascent_unified_profile import apply_profile as apply_unified
@@ -306,13 +306,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if is_ascent_v1 and saved_profile in ('ascent_entry_v1_stage5', 'ascent_entry_v1_stage6'):
         train_cfg['actor'].update(class_name='rl_training.models.ascent_adaptive_actor:AscentAdaptiveMLPModel')
         train_cfg['obs_groups']['critic'] = ['critic', 'motion_control', 'ascent_control']
-    if is_ascent_v1 and saved_profile in ('ascent_entry_v1_stage7', 'ascent_entry_v1_stage8_fixed'):
+    if is_ascent_v1 and saved_profile in ('ascent_entry_v1_stage7', 'ascent_entry_v1_stage8_fixed', 'ascent_entry_v1_stage9'):
         for key in ('entry_hidden_dims','landing_hidden_dims','sequence_hidden_dims'):
             train_cfg['actor'].pop(key, None)
         train_cfg['actor'].update(class_name='rl_training.models.ascent_unified_actor:AscentUnifiedMLPModel',
             unified_hidden_dims=[256,128])
         train_cfg['obs_groups']['critic'] = ['critic','motion_control','ascent_control']
-    if is_ascent_v1 and saved_profile == 'ascent_entry_v1_stage8_fixed':
+    if is_ascent_v1 and saved_profile in ('ascent_entry_v1_stage8_fixed', 'ascent_entry_v1_stage9'):
         train_cfg['actor'].update(class_name='rl_training.models.stair_path_actor:StairPathMLPModel')
     runner_class = resolve_callable(runner_class_name) if is_custom_runner else OnPolicyRunner
     ppo_runner = runner_class(env, train_cfg, log_dir=None, device=agent_cfg.device)

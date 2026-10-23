@@ -36,8 +36,9 @@ from isaaclab.app import AppLauncher
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import cli_args
 
-ADAPTIVE_PROFILES = ('ascent_entry_v1_stage5', 'ascent_entry_v1_stage6', 'ascent_entry_v1_stage7', 'ascent_entry_v1_stage8_fixed')
-ASCENT_PROFILES = ('ascent_entry_v1', 'ascent_entry_v1_stage2', 'ascent_entry_v1_stage3', 'ascent_entry_v1_stage4', 'ascent_entry_v1_stage5', 'ascent_entry_v1_stage6', 'ascent_entry_v1_stage7', 'ascent_entry_v1_stage8_fixed')
+PATH_PROFILES = ('ascent_entry_v1_stage8_fixed', 'ascent_entry_v1_stage9')
+ADAPTIVE_PROFILES = ('ascent_entry_v1_stage5', 'ascent_entry_v1_stage6', 'ascent_entry_v1_stage7', *PATH_PROFILES)
+ASCENT_PROFILES = ('ascent_entry_v1', 'ascent_entry_v1_stage2', 'ascent_entry_v1_stage3', 'ascent_entry_v1_stage4', 'ascent_entry_v1_stage5', 'ascent_entry_v1_stage6', 'ascent_entry_v1_stage7', *PATH_PROFILES)
 
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
@@ -256,7 +257,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         profile_manifest = apply_profile(env_cfg, agent_cfg, args_cli.m20_profile)
         if args_cli.ascent_learning_rate is not None:
             agent_cfg.algorithm.learning_rate=args_cli.ascent_learning_rate
-        if args_cli.m20_profile == 'ascent_entry_v1_stage8_fixed':
+        if args_cli.m20_profile in PATH_PROFILES:
             # Replay the checkpoint's recorded controller on native init/resume.
             # Its policy must not silently acquire today's default PD gains.
             path_source = (Path(args_cli.init_actor_from).expanduser() if args_cli.init_actor_from else
@@ -264,7 +265,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                      agent_cfg.load_run, agent_cfg.load_checkpoint)) if agent_cfg.resume else None)
             if path_source is not None:
                 path_manifest = torch.load(path_source, map_location='cpu', weights_only=True).get('m20_training_manifest') or {}
-                if path_manifest.get('m20_profile') == 'ascent_entry_v1_stage8_fixed':
+                if path_manifest.get('m20_profile') in PATH_PROFILES:
                     from rl_training.control.stair_path import PathConfig
                     config = PathConfig(**path_manifest['stair_path_config']).to_dict()
                     env_cfg.stair_path_config = config
@@ -295,7 +296,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if args_cli.m20_profile in ('ascent_entry_v1_stage4', 'ascent_entry_v1_stage5', 'ascent_entry_v1_stage6'):
         from rl_training.tasks.manager_based.locomotion.velocity.mdp.ascent.ascent_reward_audit import audit_conflicting_rewards
         profile_manifest['resolved_conflicting_reward_audit'] = audit_conflicting_rewards(env_cfg.rewards)
-    if args_cli.m20_profile in ('ascent_entry_v1_stage6', 'ascent_entry_v1_stage7', 'ascent_entry_v1_stage8_fixed'):
+    if args_cli.m20_profile in ('ascent_entry_v1_stage6', 'ascent_entry_v1_stage7', *PATH_PROFILES):
         from rl_training.tasks.manager_based.locomotion.velocity.mdp.ascent.ascent_alternating_mdp import audit_positive_rewards
         profile_manifest['resolved_positive_reward_audit'] = audit_positive_rewards(env_cfg.rewards)
     agent_cfg.max_iterations = (
@@ -403,12 +404,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         train_cfg['actor'].update(class_name='rl_training.models.ascent_adaptive_actor:AscentAdaptiveMLPModel',
                                   adaptive_exploration=profile_manifest['adaptive_exploration_action_std'])
         train_cfg['obs_groups']['critic'] = ['critic', 'motion_control', 'ascent_control']
-    if args_cli.m20_profile in ('ascent_entry_v1_stage7', 'ascent_entry_v1_stage8_fixed'):
+    if args_cli.m20_profile in ('ascent_entry_v1_stage7', *PATH_PROFILES):
         for key in ('entry_hidden_dims','landing_hidden_dims','sequence_hidden_dims','entry_limits','landing_limits','sequence_limits'):
             train_cfg['actor'].pop(key, None)
         train_cfg['actor'].update(class_name='rl_training.models.ascent_unified_actor:AscentUnifiedMLPModel',
             unified_hidden_dims=[256,128], unified_limits=profile_manifest['unified_limits_action_units'])
-    if args_cli.m20_profile == 'ascent_entry_v1_stage8_fixed':
+    if args_cli.m20_profile in PATH_PROFILES:
         train_cfg['actor'].update(class_name='rl_training.models.stair_path_actor:StairPathMLPModel',
                                   descent_limits=profile_manifest['descent_limits_action_units'])
     effective_actor_config = copy.deepcopy(train_cfg.get("actor"))
@@ -416,12 +417,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     runner = runner_class(env, train_cfg, log_dir=log_dir, device=agent_cfg.device)
     if args_cli.m20_profile in ADAPTIVE_PROFILES:
         from rl_training.algorithms.initialization.ascent_adaptive_init import attach_curriculum_checkpoint
-        if args_cli.m20_profile == 'ascent_entry_v1_stage8_fixed':
+        if args_cli.m20_profile in PATH_PROFILES:
             from rl_training.algorithms.initialization.stair_path_init import attach_curriculum_checkpoint
         attach_curriculum_checkpoint(runner.alg, env.unwrapped)
         from rl_training.algorithms.initialization.ascent_adaptive_demo import attach_demonstrations
         attach_demonstrations(runner.alg, args_cli.ascent_demo,
-            coefficient=0. if args_cli.m20_profile in ('ascent_entry_v1_stage6','ascent_entry_v1_stage7','ascent_entry_v1_stage8_fixed') else .5)
+            coefficient=0. if args_cli.m20_profile in ('ascent_entry_v1_stage6','ascent_entry_v1_stage7', *PATH_PROFILES) else .5)
     use_compact_console_logging(
         runner.logger, fast=args_cli.m20_profile in ('v1_stop_v5', 'idle_stop_motion_v1', *ASCENT_PROFILES),
         descent_guide_schedule=descent_guide_schedule)
@@ -441,6 +442,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         runner.load(resume_path)
         if args_cli.m20_profile in ('ascent_entry_v1_stage4', 'ascent_entry_v1_stage5', 'ascent_entry_v1_stage6'):
             env.unwrapped._ascent_sequence_step_offset = int(runner.current_learning_iteration)*agent_cfg.num_steps_per_env
+        if args_cli.m20_profile == 'ascent_entry_v1_stage9':
+            env.unwrapped._stair_path_sampling_iteration_offset = int(runner.current_learning_iteration)
     if descent_guide_schedule:
         env.unwrapped._m20_descent_entry_guide_schedule = {
             **descent_guide_schedule,
@@ -457,7 +460,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             raise ValueError(f"Checkpoint has no actor_state_dict: {init_path}")
         if args_cli.m20_profile == 'v1_stop_v5':
             runner.alg.actor.load_motion_state(actor_state)
-        elif args_cli.m20_profile == 'ascent_entry_v1_stage8_fixed':
+        elif args_cli.m20_profile in PATH_PROFILES:
             from rl_training.algorithms.initialization.stair_path_init import load_actor
             load_actor(runner.alg.actor, saved)
         elif args_cli.m20_profile == 'ascent_entry_v1_stage7':
@@ -485,7 +488,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if args_cli.init_critic_from:
         init_path = Path(args_cli.init_critic_from).expanduser().resolve()
         saved = torch.load(init_path, map_location="cpu", weights_only=True)
-        if args_cli.m20_profile == 'ascent_entry_v1_stage8_fixed':
+        if args_cli.m20_profile in PATH_PROFILES:
             from rl_training.algorithms.initialization.stair_path_init import load_critic
             load_critic(runner.alg.critic, saved['critic_state_dict'])
         elif args_cli.m20_profile in ADAPTIVE_PROFILES:
@@ -495,11 +498,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             runner.alg.critic.load_state_dict(saved["critic_state_dict"], strict=True)
         print(f"[INFO]: Initialized critic weights (fresh optimizer) from: {init_path}")
     path_curriculum_seed = None
-    if args_cli.m20_profile == 'ascent_entry_v1_stage8_fixed' and args_cli.init_actor_from:
+    if args_cli.m20_profile in PATH_PROFILES and args_cli.init_actor_from:
         from rl_training.algorithms.initialization.stair_path_init import seed_curriculum
         path_curriculum_seed = seed_curriculum(env.unwrapped, torch.load(
             Path(args_cli.init_actor_from).expanduser(), map_location='cpu', weights_only=True))
-        print('[INFO] Stage8 curriculum warm start: '+json.dumps(path_curriculum_seed))
+        print('[INFO] Stair path curriculum warm start: '+json.dumps(path_curriculum_seed))
     reference_path = args_cli.preserve_actor_from or args_cli.init_actor_from
     if args_cli.m20_profile in ('v1_stop_v5', 'idle_stop_motion_v1'):
         branch = 'stop' if args_cli.m20_profile == 'v1_stop_v5' else 'commanded-motion residual'
@@ -568,23 +571,24 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if args_cli.m20_profile in ADAPTIVE_PROFILES:
         tracked.extend(source_root/name for name in ('tasks/manager_based/locomotion/velocity/mdp/ascent/ascent_adaptive.py', 'tasks/manager_based/locomotion/velocity/mdp/ascent/ascent_adaptive_mdp.py',
             'tasks/manager_based/locomotion/velocity/config/wheeled/deeprobotics_m20/profiles/ascent_adaptive_profile.py', 'models/ascent_adaptive_actor.py', 'algorithms/initialization/ascent_adaptive_init.py', 'algorithms/initialization/ascent_adaptive_demo.py'))
-    if args_cli.m20_profile in ('ascent_entry_v1_stage6', 'ascent_entry_v1_stage7', 'ascent_entry_v1_stage8_fixed'):
+    if args_cli.m20_profile in ('ascent_entry_v1_stage6', 'ascent_entry_v1_stage7', *PATH_PROFILES):
         tracked.extend(source_root/name for name in (
             'tasks/manager_based/locomotion/velocity/mdp/ascent/ascent_alternating.py',
             'tasks/manager_based/locomotion/velocity/mdp/ascent/ascent_alternating_mdp.py',
             'tasks/manager_based/locomotion/velocity/mdp/ascent/ascent_alternating_reward.py',
             'tasks/manager_based/locomotion/velocity/config/wheeled/deeprobotics_m20/profiles/ascent_alternating_profile.py',
             'algorithms/initialization/ascent_alternating_init.py'))
-    if args_cli.m20_profile in ('ascent_entry_v1_stage7', 'ascent_entry_v1_stage8_fixed'):
+    if args_cli.m20_profile in ('ascent_entry_v1_stage7', *PATH_PROFILES):
         tracked.extend(source_root/name for name in (
             'models/ascent_unified_actor.py', 'algorithms/initialization/ascent_unified_init.py',
             'tasks/manager_based/locomotion/velocity/mdp/ascent/ascent_unified.py',
             'tasks/manager_based/locomotion/velocity/mdp/ascent/ascent_unified_mdp.py',
             'tasks/manager_based/locomotion/velocity/config/wheeled/deeprobotics_m20/profiles/ascent_unified_profile.py'))
-    if args_cli.m20_profile == 'ascent_entry_v1_stage8_fixed':
+    if args_cli.m20_profile in PATH_PROFILES:
         tracked.extend(source_root/name for name in (
             'control/stair_path.py', 'models/stair_path_actor.py', 'algorithms/initialization/stair_path_init.py',
             'tasks/manager_based/locomotion/velocity/mdp/path/stair_path_mdp.py',
+            'tasks/manager_based/locomotion/velocity/mdp/path/stair_path_layout.py',
             'tasks/manager_based/locomotion/velocity/mdp/path/stair_path_objectives.py',
             'tasks/manager_based/locomotion/velocity/config/wheeled/deeprobotics_m20/profiles/stair_path_profile.py'))
     manifest = {"refinement_version": "m20_descent_hold_v4_20261016",
@@ -613,10 +617,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             if args_cli.m20_profile in ASCENT_PROFILES:
                 manifest['ascent_entry_profile'] = profile_manifest
                 manifest['frozen_full_baseline_sha256'] = profile_manifest['baseline_actor_sha256']
-                if args_cli.m20_profile in ('ascent_entry_v1_stage7', 'ascent_entry_v1_stage8_fixed'):
+                if args_cli.m20_profile in ('ascent_entry_v1_stage7', *PATH_PROFILES):
                     manifest['unified_limits_action_units'] = runner.alg.actor.unified_limits.detach().cpu().tolist()
                     from rl_training.models.ascent_unified_actor import baseline_digest
-                    if args_cli.m20_profile == 'ascent_entry_v1_stage8_fixed':
+                    if args_cli.m20_profile in PATH_PROFILES:
                         from rl_training.algorithms.initialization.stair_path_init import frozen_digest as baseline_digest
                     manifest['frozen_motion_state_sha256'] = baseline_digest(runner.alg.actor.state_dict())
                     manifest['consolidation'] = ((torch.load(Path(args_cli.init_actor_from).expanduser(),map_location='cpu',weights_only=True).get('m20_training_manifest') or {}).get('consolidation')
@@ -655,7 +659,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             manifest['contact_demonstration_schedule'] = profile_manifest['contact_demonstration_schedule']
             manifest['contact_demonstration_authority'] = demo_authority
             manifest['critic_input_groups']['ascent_control'] = 12
-        if args_cli.m20_profile == 'ascent_entry_v1_stage8_fixed':
+        if args_cli.m20_profile in PATH_PROFILES:
             source_manifest = (torch.load(Path(args_cli.init_actor_from).expanduser(), map_location='cpu', weights_only=True)['m20_training_manifest']
                                if args_cli.init_actor_from else prior)
             manifest['stair_path_config'] = profile_manifest['stair_path_config']
@@ -679,7 +683,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             manifest["stop_teacher_sha256"] = prior.get("stop_teacher_sha256")
     if reference_path and args_cli.m20_profile != 'idle_stop_motion_v1':
         manifest["preservation_actor_sha256"] = hashlib.sha256(Path(reference_path).expanduser().read_bytes()).hexdigest()
-    elif args_cli.m20_profile in ("v1_stop_v4", "v1_stop_v5", "idle_stop_motion_v1", "ascent_entry_v1_stage7", "ascent_entry_v1_stage8_fixed") and agent_cfg.resume:
+    elif args_cli.m20_profile in ("v1_stop_v4", "v1_stop_v5", "idle_stop_motion_v1", "ascent_entry_v1_stage7", *PATH_PROFILES) and agent_cfg.resume:
         manifest["preservation_actor_sha256"] = prior.get("preservation_actor_sha256")
     if hasattr(env_cfg, "teacher_detailed_diagnostics"):
         manifest["teacher_detailed_diagnostics"] = bool(env_cfg.teacher_detailed_diagnostics)
@@ -710,11 +714,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             initial = {key: value for key, value in initial.items() if not key.startswith('entry_mlp.')}
         if args_cli.m20_profile in ADAPTIVE_PROFILES and initial is not None:
             initial = {k: v for k, v in initial.items() if not k.startswith('sequence_mlp.')}
-        if args_cli.m20_profile in ('ascent_entry_v1_stage7','ascent_entry_v1_stage8_fixed') and initial is not None:
+        if args_cli.m20_profile in ('ascent_entry_v1_stage7', *PATH_PROFILES) and initial is not None:
             initial = {k:v for k,v in initial.items() if not k.startswith('unified_mlp.')}
         if initial is None:
             reference=runner.alg.reference_actor.state_dict()
-            trained_prefix = ('unified_mlp.' if args_cli.m20_profile in ('ascent_entry_v1_stage7','ascent_entry_v1_stage8_fixed') else 'sequence_mlp.' if args_cli.m20_profile in ('ascent_entry_v1_stage4', 'ascent_entry_v1_stage5', 'ascent_entry_v1_stage6') else
+            trained_prefix = ('unified_mlp.' if args_cli.m20_profile in ('ascent_entry_v1_stage7', *PATH_PROFILES) else 'sequence_mlp.' if args_cli.m20_profile in ('ascent_entry_v1_stage4', 'ascent_entry_v1_stage5', 'ascent_entry_v1_stage6') else
                               'landing_mlp.' if args_cli.m20_profile == 'ascent_entry_v1_stage3' else 'entry_mlp.')
             initial={key:value.detach().cpu() for key,value in reference.items()
                      if not key.startswith(trained_prefix)}
@@ -728,7 +732,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                'filtered_support_samples':int(env.unwrapped._ascent_entry_observer.lifetime_support_samples.item()),
                'new_tread_landings':int(env.unwrapped._ascent_entry_observer.lifetime_landings.item()),
                'completed':True,'behavioral_acceptance':'requires paired MuJoCo evaluation'}
-        if args_cli.m20_profile in ('ascent_entry_v1_stage7', 'ascent_entry_v1_stage8_fixed'):
+        if args_cli.m20_profile in ('ascent_entry_v1_stage7', *PATH_PROFILES):
             audit['unified_output_weight_norm'] = audit.pop('entry_output_weight_norm')
             audit['frozen_motion_exact'] = frozen_exact
         if source_entry_weight is not None:

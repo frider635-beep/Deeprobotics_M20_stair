@@ -176,7 +176,8 @@ def context(env):
         return observer.cached
     robot = env.scene['robot'].data
     command = env.command_manager.get_command('base_velocity')
-    course = env.scene.terrain.terrain_types < 8
+    from .ascent_adaptive import ascent_mask
+    course = ascent_mask(env)
     forward = (command[:,0]>.1)&(command[:,1].abs()<.1)&(command[:,2].abs()<.1)
     active = course & forward
     depth, rise = float(env.cfg.ascent_entry_depth), float(env.cfg.ascent_entry_height)

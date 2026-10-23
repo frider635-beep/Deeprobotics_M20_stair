@@ -13,6 +13,56 @@ PREFIXES = (2, 4, 6, 18)
 DEADLINES = (8., 12., 16., 23.5)
 
 
+def ascent_column_count(env):
+    return int(getattr(env.cfg, 'ascent_adaptive_ascent_columns', 8))
+
+
+def column_mask(env, columns):
+    types = env.scene.terrain.terrain_types
+    result = torch.zeros_like(types, dtype=torch.bool)
+    for column in columns:
+        result |= types == int(column)
+    return result
+
+
+def flat_column(env):
+    return int(getattr(env.cfg, 'stair_path_flat_column', ascent_column_count(env)))
+
+
+def descent_column_start(env):
+    return int(getattr(env.cfg, 'stair_path_descent_start', flat_column(env)+1))
+
+
+def ascent_mask(env):
+    columns = getattr(env.cfg, 'ascent_adaptive_ascent_column_ids', None)
+    if columns is None:
+        return env.scene.terrain.terrain_types < ascent_column_count(env)
+    return column_mask(env, columns)
+
+
+def descent_mask(env):
+    columns = getattr(env.cfg, 'stair_path_descent_columns', None)
+    if columns is None:
+        return env.scene.terrain.terrain_types >= descent_column_start(env)
+    return column_mask(env, columns)
+
+
+def flat_mask(env):
+    columns = getattr(env.cfg, 'stair_path_flat_columns', None)
+    if columns is None:
+        return env.scene.terrain.terrain_types == flat_column(env)
+    return column_mask(env, columns)
+
+
+def general_mask(env):
+    columns = getattr(env.cfg, 'stair_path_general_columns', ())
+    return column_mask(env, columns)
+
+
+def reference_columns(env):
+    return tuple(getattr(env.cfg, 'ascent_adaptive_reference_columns', REFERENCE_COLUMNS))
+
+
 def depth_for_row(row, nominal):
     return .30+(nominal-.30)*min(1., max(0, row)/2.)
 

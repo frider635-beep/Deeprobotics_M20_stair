@@ -85,7 +85,7 @@ python deploy/deploy_mujoco/deploy_mujoco.py --model deep_robotics_model/M20/mjc
 
 Replace the checkpoint with a trained candidate. New profile manifests select `legacy_v1` automatically; old checkpoints without manifests need the explicit flag for this comparison. Verify baseline behavior under the same controller before attributing differences to training.
 
-Viewer keys: `Z` stand, `C` policy, `W/S` forward/reverse, `A/D` lateral, `Q/E` turn, `H` scan, `X` prone, `R` damping, `Esc` exit. X11 reads held keys directly; release/focus loss clears movement. Terminal input uses repeat/timeouts. Confirm raw-zero commands in telemetry.
+Viewer keys: `Z` stand, `C` policy, keypad `8/2` forward/reverse, `4/6` left/right, `7/9` turn left/right, `H` scan, `X` prone, `R` / `Backspace` reset to the initial prone state (press `Z` again to stand, then `C` for policy), `Esc` exit. Teleop keys are consumed before native viewer shortcuts; movement uses the separate numeric keypad, not the top number row. X11 reads held keys directly; release/focus loss clears movement. Terminal input uses repeat/timeouts. Confirm raw-zero commands in telemetry.
 
 Use `stairs_descent.xml` for descent and **`--terrain flat`** for flat ground. Omitting terrain arguments defaults to ascent. `--viewer --autoplay` executes automatic commands. Policy/physics periods are 0.02/0.005 seconds. Batch example:
 

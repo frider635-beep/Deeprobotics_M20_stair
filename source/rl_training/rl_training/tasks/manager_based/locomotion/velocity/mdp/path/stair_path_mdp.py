@@ -1,11 +1,14 @@
-"""Stage8 path feedback and measured per-direction training objectives."""
+"""Shared stair-path feedback and measured per-direction training objectives."""
 from types import MethodType
 import torch
 from .......control.stair_path import StairPathController
 from .......utils.teacher_diagnostics import export_teacher_metrics
 from ..ascent.ascent_unified_mdp import UnifiedPhysicsObserver
-from ..ascent import ascent_adaptive_mdp as adaptive
+from ..ascent import ascent_adaptive_mdp as ascent_mdp
+from ..ascent import ascent_adaptive as terrain_adaptive
 from .stair_path_objectives import contact_slip_cost, return_velocity_cost
+from . import stair_path_layout as layout
+from .stair_path_layout import ASCENT_TASKS, DESCENT_TASKS, DESCENT_START, task_label
 
 
 def controller(env):
@@ -31,7 +34,8 @@ def apply_path_command(env, effective, raw, command_name='base_velocity'):
     result = effective.clone()
     # Manual lateral/turn commands retain ownership; a platform exit decays
     # smoothly only while the original straight request is still held.
-    result[:, 1] = torch.where(control.straight, control.correction, raw[:, 1])
+    stair_course = terrain_adaptive.ascent_mask(env) | terrain_adaptive.descent_mask(env)
+    result[:, 1] = torch.where(control.straight & stair_course, control.correction, raw[:, 1])
     return result
 
 
@@ -76,14 +80,14 @@ class PathPhysicsObserver(UnifiedPhysicsObserver):
         super().observe()
         ctrl = controller(env); data = env.scene['robot'].data
         command = env.command_manager.get_command('base_velocity')
-        stairs = env.scene.terrain.terrain_types != 8
+        stairs = terrain_adaptive.ascent_mask(env) | terrain_adaptive.descent_mask(env)
         straight = (command[:, 0] > .1) & (command[:, 1:].abs().amax(-1) <= .1)
         active = stairs & straight
         q = data.root_quat_w
         yaw = torch.atan2(2.*(q[:, 0]*q[:, 3]+q[:, 1]*q[:, 2]),
                           1.-2.*(q[:, 2].square()+q[:, 3].square()))
         error, speed, _, normal = ctrl.measure(data.root_pos_w[:, :2], data.root_lin_vel_w[:, :2], yaw)
-        descending = active & (env.scene.terrain.terrain_types >= 9)
+        descending = active & terrain_adaptive.descent_mask(env)
         slip_cost, lateral_slip, longitudinal_slip = contact_slip_cost(
             self.contact_tangent, self.contact_support, normal, descending)
         relative_yaw = yaw-ctrl.heading
@@ -102,7 +106,7 @@ class PathPhysicsObserver(UnifiedPhysicsObserver):
         # A successful tread prefix cannot override a failed path corridor.
         self.prefix_ready &= ~self.path_failed
         self.top_ready &= ~self.path_failed
-        _, depth = adaptive.geometry(env)
+        _, depth = terrain_adaptive.geometry(env)
         end = env.scene.env_origins[:, 0]+1.25+env.cfg.ascent_sequence_step_count*depth
         wheel_pos = data.body_pos_w[:, self.wheels]
         self.down_ready |= descending & (wheel_pos[..., 0].amin(-1) > end+.40)
@@ -126,7 +130,7 @@ class PathPhysicsObserver(UnifiedPhysicsObserver):
 def install_physics_observer(env):
     if hasattr(env, '_ascent_entry_observer'):
         if not isinstance(env._ascent_entry_observer, PathPhysicsObserver):
-            raise RuntimeError('Stage8 needs the shared path observer from the first physics step')
+            raise RuntimeError('Stair path profiles need the shared path observer from the first physics step')
         return
     env._ascent_entry_observer = PathPhysicsObserver(env)
     original = env.scene.update
@@ -194,7 +198,7 @@ def descent_course(env):
 def curriculum(env, env_ids):
     course = descent_course(env); terrain = env.scene.terrain
     ids = torch.arange(env.num_envs, device=env.device) if env_ids is None else torch.as_tensor(env_ids, device=env.device, dtype=torch.long)
-    ids = ids[terrain.terrain_types[ids] >= 9]
+    ids = ids[terrain_adaptive.descent_mask(env)[ids]]
     observer = getattr(env, '_ascent_entry_observer', None)
     if observer is not None and len(ids) and getattr(env.cfg, 'ascent_adaptive_training', True):
         ids = ids[observer.path_samples[ids] > 0]
@@ -203,13 +207,84 @@ def curriculum(env, env_ids):
         # hardest row. A solved staircase should remain on that hardest row.
         up &= terrain.terrain_levels[ids] < terrain.terrain_origins.shape[0]-1
         terrain.update_env_origins(ids, up, down)
-    selected = terrain.terrain_types >= 9
+    selected = terrain_adaptive.descent_mask(env)
     result = dict(terrain_level_mean=terrain.terrain_levels[selected].float().mean() if selected.any() else torch.zeros((), device=env.device))
-    for column,label in ((9,'depth020'),(10,'depth025'),(11,'depth030'),(12,'depth035')):
+    for offset, (depth, width) in enumerate(DESCENT_TASKS):
+        column = DESCENT_START+offset
+        label = task_label('descent', depth, width)
         chosen = terrain.terrain_types == column
         result['__weighted_total__/'+label+'_terrain_level_mean'] = terrain.terrain_levels[chosen].float().sum()
         result['__weighted_count__/'+label+'_terrain_level_mean'] = chosen.float().sum()
     return export_teacher_metrics(result, result.keys(), detailed=True)
+
+
+def general_terrain_curriculum(env, env_ids, min_commanded_translation_m=.1):
+    terrain = env.scene.terrain
+    ids = torch.arange(env.num_envs, device=env.device) if env_ids is None else torch.as_tensor(
+        env_ids, device=env.device, dtype=torch.long)
+    general = terrain_adaptive.general_mask(env) | terrain_adaptive.flat_mask(env)
+    ids = ids[general[ids]]
+    if len(ids):
+        from .. import stair_teacher
+        return stair_teacher.stair_distance_terrain_levels(
+            env, ids, min_commanded_translation_m=min_commanded_translation_m)
+    return terrain.terrain_levels.float().mean()
+
+
+def _sampling_stage(env):
+    steps_per_iteration = int(getattr(env.cfg, 'stair_path_sampling_steps_per_iteration', 24))
+    offset = int(getattr(env, '_stair_path_sampling_iteration_offset', 0))
+    iteration = offset + int(env.common_step_counter) // max(steps_per_iteration, 1)
+    return (0 if iteration < 600 else 1 if iteration < 2000 else 2), iteration
+
+
+def _resample_reset_terrains(env, ids, stage):
+    """Assign environments at phase boundaries, then keep each task stable within a phase."""
+    if not len(ids):
+        return
+    terrain = env.scene.terrain
+    if not hasattr(env, '_stair_path_sampling_stage'):
+        env._stair_path_sampling_stage = torch.full((env.num_envs,), -1, device=env.device, dtype=torch.long)
+    ids = ids[env._stair_path_sampling_stage[ids] != stage]
+    if not len(ids):
+        return
+    probabilities = torch.tensor(layout.staged_sampling_probabilities(stage), device=env.device)
+    old_types = terrain.terrain_types[ids].clone()
+    new_types = torch.multinomial(probabilities.expand(len(ids), -1).contiguous(), 1).squeeze(-1)
+    changed = new_types != old_types
+    env._stair_path_sampling_stage[ids] = stage
+    if not changed.any():
+        return
+    changed_ids = ids[changed]
+    old_changed = old_types[changed]
+    new_changed = new_types[changed]
+    terrain.terrain_types[changed_ids] = new_changed
+    old_stair = ((old_changed < layout.ASCENT_COLUMNS)
+                 | ((old_changed >= layout.DESCENT_START)
+                    & (old_changed < layout.DESCENT_START + len(layout.DESCENT_COLUMNS))))
+    new_stair = ((new_changed < layout.ASCENT_COLUMNS)
+                 | ((new_changed >= layout.DESCENT_START)
+                    & (new_changed < layout.DESCENT_START + len(layout.DESCENT_COLUMNS))))
+    terrain.terrain_levels[changed_ids[old_stair | new_stair]] = 0
+    terrain.env_origins[changed_ids] = terrain.terrain_origins[
+        terrain.terrain_levels[changed_ids], new_changed]
+
+    # Contact-prefix progress belongs to a geometry. Do not carry an easy
+    # column's full-flight target onto a newly sampled narrow staircase.
+    ascent_changed = (old_changed < layout.ASCENT_COLUMNS) | (new_changed < layout.ASCENT_COLUMNS)
+    if ascent_changed.any():
+        reset_ids = changed_ids[ascent_changed]
+        state = ascent_mdp.curriculum_state(env)
+        for name in ('skill', 'good', 'bad', 'completed'):
+            getattr(state, name)[reset_ids] = 0
+
+    descent_changed = ((old_changed >= layout.DESCENT_START) & (old_changed < layout.DESCENT_START + len(layout.DESCENT_COLUMNS)))
+    descent_changed |= ((new_changed >= layout.DESCENT_START) & (new_changed < layout.DESCENT_START + len(layout.DESCENT_COLUMNS)))
+    if descent_changed.any() and hasattr(env, '_stair_path_descent_curriculum'):
+        reset_ids = changed_ids[descent_changed]
+        state = env._stair_path_descent_curriculum
+        for name in ('window', 'trials', 'cursor', 'bad'):
+            getattr(state, name)[reset_ids] = 0
 
 
 def metrics(env, env_ids):
@@ -218,7 +293,8 @@ def metrics(env, env_ids):
     ids = torch.arange(env.num_envs, device=env.device) if env_ids is None else torch.as_tensor(env_ids, device=env.device, dtype=torch.long)
     terrain = env.scene.terrain; command = env.command_manager.get_command('base_velocity')
     result = {}
-    for label, select in (('ascent', terrain.terrain_types < 8), ('descent', terrain.terrain_types >= 9)):
+    for label, select in (('ascent', terrain_adaptive.ascent_mask(env)),
+                          ('descent', terrain_adaptive.descent_mask(env))):
         picked = ids[select[ids] & (observer.path_samples[ids] > 0)]
         count = len(picked); samples = observer.path_samples[picked].sum()
         for name, total, denominator in (
@@ -237,10 +313,43 @@ def metrics(env, env_ids):
                 group = picked[(command[picked, 0] > .6) == fast]
                 result['__weighted_total__/descent_'+suffix+'_success'] = observer.down_success[group].float().sum()
                 result['__weighted_count__/descent_'+suffix+'_success'] = torch.as_tensor(len(group), device=env.device).float()
-    for column,label in ((2,'ascent_depth020'),(3,'ascent_depth025'),(9,'descent_depth020'),(10,'descent_depth025'),(11,'descent_depth030'),(12,'descent_depth035')):
+    groups = [(column, task_label('ascent', depth, width), True)
+              for column, (depth, width) in enumerate(ASCENT_TASKS)]
+    groups.append((len(ASCENT_TASKS), 'ascent_reference', True))
+    groups.extend((DESCENT_START+offset, task_label('descent', depth, width), False)
+                  for offset, (depth, width) in enumerate(DESCENT_TASKS))
+    for column,label,is_ascent in groups:
         picked = ids[(terrain.terrain_types[ids] == column) & (observer.path_samples[ids] > 0)]
-        success = (adaptive.finished(env)[picked] if column < 8 and len(picked) else observer.down_success[picked])
-        for name, total in (('success',success.float().sum()),('max_error_m',observer.path_max[picked].sum())):
+        success = ascent_mdp.finished(env)[picked] if is_ascent else observer.down_success[picked]
+        missing = observer.stats['adaptive_missing'][picked].sum() if is_ascent else torch.zeros((), device=env.device)
+        for name, total in (('success',success.float().sum()),
+                            ('max_error_m',observer.path_max[picked].sum()),
+                            ('missing_treads',missing)):
             result['__weighted_total__/'+label+'_'+name] = total
             result['__weighted_count__/'+label+'_'+name] = torch.as_tensor(len(picked), device=env.device).float()
+    for terrain_name, columns in layout.GENERAL_COLUMN_GROUPS.items():
+        selected = torch.zeros_like(terrain.terrain_types, dtype=torch.bool)
+        for column in columns:
+            selected |= terrain.terrain_types == column
+        chosen = ids[selected[ids]]
+        result['__weighted_total__/general_'+terrain_name+'_terrain_level_mean'] = terrain.terrain_levels[chosen].float().sum()
+        result['__weighted_count__/general_'+terrain_name+'_terrain_level_mean'] = torch.as_tensor(
+            len(chosen), device=env.device).float()
+    flat = torch.zeros_like(terrain.terrain_types, dtype=torch.bool)
+    for column in layout.FLAT_COLUMNS:
+        flat |= terrain.terrain_types == column
+    chosen = ids[flat[ids]]
+    result['__weighted_total__/general_flat_terrain_level_mean'] = terrain.terrain_levels[chosen].float().sum()
+    result['__weighted_count__/general_flat_terrain_level_mean'] = torch.as_tensor(len(chosen), device=env.device).float()
+    if getattr(env.cfg, 'm20_refinement_profile', None) == 'ascent_entry_v1_stage9':
+        stage, iteration = _sampling_stage(env)
+        probabilities = layout.staged_sampling_probabilities(stage)
+        result['sampling_stage'] = torch.as_tensor(stage, device=env.device, dtype=torch.float32)
+        result['sampling_iteration'] = torch.as_tensor(iteration, device=env.device, dtype=torch.float32)
+        result['sampling_ascent_fraction'] = torch.as_tensor(sum(probabilities[:layout.ASCENT_COLUMNS]), device=env.device)
+        result['sampling_descent_fraction'] = torch.as_tensor(
+            sum(probabilities[layout.DESCENT_START:layout.DESCENT_START+len(layout.DESCENT_COLUMNS)]), device=env.device)
+        result['sampling_non_stair_fraction'] = torch.as_tensor(
+            sum(probabilities[column] for column in (*layout.FLAT_COLUMNS, *layout.GENERAL_COLUMNS)), device=env.device)
+        _resample_reset_terrains(env, ids, stage)
     return export_teacher_metrics(result, result.keys(), detailed=True)

@@ -1,4 +1,5 @@
-"""Stage8: retain Stage7 ascent, share path feedback and learn straight descent."""
+"""Stage9: stabilize narrow-stair courses and retain shared path feedback."""
+from copy import deepcopy
 import numpy as np
 import torch
 import trimesh
@@ -9,33 +10,75 @@ from isaaclab.utils import configclass
 from . import ascent_unified_profile as previous
 from .ascent_alternating_profile import AlternatingVelocityCommand
 from .ascent_adaptive_profile import AdaptiveStairsCfg
-from .ascent_entry_profile import straight_stairs, reset_entry_root
+from .ascent_entry_profile import reset_entry_root
 from rl_training.control.stair_path import PathConfig, PATH_VERSION
-from rl_training.models.stair_path_actor import PROFILE, VERSION, DESCENT_LIMITS, DESCENT_WARMUP, DESCENT_RAMP
+from rl_training.models.stair_path_actor import DESCENT_LIMITS, DESCENT_WARMUP, DESCENT_RAMP
 from rl_training.tasks.manager_based.locomotion.velocity.mdp.path import stair_path_mdp as path
+from rl_training.tasks.manager_based.locomotion.velocity.mdp.path import stair_path_layout as layout
+from rl_training.tasks.manager_based.locomotion.velocity.mdp.path.rectangular_random_grid import random_grid_terrain
 from rl_training.tasks.manager_based.locomotion.velocity.mdp.path.stair_path_objectives import REWARD_VERSION, REWARD_WEIGHTS
 from rl_training.tasks.manager_based.locomotion.velocity.mdp.ascent import ascent_alternating_mdp as alternating
-from rl_training.tasks.manager_based.locomotion.velocity.mdp.ascent.ascent_adaptive import HEIGHTS, REFERENCE_COLUMNS
+from rl_training.tasks.manager_based.locomotion.velocity.mdp.ascent import ascent_entry_mdp as entry
+from rl_training.tasks.manager_based.locomotion.velocity.mdp.ascent import ascent_adaptive as adaptive
+from rl_training.tasks.manager_based.locomotion.velocity.mdp.ascent.ascent_adaptive import geometry
+from rl_training.tasks.manager_based.locomotion.velocity.mdp.ascent.ascent_adaptive import HEIGHTS
 
 
-# Eight ascent columns, one flat, four descending widths. Never change the
-# <8 / ==8 / >=9 direction contract used by the existing contact observers.
-PATH_DEPTHS = (.30,.30,.20,.25,.30,.35,.30,.35,.30,.20,.25,.30,.35)
-TERRAIN_COLUMNS = len(PATH_DEPTHS)
+PROFILE = 'ascent_entry_v1_stage9'
+VERSION = 'm20_stair_path_fixed247_20261023_v2_staged_sampling'
+STAGE8_PROFILE = 'ascent_entry_v1_stage8_fixed'
+STAGE8_VERSION = 'm20_stair_path_fixed247_20261022_v1_stage8_reward_v2'
+STAGE8_DEPTHS = (.30,.30,.20,.25,.30,.35,.30,.35,.30,.20,.25,.30,.35)
+STAGE8_REFERENCE_COLUMNS = (4, 6)
+ASCENT_REFERENCE_COLUMN = len(layout.ASCENT_TASKS)
+PATH_DEPTHS = tuple(depth for depth, _ in layout.ASCENT_TASKS) + (layout.REFERENCE_TASK[0],) + tuple(
+    [.30]*layout.FLAT_COPIES) + tuple(depth for depth, _ in layout.DESCENT_TASKS) + tuple(
+    [.30]*len(layout.GENERAL_COLUMNS))
+TERRAIN_COLUMNS = layout.TERRAIN_COLUMNS
+if len(PATH_DEPTHS) != TERRAIN_COLUMNS:
+    raise RuntimeError('Stage9 geometry table does not cover every terrain column')
+
+
+def _narrow_ascent_mask(env):
+    """Limit extra riser protection to the trained 20/25 cm ascent columns."""
+    _, depth = geometry(env)
+    ascent = adaptive.ascent_mask(env)
+    return ascent & (depth <= .25 + 1.e-6)
+
+
+def narrow_ascent_clearance_cost(env):
+    """Restore the wheel-over-riser clearance signal on narrow treads only."""
+    return entry.clearance_cost(env) * _narrow_ascent_mask(env)
+
+
+def narrow_ascent_riser_contact_cost(env):
+    """Make front-edge impacts visible on narrow ascent columns only."""
+    return entry.riser_contact_cost(env) * _narrow_ascent_mask(env)
+
 
 def path_stairs(difficulty, cfg):
     row = int(np.clip(np.floor(float(difficulty)*len(HEIGHTS)), 0, len(HEIGHTS)-1))
     height = .15 if cfg.reference else max(HEIGHTS[row], cfg.minimum_height)
-    if not cfg.descending:
-        return straight_stairs(difficulty, cfg.replace(step_height=height))
-    length, width = cfg.size; depth, count, start = cfg.tread_depth, cfg.step_count, 3.
-    def box(x0, x1, z):
+    length, tile_width = cfg.size
+    depth, count, start = cfg.tread_depth, cfg.step_count, 3.
+    course_width = tile_width if cfg.reference else cfg.course_width_m
+
+    def box(x0, x1, z, width):
         return trimesh.creation.box((x1-x0, width, z+.1),
-            trimesh.transformations.translation_matrix(((x0+x1)/2, width/2, (z-.1)/2)))
-    meshes = [box(0., length, 0.), box(0., start, count*height)]
-    for i in range(count):
-        meshes.append(box(start+i*depth, start+(i+1)*depth, (count-1-i)*height))
-    return meshes, np.array([start-1.25, width/2, count*height])
+            trimesh.transformations.translation_matrix(((x0+x1)/2, tile_width/2, (z-.1)/2)))
+
+    meshes = [box(0., length, 0., tile_width)]
+    if cfg.descending:
+        meshes.append(box(0., start, count*height, course_width))
+        for i in range(count):
+            meshes.append(box(start+i*depth, start+(i+1)*depth,
+                              (count-1-i)*height, course_width))
+    else:
+        for i in range(count):
+            meshes.append(box(start+i*depth, start+(i+1)*depth,
+                              (i+1)*height, course_width))
+        meshes.append(box(start+count*depth, length, count*height, course_width))
+    return meshes, np.array([start-1.25, tile_width/2, 0. if not cfg.descending else count*height])
 
 
 @configclass
@@ -43,19 +86,20 @@ class PathStairsCfg(AdaptiveStairsCfg):
     function = path_stairs
     descending: bool = False
     minimum_height: float = 0.
+    course_width_m: float = 1.0
 
 
 class PathVelocityCommand(AlternatingVelocityCommand):
     def _resample_command(self, env_ids):
         super()._resample_command(env_ids)
         ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
-        down = ids[self._env.scene.terrain.terrain_types[ids] >= 9]
+        down = ids[adaptive.descent_mask(self._env)[ids]]
         self.entry_speeds[down] = torch.where(torch.rand(len(down), device=self.device) < .5, .5, .7)
         self._apply_ascent_command()
 
     def _apply_ascent_command(self):
         super()._apply_ascent_command()
-        down = self._env.scene.terrain.terrain_types >= 9
+        down = adaptive.descent_mask(self._env)
         self.vel_command_b[down, 0] = self.entry_speeds[down]
         self.vel_command_b[down, 1:] = 0.
         self.is_standing_env[down] = False
@@ -65,7 +109,7 @@ class PathVelocityCommand(AlternatingVelocityCommand):
 def reset_path_root(env, env_ids, pose_range, velocity_range, asset_cfg=SceneEntityCfg('robot')):
     reset_entry_root(env, env_ids, pose_range, velocity_range, asset_cfg)
     ids = torch.as_tensor(env_ids, device=env.device, dtype=torch.long)
-    ids = ids[env.scene.terrain.terrain_types[ids] >= 9]
+    ids = ids[adaptive.descent_mask(env)[ids]]
     asset = env.scene[asset_cfg.name]
     pose = asset.data.default_root_state[ids, :7].clone()
     pose[:, :3] += env.scene.env_origins[ids]
@@ -77,8 +121,18 @@ def reset_path_root(env, env_ids, pose_range, velocity_range, asset_cfg=SceneEnt
     asset.write_root_velocity_to_sim(torch.zeros(len(ids), 6, device=env.device), env_ids=ids)
 
 
-def apply_profile(env_cfg, agent_cfg, evaluation=False):
-    if getattr(env_cfg, 'm20_refinement_profile', None) != PROFILE:
+def apply_profile(env_cfg, agent_cfg, evaluation=False, profile=PROFILE):
+    if profile not in (STAGE8_PROFILE, PROFILE):
+        raise ValueError(f'Unknown stair path profile: {profile}')
+    if getattr(env_cfg, 'm20_refinement_profile', None) != profile:
+        if profile == PROFILE:
+            preserved_terrains = getattr(env_cfg, '_m20_general_terrain_sources', None)
+            if preserved_terrains is None:
+                preserved_terrains = env_cfg.scene.terrain.terrain_generator.sub_terrains
+            try:
+                preserved_terrains = layout.preserve_general_terrains(preserved_terrains)
+            except RuntimeError as exc:
+                raise RuntimeError(str(exc) + '; initialize the v1 task before applying the Stage9 profile') from exc
         previous.apply_profile(env_cfg, agent_cfg, evaluation=evaluation)
         from rl_training.tasks.manager_based.locomotion.velocity.mdp import stair_teacher
         stair_teacher.TUNING['stair_path_feedback'] = True
@@ -86,21 +140,76 @@ def apply_profile(env_cfg, agent_cfg, evaluation=False):
         env_cfg.stair_path_merge_entry_slip = True
         env_cfg.commands.base_velocity.class_type = PathVelocityCommand
         env_cfg.events.randomize_reset_base.func = reset_path_root
-        terrains = {}
-        for column in range(8):
-            terrains[f'path_stairs_{column}'] = PathStairsCfg(proportion=1./TERRAIN_COLUMNS, tread_depth=PATH_DEPTHS[column],
-                reference=column in REFERENCE_COLUMNS, minimum_height=.15 if column == 3 else 0.)
-        terrains['flat'] = MeshPlaneTerrainCfg(proportion=1./TERRAIN_COLUMNS)
-        for label, depth in (('compact',.20),('narrow',.25),('reference',.30),('wide',.35)):
-            terrains['straight_descent_'+label] = PathStairsCfg(proportion=1./TERRAIN_COLUMNS, tread_depth=depth, descending=True)
-        env_cfg.scene.terrain.terrain_generator = TerrainGeneratorCfg(size=(12., 5.), num_rows=len(HEIGHTS),
-            num_cols=TERRAIN_COLUMNS, curriculum=True, difficulty_range=(0., 1.), use_cache=False, sub_terrains=terrains)
-        env_cfg.ascent_adaptive_height_grid = [[.15 if c in REFERENCE_COLUMNS else max(h, .15) if c == 3 else h
-                                               for c in range(TERRAIN_COLUMNS)] for h in HEIGHTS]
-        # Depth remains fixed in each column on EVERY row: failure no longer
-        # converts a narrow stair into an easier, wide-tread task.
-        env_cfg.ascent_adaptive_depth_grid = [list(PATH_DEPTHS) for _ in HEIGHTS]
+        if profile == PROFILE:
+            terrains = {}
+            proportion = 1./TERRAIN_COLUMNS
+            for column, (depth, width) in enumerate(layout.ASCENT_TASKS):
+                terrains[f'path_ascent_{column}'] = PathStairsCfg(proportion=proportion,
+                    tread_depth=depth, course_width_m=width)
+            terrains['path_ascent_reference'] = PathStairsCfg(proportion=proportion,
+                tread_depth=layout.REFERENCE_TASK[0], reference=True)
+            for replica, _ in enumerate(layout.FLAT_COLUMNS):
+                terrains[f'flat_{replica}'] = MeshPlaneTerrainCfg(proportion=proportion)
+            for column, (depth, width) in enumerate(layout.DESCENT_TASKS):
+                terrains[f'path_descent_{column}'] = PathStairsCfg(proportion=proportion,
+                    tread_depth=depth, descending=True, course_width_m=width)
+            for name, columns in layout.GENERAL_COLUMN_GROUPS.items():
+                for replica, _ in enumerate(columns):
+                    terrain_cfg = deepcopy(preserved_terrains[name])
+                    if name == 'boxes':
+                        terrain_cfg.function = random_grid_terrain
+                    terrain_cfg.proportion = proportion
+                    terrains[f'{name}_{replica}'] = terrain_cfg
+            env_cfg.scene.terrain.terrain_generator = TerrainGeneratorCfg(size=(12., 5.), num_rows=len(HEIGHTS),
+                num_cols=TERRAIN_COLUMNS, curriculum=True, difficulty_range=(0., 1.), use_cache=False, sub_terrains=terrains)
+            env_cfg.ascent_adaptive_ascent_columns = layout.ASCENT_COLUMNS
+            env_cfg.ascent_adaptive_ascent_column_ids = tuple(range(layout.ASCENT_COLUMNS))
+            env_cfg.ascent_adaptive_reference_columns = (layout.ASCENT_REFERENCE_COLUMN,)
+            env_cfg.stair_path_flat_column = layout.FLAT_COLUMN
+            env_cfg.stair_path_flat_columns = layout.FLAT_COLUMNS
+            env_cfg.stair_path_descent_start = layout.DESCENT_START
+            env_cfg.stair_path_descent_columns = layout.DESCENT_COLUMNS
+            env_cfg.stair_path_general_columns = layout.GENERAL_COLUMNS
+            env_cfg.ascent_adaptive_height_grid = [[.15 if c == ASCENT_REFERENCE_COLUMN else h
+                                                   for c in range(TERRAIN_COLUMNS)] for h in HEIGHTS]
+            # Each column keeps its width and tread depth at every height row.
+            env_cfg.ascent_adaptive_depth_grid = [list(PATH_DEPTHS) for _ in HEIGHTS]
+            env_cfg.stair_path_sampling_steps_per_iteration = agent_cfg.num_steps_per_env
+        else:
+            terrains = {}
+            proportion = 1./len(STAGE8_DEPTHS)
+            for column in range(8):
+                terrains[f'path_stairs_{column}'] = PathStairsCfg(proportion=proportion,
+                    tread_depth=STAGE8_DEPTHS[column], reference=column in STAGE8_REFERENCE_COLUMNS,
+                    minimum_height=.15 if column == 3 else 0., course_width_m=5.0)
+            terrains['flat'] = MeshPlaneTerrainCfg(proportion=proportion)
+            for label, depth in (('compact',.20),('narrow',.25),('reference',.30),('wide',.35)):
+                terrains['straight_descent_'+label] = PathStairsCfg(proportion=proportion,
+                    tread_depth=depth, descending=True, course_width_m=5.0)
+            env_cfg.scene.terrain.terrain_generator = TerrainGeneratorCfg(size=(12., 5.), num_rows=len(HEIGHTS),
+                num_cols=len(STAGE8_DEPTHS), curriculum=True, difficulty_range=(0., 1.), use_cache=False,
+                sub_terrains=terrains)
+            env_cfg.ascent_adaptive_ascent_columns = 8
+            env_cfg.ascent_adaptive_ascent_column_ids = tuple(range(8))
+            env_cfg.ascent_adaptive_reference_columns = STAGE8_REFERENCE_COLUMNS
+            env_cfg.stair_path_flat_column = 8
+            env_cfg.stair_path_flat_columns = (8,)
+            env_cfg.stair_path_descent_start = 9
+            env_cfg.stair_path_descent_columns = tuple(range(9, 13))
+            env_cfg.stair_path_general_columns = ()
+            env_cfg.ascent_adaptive_height_grid = [[.15 if c in STAGE8_REFERENCE_COLUMNS else max(h,.15) if c == 3 else h
+                                                   for c in range(len(STAGE8_DEPTHS))] for h in HEIGHTS]
+            env_cfg.ascent_adaptive_depth_grid = [list(STAGE8_DEPTHS) for _ in HEIGHTS]
         env_cfg.rewards.ascent_alternating_lateral.weight = 0.
+        # Stage5's wheel-over-riser clearance term was disabled when adaptive
+        # landing guidance was replaced by paired guidance in Stage7. Restore
+        # it only for 20/25 cm ascent columns, where the valid landing window
+        # is narrower and MuJoCo shows more riser strikes and support slip.
+        if profile == PROFILE:
+            env_cfg.rewards.ascent_entry_clearance.func = narrow_ascent_clearance_cost
+            env_cfg.rewards.ascent_entry_clearance.weight = -.30
+            env_cfg.rewards.ascent_riser_contact.func = narrow_ascent_riser_contact_cost
+            env_cfg.rewards.ascent_riser_contact.weight = -.30
         # The retained continuous ascent terms own entry + full-flight slip;
         # the common route objective owns descent lateral position/velocity.
         env_cfg.rewards.ascent_stage2_front_slip.weight = 0.
@@ -112,26 +221,39 @@ def apply_profile(env_cfg, agent_cfg, evaluation=False):
         env_cfg.terminations.stair_path_descent_finished = TerminationTermCfg(func=path.descent_finished)
         env_cfg.curriculum.stair_path_descent = CurriculumTermCfg(func=path.curriculum)
         env_cfg.curriculum.stair_path = CurriculumTermCfg(func=path.metrics)
-        env_cfg.m20_refinement_profile = PROFILE
+        if profile == PROFILE:
+            env_cfg.curriculum.terrain_levels = CurriculumTermCfg(
+                func=path.general_terrain_curriculum, params={'min_commanded_translation_m': .1})
+        env_cfg.m20_refinement_profile = profile
         alternating.gate_positive_rewards(env_cfg.rewards)
     if evaluation:
         env_cfg.ascent_adaptive_training = False
         for terrain in env_cfg.scene.terrain.terrain_generator.sub_terrains.values():
             if isinstance(terrain, PathStairsCfg):
                 terrain.reference = True; terrain.tread_depth = .30
-        env_cfg.ascent_adaptive_height_grid = [[.15]*TERRAIN_COLUMNS for _ in HEIGHTS]
-        env_cfg.ascent_adaptive_depth_grid = [[.30]*TERRAIN_COLUMNS for _ in HEIGHTS]
-    manifest = configure_agent(agent_cfg)
+        columns = TERRAIN_COLUMNS if profile == PROFILE else len(STAGE8_DEPTHS)
+        env_cfg.ascent_adaptive_height_grid = [[.15]*columns for _ in HEIGHTS]
+        env_cfg.ascent_adaptive_depth_grid = [[.30]*columns for _ in HEIGHTS]
+    manifest = configure_agent(agent_cfg, profile=profile)
     manifest['gated_positive_rewards'] = alternating.audit_positive_rewards(env_cfg.rewards)
     return manifest
 
 
-def configure_agent(agent_cfg):
+def configure_agent(agent_cfg, profile=PROFILE):
     manifest = previous.configure_agent(agent_cfg)
     agent_cfg.algorithm.learning_rate = 1.e-5
     agent_cfg.algorithm.anchor_coefficient = .15
     agent_cfg.algorithm.critic_warmup_iterations = 30
-    manifest.update(profile=PROFILE, version=VERSION+'_reward_v2', control_profile='legacy_v1_path_v1',
+    stage9 = profile == PROFILE
+    profile_version = VERSION if stage9 else STAGE8_VERSION
+    columns = TERRAIN_COLUMNS if stage9 else len(STAGE8_DEPTHS)
+    reference_columns = [ASCENT_REFERENCE_COLUMN] if stage9 else list(STAGE8_REFERENCE_COLUMNS)
+    ascent_tasks = ([dict(depth_m=depth, width_m=width) for depth, width in layout.ASCENT_TASKS]
+                    if stage9 else [dict(depth_m=depth, width_m=5.0) for depth in STAGE8_DEPTHS[:8]])
+    descent_tasks = ([dict(depth_m=depth, width_m=width) for depth, width in layout.DESCENT_TASKS]
+                     if stage9 else [dict(depth_m=depth, width_m=5.0) for depth in STAGE8_DEPTHS[9:]])
+    course_widths = list(layout.TASK_WIDTHS_M) if stage9 else [5.0]
+    manifest.update(profile=profile, version=profile_version, control_profile='legacy_v1_path_v1',
         initialization='complete_stage7_exact_network_state_fresh_optimizer',
         actor_inputs='policy244_plus_raw_command3',
         critic_inputs='critic285_plus_raw_command3_plus_ascent_control12',
@@ -145,8 +267,43 @@ def configure_agent(agent_cfg):
         descent_authority_schedule=dict(warmup_iterations=DESCENT_WARMUP, ramp_iterations=DESCENT_RAMP),
         descent_initialization='same_unified_mlp_fixed_bounded_envelope_schedule_30_warmup_800_ramp',
         preservation='default_ascent_1_narrow025_015_compact020_005_descent_002',
-        geometry='fixed_depth_per_column_narrow_min_height_015',
-        terrain_columns=TERRAIN_COLUMNS, ascent_depths_m=[.20,.25,.30,.35],
-        descent_course=dict(fraction=4./TERRAIN_COLUMNS, shape='straight_18_treads', speeds=[.5,.7], depths_m=[.20,.25,.30,.35],
-            promote='both_speeds_6_of_8',demote_consecutive_failures=3, success_max_path_error_m=.20))
+        course_width_curriculum=dict(widths_m=course_widths,
+            pattern='fixed_column_per_tread_depth_and_width' if stage9 else 'legacy_fixed_wide_stairs',
+            ascent_columns=ascent_tasks, descent_columns=descent_tasks,
+            reference_columns=reference_columns, reference_width_m=5.0,
+            outer_region='flat_ground_to_match_MuJoCo_scan_and_edge_support' if stage9 else None),
+        narrow_ascent_contact_protection=(dict(depths_m=[.20,.25], clearance_weight=-.30,
+            riser_contact_weight=-.30, scope='ascent_only') if stage9 else None),
+        staged_sampling=(dict(iteration_boundaries=[600,2000],
+            phases=[dict(easy=.70,middle=.20,hard=.10),
+                    dict(easy=.45,middle=.35,hard=.20),
+                    dict(all_ascent_geometries='uniform')],
+            easy_columns=['30cm/1.2m','35cm/1.2m','5m reference'],
+            middle_columns=['25cm/1.2m','30cm/1.0m','35cm/1.0m'],
+            hard_columns=['20cm/1.0m','20cm/1.2m','25cm/1.0m'],
+            ascent_fraction=round(layout.ASCENT_FRACTION,4),
+            descent_fraction=round(layout.DESCENT_FRACTION,4),
+            non_stair_fraction=round(layout.NON_STAIR_FRACTION,4),
+            non_stair_and_descent_absolute_samples_preserved_from_8192=True,
+            resample='reset_environments_only') if stage9 else None),
+        reward_adjustment=('unchanged_for_sampling_curriculum_ablation' if stage9 else None),
+        geometry=('fixed_width_and_depth_per_column_lowest_row_for_new_width_tasks' if stage9
+                  else 'legacy_fixed_depth_per_column'),
+        terrain_columns=columns, ascent_depths_m=[.20,.25,.30,.35],
+        ascent_course=(dict(reference_column=ASCENT_REFERENCE_COLUMN, reference_width_m=5.0,
+            task_widths_m=[1.0,1.2], demotion_retains_width_and_depth=True) if stage9 else
+            dict(reference_columns=list(STAGE8_REFERENCE_COLUMNS), course_width_m=5.0)),
+        descent_course=dict(fraction=(8./TERRAIN_COLUMNS if stage9 else 4./len(STAGE8_DEPTHS)),
+            shape='straight_18_treads', speeds=[.5,.7], depths_m=[.20,.25,.30,.35],
+            promote='both_speeds_6_of_8',demote_consecutive_failures=3, success_max_path_error_m=.20),
+        mixed_terrain=(dict(flat_columns=list(layout.FLAT_COLUMNS),
+            general_columns={name:list(columns) for name,columns in layout.GENERAL_COLUMN_GROUPS.items()},
+            general_curriculum='distance_based_with_original_velocity_command_and_rewards',
+            path_feedback_scope='ascent_and_descent_columns_only',
+            terrain_grid=dict(rows=len(HEIGHTS),columns=TERRAIN_COLUMNS,tile_size_m=[12.,5.],
+                environments_per_column_at_10584=round(10584/TERRAIN_COLUMNS)))
+            if stage9 else dict(
+                flat_columns=[8], general_columns={}, general_curriculum='legacy_stage8',
+                path_feedback_scope='legacy_stage8_stair_columns_only',
+                terrain_grid=dict(rows=len(HEIGHTS),columns=len(STAGE8_DEPTHS),tile_size_m=[12.,5.]))))
     return manifest

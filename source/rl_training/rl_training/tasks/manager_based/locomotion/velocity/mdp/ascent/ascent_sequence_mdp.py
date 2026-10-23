@@ -2,6 +2,7 @@
 from types import MethodType
 import torch
 from .ascent_entry_mdp import smooth01
+from .ascent_adaptive import ascent_column_count, ascent_mask
 from .ascent_entry_stage2 import Stage2PhysicsObserver
 from .ascent_sequence import SequenceLedger, TopTransition, front_guidance, support_margin_cost, terrain_pitch_target
 
@@ -46,7 +47,7 @@ class SequencePhysicsObserver(Stage2PhysicsObserver):
         super().observe()
         data = env.scene['robot'].data
         command = env.command_manager.get_command('base_velocity')
-        active = (env.scene.terrain.terrain_types < 8) & (command[:, 0] > .1)
+        active = ascent_mask(env) & (command[:, 0] > .1)
         active &= command[:, 1:].abs().amax(-1) < .1
         position = data.body_pos_w[:, self.wheels]
         level = torch.round((self.previous_top_z-self.first_floor[:, None])/env.cfg.ascent_entry_height).long()
@@ -185,7 +186,7 @@ def finished(env):
     types = env.scene.terrain.terrain_types
     progress = env.scene['robot'].data.root_pos_w[:, 0]-env.scene.env_origins[:, 0]
     entry = (types < 6) & (progress > 1.25+6.*env.cfg.ascent_entry_depth)
-    return entry | ((types >= 6) & (types < 8) & observer.top_ready)
+    return entry | ((types >= 6) & (types < ascent_column_count(env)) & observer.top_ready)
 
 
 def metrics(env, env_ids):
@@ -193,7 +194,7 @@ def metrics(env, env_ids):
     if observer is None or not hasattr(observer, 'sequence'): return {}
     ids = torch.arange(env.num_envs, device=env.device)
     if env_ids is not None: ids = ids[env_ids]
-    ids = ids[env.scene.terrain.terrain_types[ids] < 8]
+    ids = ids[ascent_mask(env)[ids]]
     count = max(len(ids), 1); ledger = observer.sequence; stats = observer.stats
     result = {k: stats[k][ids].sum()/count for k in ('seq_pairs', 'seq_ordered', 'seq_missing', 'seq_early',
                                                   'seq_simultaneous', 'seq_top_front', 'seq_top_rear')}

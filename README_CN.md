@@ -105,7 +105,7 @@ python deploy/deploy_mujoco/deploy_mujoco.py --model deep_robotics_model/M20/mjc
 
 随后替换为训练候选检查点。新配置通过 manifest 自动选择 `legacy_v1`，无 manifest 的旧模型需要显式参数才能保持本次对照一致。先确认基准在相同控制器下的表现，再把差异归因于训练。
 
-窗口按键：`Z` 起立、`C` 策略、`W/S` 前后、`A/D` 横移、`Q/E` 转向、`H` 扫描、`X` 趴下、`R` 阻尼、`Esc` 退出。X11 直接读取按住状态，松开/失焦后移动命令归零；终端输入使用连发/超时机制。停车时检查遥测中的原始零命令。
+窗口按键：`Z` 起立、`C` 策略、数字小键盘 `8/2` 前后、`4/6` 左右横移、`7/9` 左右转向、`H` 扫描、`X` 趴下、`R` / `Backspace` 重置到初始卧地状态（需重新按 `Z` 起立，再按 `C` 进入策略）、`Esc` 退出。控制按键优先处理，不再同时触发 MuJoCo 默认快捷功能；移动使用独立数字小键盘，非主键盘数字行。X11 直接读取按住状态，松开/失焦后移动命令归零；终端输入使用连发/超时机制。停车时检查遥测中的原始零命令。
 
 下楼使用 `stairs_descent.xml`，平地明确使用 **`--terrain flat`**，不传地形默认上楼。`--viewer --autoplay` 执行自动指令，策略/物理周期为 0.02/0.005 秒。批量回放示例：
 
@@ -165,25 +165,35 @@ bash scripts/train_ascent_stage5.sh
 
 本次完成CPU动力学示例、真实PPO更新、断点恢复与isaaclab Python环境预检查；没有做GPU/Isaac端到端启动测试，没有开始第五阶段正式训练。实现和局部示例通过不代表完整上楼步态已学会。详细证据见本地[改进与验证](docs/test_docs/07_上楼步态校正/v1_20261021/stage5_20261021/改进与验证.md)和[初始化对比](docs/test_docs/07_上楼步态校正/v1_20261021/stage5_20261021/初始化检查点对比.md)。
 
-## v1 第八阶段：固定输入的上下楼路径修正（2026-10-22）
+## v1 第八阶段历史配置：固定输入的上下楼路径修正（2026-10-22）
 
-当前使用 `--m20_profile ascent_entry_v1_stage8_fixed`。保留Stage7 Actor的247维输入、统一MLP的247→256→128→16结构和Critic的300维输入；所有网络参数键名、形状及总数保持不变。启动链路已用原始model_11400.pt验证；按用户后续要求，正式训练直接加载同一次Stage7训练的最新model_12100.pt，使用新优化器，不重复本轮验证。旧的253/306维Stage8方案已撤回，不再作为训练入口；旧文件仍可通过MuJoCo兼容加载器回放。
+历史配置 `ascent_entry_v1_stage8_fixed` 保留Stage7 Actor的247维输入、统一MLP的247→256→128→16结构和Critic的300维输入；所有网络参数键名、形状及总数保持不变。该配置采用13列固定宽度楼梯课程，保留用于复现实验与旧检查点回放；窄路线和混合地形训练请使用下方Stage9。旧的253/306维Stage8方案已撤回；旧文件仍可通过MuJoCo兼容加载器回放。
 
-依次改进路径反馈、下楼门控、奖励及多尺寸课程。横向位置/速度反馈经现有有效vy通道进入策略，原始指令独立用于门控，保留legacy航向控制。下楼复用统一MLP的16个输出，以固定限幅和非训练参数的时间调度开放权限：前30轮为零，之后800轮线性增加。保留上楼输出约束，20/25cm窄踏面适当降低旧动作保留权重。上下楼路径偏差、横向速度和接触横滑均有代价，偏离路径后不能计为课程成功。上楼连续左右交替、逐轮不漏阶、同阶先后和到顶放平要求继续保留，不固定前后轮相隔级数。
+依次改进路径反馈、下楼门控和奖励。横向位置/速度反馈经现有有效vy通道进入策略，原始指令独立用于门控，保留legacy航向控制。下楼复用统一MLP的16个输出，以固定限幅和非训练参数的时间调度开放权限：前30轮为零，之后800轮线性增加。保留上楼输出约束，20/25cm窄踏面适当降低旧动作保留权重。上下楼路径偏差、横向速度和接触横滑均有代价，偏离路径后不能计为课程成功。上楼连续左右交替、逐轮不漏阶、同阶先后和到顶放平要求继续保留，不固定前后轮相隔级数。
 
 13列地形包含8列上楼、1列平地、4列下楼，**上下楼均覆盖20/25/30/35cm踏深**，阶高课程为10/12/15/18/20/25cm。新增20cm上楼从10cm阶高、4阶任务开始，课程降级不会把20cm踏深改宽；25cm上楼列最低阶高15cm。下楼各踏深按0.5/0.7m/s两档速度分别累计成功，均达到最近8次至少6次成功才升级，连续3次失败降级。
 
-在仓库根目录、现有isaaclab环境执行：
+建议用短程训练先复测默认楼梯及20/25cm踏深，同时查看上下楼横移、左右偏航、落阶覆盖、同阶先后、左右交替和平台过渡。固定输入版本的实现及实测证据见本地 `docs/test_docs/07_上楼步态校正/v1_20261022/stage8_fixed/改进与验证.md`；初始化与短测不代表正式续训后的完整步态验收。
+
+截至14900轮的现有日志使用 `m20_stair_path_fixed247_20261022_v1_stage8_reward_v2`，实际从Stage7 `model_12300.pt`初始化，是固定宽楼梯课程的历史对照。v2奖励细节与验证见本地 `docs/test_docs/07_上楼步态校正/v1_20261022/stage8_reward_v2/改进与验证.md`。
+
+Stage8的旧13列布局与Stage9的28列布局分别保留，避免旧配置回放或恢复时误用新课程。
+
+## v1 第九阶段：窄楼梯与混合地形保留（2026-10-23）
+
+Stage9 针对1.0/1.2m楼梯路线的横向漂移、踏面不足和25cm踏深下的滑移/立板碰撞增加路径约束与窄踏面接触代价。地形列固定为28列：0–7是20/25/30/35cm踏深与1.0/1.2m宽度组合的上楼，8是5m参考上楼，9–11是平地，12–19是对应的下楼任务，20–27是箱体、粗糙地面和双向坡面。上下楼高度行仍为10/12/15/18/20/25cm；降级仅降低高度行，列上的踏深和宽度不变。平地与非楼梯地形保留原命令、奖励及基于行走距离的地形课程，路径反馈只作用于楼梯列。
+
+Stage9 v2在episode重置时按三段课程重新分配下一回合的地形列，不重建地形网格、不改变各列几何。前600轮的上楼样本中，70%来自30/35cm、1.2m及5m参考楼梯，20%来自25cm/1.2m和30/35cm/1.0m，10%来自20cm和25cm/1.0m；600–2000轮调整为45%/35%/20%；之后九种上楼几何均匀采样。20cm任务始终保留非零概率。10584环境下，下楼与非楼梯地形的绝对样本数约维持8192环境旧配置的水平，上楼样本约增加到旧配置的1.9倍。不同几何间切换时重置该环境的接触前缀计数，避免把容易几何上学到的全程目标错误带入困难列。`sampling_stage`及各类目标采样比例写入课程日志。奖励权重暂不调整，先单独验证课程采样带来的变化。
+
+Actor/Critic维度、参数形状和Stage7统一分支结构均不变。冻结的基础运动分支保留其原策略输出，但最终动作仍叠加可训练统一修正分支；因此冻结降低了遗忘风险，却不能单独证明粗糙地面、箱体、坡面上的组合策略无回归。Stage9继续采样这些地形并记录分类型地形等级，验收时要同时看各非楼梯类别行走表现和楼梯课程，不以楼梯成功率替代全地形回归。
+
+在仓库根目录、现有isaaclab环境启动Stage9 v2；这条命令从用户选定的Stage7 `model_12100.pt`初始化Actor/Critic并使用新优化器，不做完整恢复，也不重复检查该检查点：
 
 ```bash
-OMP_NUM_THREADS=4 python -u scripts/reinforcement_learning/rsl_rl/train.py --task Rough-Deeprobotics-M20-StairTeacher-v1 --m20_profile ascent_entry_v1_stage8_fixed --init_actor_from logs/rsl_rl/deeprobotics_m20_stair_teacher_v1_stage2/2026-10-21_18-29-16_ascent_entry_v1_stage7/model_12100.pt --init_critic_from logs/rsl_rl/deeprobotics_m20_stair_teacher_v1_stage2/2026-10-21_18-29-16_ascent_entry_v1_stage7/model_12100.pt --run_name ascent_entry_v1_stage8_fixed_from12100_reward_v2 --num_envs 4096 --max_iterations 12000 --seed 42 --device cuda:0 --headless
+OMP_NUM_THREADS=4 python -u scripts/reinforcement_learning/rsl_rl/train.py --task Rough-Deeprobotics-M20-StairTeacher-v1 --m20_profile ascent_entry_v1_stage9 --init_actor_from logs/rsl_rl/deeprobotics_m20_stair_teacher_v1_stage2/2026-10-21_18-29-16_ascent_entry_v1_stage7/model_12100.pt --init_critic_from logs/rsl_rl/deeprobotics_m20_stair_teacher_v1_stage2/2026-10-21_18-29-16_ascent_entry_v1_stage7/model_12100.pt --run_name ascent_entry_v1_stage9_v2_staged_sampling_from12100 --num_envs 10584 --max_iterations 120000 --seed 42 --device cuda:0 --headless
 ```
 
-建议先训练500–1000轮复测默认楼梯及20/25cm踏深，同时查看上下楼横移、左右偏航、落阶覆盖、同阶先后、左右交替和平台过渡。固定输入版本的实现及实测证据见本地 `docs/test_docs/07_上楼步态校正/v1_20261022/stage8_fixed/改进与验证.md`；初始化与短测不代表正式续训后的完整步态验收。
-
-当前奖励修订为 `m20_stair_path_rewards_20261022_v2`：路径反馈激活时XY跟踪采用有效指令，离线时允许受控回线、近线时抑制横向速度；路径位置权重−1.5，横向速度−0.25，接触滑移−0.4。关闭旧Stage2前后轮滑移项及旧下楼横移项，入口强调合入保留的连续上楼滑移项；下楼接触滑移增加纵向分量，上楼纵向仍由连续前后轮滑移项负责。航向、前进/停滞奖励及步态约束保持原配置。新增分方向纵向滑移与回线速度误差日志，网络及20/25/30/35cm课程保持原配置。修订后的实现与验证见本地 `docs/test_docs/07_上楼步态校正/v1_20261022/stage8_reward_v2/改进与验证.md`。
-
-奖励修订会记录在manifest中。旧奖励版本完整`--resume`会被拒绝，需使用Actor/Critic初始化和新优化器；正式启动仍按用户要求直接加载原Stage7的model12100，不重复验证该检查点。
+28列、6个高度行共168个地形单元；10584环境下简单平均每列约378个、每列每高度行约63个环境。Stage9 v2按课程阶段对reset环境分配地形，因此实际上楼列的样本量按阶段变化；下楼和非楼梯类别的期望绝对采样量维持在旧8192环境Stage9的大致水平。检查 `sampling_stage`、`sampling_ascent_fraction`、`sampling_descent_fraction`、`sampling_non_stair_fraction`，以及 `general_flat_terrain_level_mean`、`general_boxes_terrain_level_mean`、`general_random_rough_terrain_level_mean`、两个坡面地形等级和各楼梯列的成功/缺阶/路径误差、横向速度与接触滑移。当前环境缺少IsaacLab依赖时，只能做静态配置与掩码检查；正式训练由用户启动。
 
 ## 代码与开发记录
 

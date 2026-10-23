@@ -5,6 +5,7 @@ from .ascent_entry_mdp import smooth01
 from .ascent_entry_stage2 import Stage2PhysicsObserver
 from .ascent_sequence import TopTransition, support_margin_cost
 from .ascent_sequence_mdp import orientation
+from . import ascent_adaptive as adaptive
 from .ascent_adaptive import StrictSequenceLedger, ContactCurriculum, geometry, landing_guidance, REFERENCE_COLUMNS, DEADLINES
 
 
@@ -59,7 +60,7 @@ class AdaptivePhysicsObserver(Stage2PhysicsObserver):
         super().observe()
         data = env.scene['robot'].data
         command = env.command_manager.get_command('base_velocity')
-        active = (env.scene.terrain.terrain_types < 8) & (command[:, 0] > .1)
+        active = adaptive.ascent_mask(env) & (command[:, 0] > .1)
         active &= command[:, 1:].abs().amax(-1) < .1
         height, depth = geometry(env)
         position = data.body_pos_w[:, self.wheels]
@@ -193,13 +194,13 @@ def critic_state(env):
         history[:, 7] = observer.prefix_ready.float()
     skill_scale = max(len(getattr(state, 'prefixes', (2, 4, 6, 18)))-1, 1)
     result = torch.cat((torch.stack((height/.25, depth/.35, prefix, state.skill.float()/skill_scale), -1), history), -1)
-    return result*(env.scene.terrain.terrain_types < 8)[:, None]
+    return result*adaptive.ascent_mask(env)[:, None]
 
 
 def failed(env):
     observer = getattr(env, '_ascent_entry_observer', None)
     if observer is None: return torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
-    return observer.sequence.failed & (env.scene.terrain.terrain_types < 8)
+    return observer.sequence.failed & adaptive.ascent_mask(env)
 
 
 def finished(env):
@@ -216,10 +217,10 @@ def curriculum(env, env_ids):
     observer = getattr(env, '_ascent_entry_observer', None)
     ids = torch.arange(env.num_envs, device=env.device) if env_ids is None else torch.as_tensor(env_ids, device=env.device, dtype=torch.long)
     terrain = env.scene.terrain
-    ids = ids[terrain.terrain_types[ids] < 8]
+    ids = ids[adaptive.ascent_mask(env)[ids]]
     if observer is not None and len(ids):
         reference = torch.zeros(len(ids), device=env.device, dtype=torch.bool)
-        for column in REFERENCE_COLUMNS: reference |= terrain.terrain_types[ids] == column
+        for column in adaptive.reference_columns(env): reference |= terrain.terrain_types[ids] == column
         success = finished(env)[ids]
         # The environment computes curriculum immediately before the reset
         # event. Reward/contact histories still belong to the old geometry.
@@ -228,7 +229,7 @@ def curriculum(env, env_ids):
                                 getattr(env.cfg, 'ascent_adaptive_training', True))
         terrain.update_env_origins(ids, up, down)
     height, depth = geometry(env)
-    select = terrain.terrain_types < 8
+    select = adaptive.ascent_mask(env)
     mean = lambda x: x[select].float().mean() if select.any() else torch.zeros((), device=env.device)
     return dict(skill_mean=mean(state.skill), terrain_level_mean=mean(terrain.terrain_levels),
                 step_height_m=mean(height), tread_depth_m=mean(depth))
@@ -239,7 +240,7 @@ def metrics(env, env_ids):
     if observer is None: return {}
     ids = torch.arange(env.num_envs, device=env.device)
     if env_ids is not None: ids = ids[env_ids]
-    ids = ids[env.scene.terrain.terrain_types[ids] < 8]
+    ids = ids[adaptive.ascent_mask(env)[ids]]
     count = max(len(ids), 1); ledger = observer.sequence
     result = {key: observer.stats['adaptive_'+key][ids].sum()/count
               for key in ('pairs', 'ordered', 'missing', 'early', 'failure', 'landing_credit')}

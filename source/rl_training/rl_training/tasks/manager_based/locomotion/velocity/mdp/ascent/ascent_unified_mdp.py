@@ -3,6 +3,7 @@ from types import MethodType
 import torch
 from . import ascent_alternating_mdp as previous
 from . import ascent_adaptive_mdp as adaptive
+from . import ascent_adaptive as terrain_adaptive
 from .ascent_adaptive import geometry
 from .ascent_unified import BridgeCurriculum, PairedSequenceLedger, paired_guidance
 from .......utils.teacher_diagnostics import export_teacher_metrics
@@ -29,7 +30,7 @@ class UnifiedPhysicsObserver(previous.AlternatingPhysicsObserver):
         super().observe()
         data = env.scene['robot'].data
         command = env.command_manager.get_command('base_velocity')
-        active = (env.scene.terrain.terrain_types < 8) & (command[:, 0] > .1)
+        active = terrain_adaptive.ascent_mask(env) & (command[:, 0] > .1)
         active &= command[:, 1:].abs().amax(-1) < .1
         height, depth = geometry(env)
         position = data.body_pos_w[:, self.wheels]
@@ -84,7 +85,7 @@ def metrics(env, env_ids):
     observer = env._ascent_entry_observer
     ids = torch.arange(env.num_envs, device=env.device)
     if env_ids is not None: ids = ids[env_ids]
-    ids = ids[env.scene.terrain.terrain_types[ids] < 8]
+    ids = ids[terrain_adaptive.ascent_mask(env)[ids]]
     count = max(len(ids), 1)
     result = {}
     for code,label in enumerate(('missing_tread','early_advance','unpaired_landing','swing_turn','deadline','lateral_corridor'), start=1):

@@ -4,6 +4,7 @@ import copy
 import inspect
 import torch
 from . import ascent_adaptive_mdp as adaptive
+from . import ascent_adaptive as terrain_adaptive
 from .ascent_adaptive import geometry, REFERENCE_COLUMNS
 from .......utils.teacher_diagnostics import export_teacher_metrics
 from .ascent_alternating import SwingAlternation, BalancedContactCurriculum, CadenceTracker, dense_costs
@@ -48,7 +49,7 @@ class AlternatingPhysicsObserver(adaptive.AdaptivePhysicsObserver):
         super().observe()
         data = env.scene['robot'].data
         command = env.command_manager.get_command('base_velocity')
-        active = (env.scene.terrain.terrain_types < 8) & (command[:, 0] > .1)
+        active = terrain_adaptive.ascent_mask(env) & (command[:, 0] > .1)
         active &= command[:, 1:].abs().amax(-1) < .1
         position = data.body_pos_w[:, self.wheels]
         first = env.scene.env_origins[:, 0]+1.25
@@ -162,7 +163,7 @@ def positive_reward(env, source_func, source_params, require_progress=False):
     step = getattr(env, 'common_step_counter', None)
     if step is None or getattr(observer, 'reward_gate_key', -1) != step:
         command = env.command_manager.get_command('base_velocity')
-        ascent = (env.scene.terrain.terrain_types < 8) & (command[:, 0] > .1)
+        ascent = terrain_adaptive.ascent_mask(env) & (command[:, 0] > .1)
         ascent &= command[:, 1:].abs().amax(-1) < .1
         observer.reward_allowed = ~ascent | observer.positive_gate
         # Compute once per policy tick, shared by both tracking terms.
@@ -172,7 +173,7 @@ def positive_reward(env, source_func, source_params, require_progress=False):
             progress_required = ascent
             age = observer.active_time
             if hasattr(observer, "path_time"):
-                descent = (env.scene.terrain.terrain_types >= 9) & (command[:, 0] > .1)
+                descent = terrain_adaptive.descent_mask(env) & (command[:, 0] > .1)
                 descent &= command[:, 1:].abs().amax(-1) < .1
                 progress_required = ascent | descent
                 age = torch.where(descent, observer.path_time, age)
@@ -231,12 +232,12 @@ def curriculum(env, env_ids):
     state.speed_bucket.copy_((env.command_manager.get_command('base_velocity')[:, 0] > .6).long())
     result = adaptive.curriculum(env, env_ids)
     ids = torch.arange(env.num_envs, device=env.device)
-    ids = ids[env.scene.terrain.terrain_types < 8]
+    ids = ids[terrain_adaptive.ascent_mask(env)]
     for bucket, label in ((0, 'vx05'), (1, 'vx07')):
         counts = state.trials[ids, bucket].sum().clamp_min(1)
         result[label+'_window_success'] = state.window[ids, bucket].sum()/counts
     reference = torch.zeros(len(ids), device=env.device, dtype=torch.bool)
-    for column in REFERENCE_COLUMNS: reference |= env.scene.terrain.terrain_types[ids] == column
+    for column in terrain_adaptive.reference_columns(env): reference |= env.scene.terrain.terrain_types[ids] == column
     probe = state.geometry_probe[ids] & ~reference
     for mask, label in ((probe, 'geometry_probe'), (~probe, 'full_flight_group')):
         count = mask.sum().clamp_min(1)
@@ -249,7 +250,7 @@ def metrics(env, env_ids):
     observer = env._ascent_entry_observer
     ids = torch.arange(env.num_envs, device=env.device)
     if env_ids is not None: ids = ids[env_ids]
-    ids = ids[env.scene.terrain.terrain_types[ids] < 8]
+    ids = ids[terrain_adaptive.ascent_mask(env)[ids]]
     count = max(len(ids), 1)
     result = {key: observer.stats['alternating_'+key][ids].sum()/count
               for key in ('front_swing_starts', 'rear_swing_starts', 'front_repeat_or_simultaneous', 'rear_repeat_or_simultaneous')}

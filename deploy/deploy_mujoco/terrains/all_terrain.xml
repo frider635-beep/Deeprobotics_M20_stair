@@ -173,6 +173,6 @@
          priority=1高于当前M20碰撞体默认priority=0，使该区接触采用板的摩擦参数。
          若换用不同机器人模型，检查其碰撞体priority；不要靠修改颜色判断摩擦生效。 -->
     <geom name="low_friction_patch" class="all_terrain_surface" priority="1" pos="35 0 0.01" size="1 2 0.01" friction="0.5 0.01 0.01" rgba="0.32 0.56 0.66 1"/>
-    <!-- 10 终点：X=38，X=[36,39]为平地；可在缓冲段停车后用Q/E转向，反向走回测试。 -->
+    <!-- 10 终点：X=38，X=[36,39]为平地；可在缓冲段停车后用数字小键盘7/9转向，反向走回测试。 -->
   </worldbody>
 </mujoco>

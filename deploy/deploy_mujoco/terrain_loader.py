@@ -23,7 +23,8 @@ PRESETS = {
 }
 KINDS = set(PRESETS) | {"custom"}
 STAIR_OVERRIDES = {"stair_height": "step_height", "tread_depth": "tread_depth",
-                   "stair_count": "step_count", "stair_start": "start_x"}
+                   "stair_count": "step_count", "stair_start": "start_x",
+                   "course_width": "width"}
 
 
 @dataclass
