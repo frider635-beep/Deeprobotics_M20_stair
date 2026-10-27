@@ -43,9 +43,10 @@ class AlternatingPhysicsObserver(adaptive.AdaptivePhysicsObserver):
         env = self.env
         if env._sim_step_counter == 0 or self.last_physics_tick == env._sim_step_counter:
             return
-        resets = env.episode_length_buf < self.previous_lengths
-        self.turns.reset(resets); self.cadence.reset(resets)
-        self.best_x[resets] = -torch.inf
+        resets = self.episode_reset_ids()
+        if len(resets):
+            self.turns.reset(resets); self.cadence.reset(resets)
+            self.best_x[resets] = -torch.inf
         super().observe()
         data = env.scene['robot'].data
         command = env.command_manager.get_command('base_velocity')
@@ -243,6 +244,20 @@ def curriculum(env, env_ids):
         count = mask.sum().clamp_min(1)
         result[label+'_fraction'] = mask.float().sum()/max(len(ids), 1)
         result[label+'_terrain_level_mean'] = (env.scene.terrain.terrain_levels[ids]*mask).sum()/count
+    if hasattr(state,'mastered'):
+        rows=env.scene.terrain.terrain_levels[ids]
+        learned=state.mastered[ids,rows]
+        protected=state.protected_skill(rows,ids)
+        result['protected_prefix_mean']=state.skill.new_tensor(state.prefixes)[protected].float().mean()
+        result['certified_environment_fraction']=(learned>=0).float().mean()
+        result['certified6_environment_fraction']=(learned>=state.prefixes.index(6)).float().mean()
+    if hasattr(state,'quality_window'):
+        passes=state.window[ids].sum(-1)
+        quality=(state.quality_window[ids]*state.window[ids,:,:,None]).sum(2)/passes.clamp_min(1)[:,:,None]
+        for axis,label in enumerate(('front','rear')):
+            result[label+'_pair_quality_window_mean']=quality[:,:,axis].mean()
+        floor=state.protected_skill(env.scene.terrain.terrain_levels[ids],ids)
+        result['at_protected_floor_fraction']=(state.skill[ids] <= floor).float().mean()
     return export_teacher_metrics(result, result.keys(), detailed=True)
 
 

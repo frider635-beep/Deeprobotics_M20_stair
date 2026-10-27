@@ -8,6 +8,9 @@ from ..ascent import ascent_adaptive_mdp as ascent_mdp
 from ..ascent import ascent_adaptive as terrain_adaptive
 from .stair_path_objectives import contact_slip_cost, return_velocity_cost
 from . import stair_path_layout as layout
+from . import stair_path_sampling as sampling
+from .stair_path_readiness import ReadinessSampler
+from .stair_path_course import ProgressiveCourse
 from .stair_path_layout import ASCENT_TASKS, DESCENT_TASKS, DESCENT_START, task_label
 
 
@@ -47,6 +50,13 @@ def path_state(env):
 
 class PathPhysicsObserver(UnifiedPhysicsObserver):
     def __init__(self, env):
+        if getattr(env.cfg, 'm20_refinement_profile', None) == 'ascent_entry_v1_stage9':
+            self.curriculum_type = ProgressiveCourse
+        if getattr(env.cfg, 'stair_ascent_pairing_v9', False):
+            from .stair_path_evidence import EvidenceCourse
+            self.curriculum_type = EvidenceCourse
+            from ..ascent.ascent_pairing import AlternatingPairLedger
+            self.ledger_type = AlternatingPairLedger
         super().__init__(env)
         self.path_max = torch.zeros(env.num_envs, device=env.device)
         self.path_signed = torch.zeros_like(self.path_max)
@@ -62,13 +72,20 @@ class PathPhysicsObserver(UnifiedPhysicsObserver):
         self.down_stable_time = torch.zeros_like(self.path_max)
         self.path_failed = torch.zeros_like(self.down_ready)
         self.path_time = torch.zeros_like(self.path_max)
+        self.path_heading_total = torch.zeros_like(self.path_max)
+        self.path_forward_max = torch.zeros_like(self.path_max)
+        # Curriculum updates run before metrics. Keep the completed episode's
+        # original row instead of attaching its outcome to a promoted row.
+        self.episode_terrain_rows = env.scene.terrain.terrain_levels.clone()
 
     def reset(self, ids):
         super().reset(ids)
         for name in ('path_max','path_signed','path_samples','path_vy_total','path_slip_total',
                      'path_longitudinal_slip_total','path_return_error_total',
-                     'path_saturated','down_ready','down_success','path_failed','path_time','down_exit_time','down_stable_time'):
+                     'path_saturated','down_ready','down_success','path_failed','path_time','down_exit_time','down_stable_time',
+                     'path_heading_total','path_forward_max'):
             getattr(self, name)[ids] = 0
+        self.episode_terrain_rows[ids] = self.env.scene.terrain.terrain_levels[ids]
         if hasattr(self.env, '_stair_path_controller'):
             self.env._stair_path_controller.reset(ids)
             self.env._stair_path_command_step = -1
@@ -91,9 +108,12 @@ class PathPhysicsObserver(UnifiedPhysicsObserver):
         slip_cost, lateral_slip, longitudinal_slip = contact_slip_cost(
             self.contact_tangent, self.contact_support, normal, descending)
         relative_yaw = yaw-ctrl.heading
+        self.path_heading_total += torch.atan2(torch.sin(relative_yaw),torch.cos(relative_yaw)).abs()*active
         desired_side = command[:, 0]*torch.sin(relative_yaw)+ctrl.correction*torch.cos(relative_yaw)
         velocity_cost, return_target = return_velocity_cost(error, speed, desired_side)
         self.path_time += active*env.physics_dt
+        self.path_forward_max = torch.maximum(self.path_forward_max,
+            (data.root_pos_w[:,0]-env.scene.env_origins[:,0]).clamp_min(0)*active)
         self.path_max = torch.maximum(self.path_max, error.abs()*active)
         self.path_signed = torch.where(active, error, self.path_signed)
         self.path_samples += active
@@ -235,30 +255,74 @@ def _sampling_stage(env):
     steps_per_iteration = int(getattr(env.cfg, 'stair_path_sampling_steps_per_iteration', 24))
     offset = int(getattr(env, '_stair_path_sampling_iteration_offset', 0))
     iteration = offset + int(env.common_step_counter) // max(steps_per_iteration, 1)
-    return (0 if iteration < 600 else 1 if iteration < 2000 else 2), iteration
+    return readiness_sampler(env).schedule(iteration)[0], iteration
 
 
-def _resample_reset_terrains(env, ids, stage):
-    """Assign environments at phase boundaries, then keep each task stable within a phase."""
-    if not len(ids):
+def readiness_sampler(env):
+    if not hasattr(env, '_stair_path_readiness'):
+        env._stair_path_readiness = ReadinessSampler(env.device,mode=getattr(env.cfg,'stair_path_sampling_mode',None) or 'manual')
+        env._stair_path_readiness.request(stage=getattr(env.cfg,'stair_path_sampling_stage',None))
+    return env._stair_path_readiness
+
+
+def _sampling_population(env):
+    population = getattr(env, '_stair_path_sampling_population', None)
+    if population is None:
+        population = sampling.AscentPopulation(env.scene.terrain.terrain_types)
+        env._stair_path_sampling_population = population
+    return population
+
+
+def _observe_sampling_readiness(env, ids, iteration):
+    state = readiness_sampler(env)
+    state.advance(iteration)
+    if state.mode != 'auto':
         return
+    observer = env._ascent_entry_observer
+    selected = ids[(env.scene.terrain.terrain_types[ids] < layout.ASCENT_COLUMNS)
+                   & (observer.path_samples[ids] > 0)]
+    if not len(selected):
+        return
+    goals = observer.episode_goals[selected]
+    ledger = observer.sequence
+    required = ledger.targets <= goals[:,None,None]
+    pairs = ((ledger.pair_paid[selected]+ledger.rear_pair_paid[selected].float())*required[:,0]).sum(-1)/(2*goals)
+    coverage = (ledger.covered[selected]*required).float().sum((1,2))/(4*goals)
+    success = observer.prefix_ready[selected] & ((goals < env.cfg.ascent_sequence_step_count) | observer.top_ready[selected])
+    samples = observer.path_samples[selected].clamp_min(1)
+    values = torch.stack((success.float(),(observer.failure_reason[selected] == 1).float(),
+        (observer.failure_reason[selected] == 4).float(),pairs,coverage,observer.path_max[selected],
+        observer.path_heading_total[selected]/samples,observer.path_slip_total[selected]/samples),-1)
+    state.observe(env.scene.terrain.terrain_types[selected],observer.episode_terrain_rows[selected],goals,
+                  env.command_manager.get_command('base_velocity')[selected,0],values)
+
+
+def _resample_reset_terrains(env, ids, iteration):
+    """Initialize pools once, then rebalance only surplus ascent columns on reset."""
+    if not len(ids):
+        return 0
     terrain = env.scene.terrain
-    if not hasattr(env, '_stair_path_sampling_stage'):
-        env._stair_path_sampling_stage = torch.full((env.num_envs,), -1, device=env.device, dtype=torch.long)
-    ids = ids[env._stair_path_sampling_stage[ids] != stage]
-    if not len(ids):
-        return
-    probabilities = torch.tensor(layout.staged_sampling_probabilities(stage), device=env.device)
+    initializing = not getattr(env, '_stair_path_sampling_initialized', False)
+    if initializing:
+        if len(ids) != env.num_envs:
+            raise RuntimeError('Stage9 sampling initialization requires a full environment reset')
+        new_types = sampling.initial_assignment(env.num_envs, env.device)
+        env._stair_path_sampling_initialized = True
+        env._stair_path_sampling_population = None
+    else:
+        ids, new_types = sampling.plan_ascent_moves(terrain.terrain_types, ids, iteration,
+            readiness_sampler(env), population=_sampling_population(env))
+        if not len(ids):
+            return 0
     old_types = terrain.terrain_types[ids].clone()
-    new_types = torch.multinomial(probabilities.expand(len(ids), -1).contiguous(), 1).squeeze(-1)
     changed = new_types != old_types
-    env._stair_path_sampling_stage[ids] = stage
     if not changed.any():
-        return
+        return 0
     changed_ids = ids[changed]
     old_changed = old_types[changed]
     new_changed = new_types[changed]
     terrain.terrain_types[changed_ids] = new_changed
+    env._stair_path_sampling_population = None
     old_stair = ((old_changed < layout.ASCENT_COLUMNS)
                  | ((old_changed >= layout.DESCENT_START)
                     & (old_changed < layout.DESCENT_START + len(layout.DESCENT_COLUMNS))))
@@ -275,8 +339,7 @@ def _resample_reset_terrains(env, ids, stage):
     if ascent_changed.any():
         reset_ids = changed_ids[ascent_changed]
         state = ascent_mdp.curriculum_state(env)
-        for name in ('skill', 'good', 'bad', 'completed'):
-            getattr(state, name)[reset_ids] = 0
+        sampling.reset_ascent_progress(state, reset_ids)
 
     descent_changed = ((old_changed >= layout.DESCENT_START) & (old_changed < layout.DESCENT_START + len(layout.DESCENT_COLUMNS)))
     descent_changed |= ((new_changed >= layout.DESCENT_START) & (new_changed < layout.DESCENT_START + len(layout.DESCENT_COLUMNS)))
@@ -285,6 +348,7 @@ def _resample_reset_terrains(env, ids, stage):
         state = env._stair_path_descent_curriculum
         for name in ('window', 'trials', 'cursor', 'bad'):
             getattr(state, name)[reset_ids] = 0
+    return len(changed_ids)
 
 
 def metrics(env, env_ids):
@@ -293,6 +357,20 @@ def metrics(env, env_ids):
     ids = torch.arange(env.num_envs, device=env.device) if env_ids is None else torch.as_tensor(env_ids, device=env.device, dtype=torch.long)
     terrain = env.scene.terrain; command = env.command_manager.get_command('base_velocity')
     result = {}
+    training_sampling = (getattr(env.cfg, 'm20_refinement_profile', None) == 'ascent_entry_v1_stage9'
+                         and getattr(env.cfg, 'ascent_adaptive_training', True)
+                         and not getattr(env, '_stair_path_sampling_restoring', False))
+    if training_sampling:
+        _, iteration = _sampling_stage(env)
+        _observe_sampling_readiness(env, ids, iteration)
+        course = ascent_mdp.curriculum_state(env)
+        if isinstance(course, ProgressiveCourse):
+            from .stair_path_course_diagnostics import CourseDiagnostics
+            if not hasattr(env,'_stair_path_course_diagnostics'):
+                env._stair_path_course_diagnostics = CourseDiagnostics(env.device)
+            selected = ids[(terrain.terrain_types[ids] < layout.ASCENT_COLUMNS)
+                           & (observer.path_samples[ids] > 0)]
+            env._stair_path_course_diagnostics.observe(env,selected,iteration)
     for label, select in (('ascent', terrain_adaptive.ascent_mask(env)),
                           ('descent', terrain_adaptive.descent_mask(env))):
         picked = ids[select[ids] & (observer.path_samples[ids] > 0)]
@@ -318,9 +396,10 @@ def metrics(env, env_ids):
     groups.append((len(ASCENT_TASKS), 'ascent_reference', True))
     groups.extend((DESCENT_START+offset, task_label('descent', depth, width), False)
                   for offset, (depth, width) in enumerate(DESCENT_TASKS))
+    ascent_success = ascent_mdp.finished(env)
     for column,label,is_ascent in groups:
         picked = ids[(terrain.terrain_types[ids] == column) & (observer.path_samples[ids] > 0)]
-        success = ascent_mdp.finished(env)[picked] if is_ascent else observer.down_success[picked]
+        success = ascent_success[picked] if is_ascent else observer.down_success[picked]
         missing = observer.stats['adaptive_missing'][picked].sum() if is_ascent else torch.zeros((), device=env.device)
         for name, total in (('success',success.float().sum()),
                             ('max_error_m',observer.path_max[picked].sum()),
@@ -341,15 +420,38 @@ def metrics(env, env_ids):
     chosen = ids[flat[ids]]
     result['__weighted_total__/general_flat_terrain_level_mean'] = terrain.terrain_levels[chosen].float().sum()
     result['__weighted_count__/general_flat_terrain_level_mean'] = torch.as_tensor(len(chosen), device=env.device).float()
-    if getattr(env.cfg, 'm20_refinement_profile', None) == 'ascent_entry_v1_stage9':
+    if training_sampling:
         stage, iteration = _sampling_stage(env)
-        probabilities = layout.staged_sampling_probabilities(stage)
-        result['sampling_stage'] = torch.as_tensor(stage, device=env.device, dtype=torch.float32)
-        result['sampling_iteration'] = torch.as_tensor(iteration, device=env.device, dtype=torch.float32)
-        result['sampling_ascent_fraction'] = torch.as_tensor(sum(probabilities[:layout.ASCENT_COLUMNS]), device=env.device)
-        result['sampling_descent_fraction'] = torch.as_tensor(
-            sum(probabilities[layout.DESCENT_START:layout.DESCENT_START+len(layout.DESCENT_COLUMNS)]), device=env.device)
-        result['sampling_non_stair_fraction'] = torch.as_tensor(
-            sum(probabilities[column] for column in (*layout.FLAT_COLUMNS, *layout.GENERAL_COLUMNS)), device=env.device)
-        _resample_reset_terrains(env, ids, stage)
+        readiness = readiness_sampler(env)
+        _, blend = readiness.schedule(iteration)
+        probabilities = sampling.probabilities_at(iteration, readiness)
+        result['sampling_stage'] = stage
+        result['sampling_iteration'] = iteration
+        result['sampling_transition_fraction'] = blend
+        result['sampling_budget_fraction'] = min(iteration/layout.SAMPLING_TOTAL_ITERATIONS, 1.)
+        result['sampling_ascent_fraction'] = sum(probabilities[:layout.ASCENT_COLUMNS])
+        result['sampling_descent_fraction'] = sum(probabilities[column] for column in layout.DESCENT_COLUMNS)
+        result['sampling_non_stair_fraction'] = sum(probabilities[column] for column in (*layout.FLAT_COLUMNS, *layout.GENERAL_COLUMNS))
+        # Old-episode diagnostics above are finalized before changing geometry.
+        changed = _resample_reset_terrains(env, ids, iteration)
+        result['__weighted_total__/sampling_changed_fraction'] = changed
+        result['__weighted_count__/sampling_changed_fraction'] = len(ids)
+        population = _sampling_population(env)
+        counts, targets = population.current, population.targets(iteration, readiness)
+        ascent_count = max(population.ascent_count, 1)
+        for label, columns in (('easy', layout.ASCENT_EASY_COLUMNS),
+                               ('middle', layout.ASCENT_MIDDLE_COLUMNS),
+                               ('hard', layout.ASCENT_HARD_COLUMNS)):
+            result['sampling_target_'+label+'_fraction'] = sum(probabilities[c] for c in columns)/layout.ASCENT_FRACTION
+            result['sampling_actual_'+label+'_fraction'] = sum(counts[c] for c in columns)/ascent_count
+        for label, columns in (('ascent', tuple(range(layout.ASCENT_COLUMNS))),
+                               ('descent', layout.DESCENT_COLUMNS),
+                               ('non_stair', (*layout.FLAT_COLUMNS, *layout.GENERAL_COLUMNS))):
+            result['sampling_actual_'+label+'_fraction'] = sum(counts[c] for c in columns)/env.num_envs
+        result['sampling_pending_ascent_fraction'] = population.pending(targets)/ascent_count
+        readiness.population_pending = result['sampling_pending_ascent_fraction']
+        if readiness.mode == 'auto':
+            ascent_ids = terrain.terrain_types < layout.ASCENT_COLUMNS
+            readiness.population_long_fraction = float((ascent_mdp.curriculum_state(env).goals()[ascent_ids] == 18).float().mean())
+        result.update({'sampling_readiness_'+name:value for name,value in readiness.telemetry().items()})
     return export_teacher_metrics(result, result.keys(), detailed=True)

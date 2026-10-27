@@ -1,5 +1,6 @@
 """Stage9: stabilize narrow-stair courses and retain shared path feedback."""
 from copy import deepcopy
+from dataclasses import asdict
 import numpy as np
 import torch
 import trimesh
@@ -15,17 +16,21 @@ from rl_training.control.stair_path import PathConfig, PATH_VERSION
 from rl_training.models.stair_path_actor import DESCENT_LIMITS, DESCENT_WARMUP, DESCENT_RAMP
 from rl_training.tasks.manager_based.locomotion.velocity.mdp.path import stair_path_mdp as path
 from rl_training.tasks.manager_based.locomotion.velocity.mdp.path import stair_path_layout as layout
+from rl_training.tasks.manager_based.locomotion.velocity.mdp.path.stair_path_readiness import ReadinessConfig
+from rl_training.tasks.manager_based.locomotion.velocity.mdp.path import stair_path_course as progressive
 from rl_training.tasks.manager_based.locomotion.velocity.mdp.path.rectangular_random_grid import random_grid_terrain
 from rl_training.tasks.manager_based.locomotion.velocity.mdp.path.stair_path_objectives import REWARD_VERSION, REWARD_WEIGHTS
 from rl_training.tasks.manager_based.locomotion.velocity.mdp.ascent import ascent_alternating_mdp as alternating
 from rl_training.tasks.manager_based.locomotion.velocity.mdp.ascent import ascent_entry_mdp as entry
 from rl_training.tasks.manager_based.locomotion.velocity.mdp.ascent import ascent_adaptive as adaptive
+from rl_training.tasks.manager_based.locomotion.velocity.mdp.ascent import ascent_pairing as pairing
+from rl_training.tasks.manager_based.locomotion.velocity.mdp.path.stair_path_evidence import SETTINGS as EVIDENCE_SETTINGS
 from rl_training.tasks.manager_based.locomotion.velocity.mdp.ascent.ascent_adaptive import geometry
 from rl_training.tasks.manager_based.locomotion.velocity.mdp.ascent.ascent_adaptive import HEIGHTS
 
 
 PROFILE = 'ascent_entry_v1_stage9'
-VERSION = 'm20_stair_path_fixed247_20261023_v2_staged_sampling'
+VERSION = pairing.VERSION
 STAGE8_PROFILE = 'ascent_entry_v1_stage8_fixed'
 STAGE8_VERSION = 'm20_stair_path_fixed247_20261022_v1_stage8_reward_v2'
 STAGE8_DEPTHS = (.30,.30,.20,.25,.30,.35,.30,.35,.30,.20,.25,.30,.35)
@@ -201,15 +206,21 @@ def apply_profile(env_cfg, agent_cfg, evaluation=False, profile=PROFILE):
                                                    for c in range(len(STAGE8_DEPTHS))] for h in HEIGHTS]
             env_cfg.ascent_adaptive_depth_grid = [list(STAGE8_DEPTHS) for _ in HEIGHTS]
         env_cfg.rewards.ascent_alternating_lateral.weight = 0.
-        # Stage5's wheel-over-riser clearance term was disabled when adaptive
-        # landing guidance was replaced by paired guidance in Stage7. Restore
-        # it only for 20/25 cm ascent columns, where the valid landing window
-        # is narrower and MuJoCo shows more riser strikes and support slip.
+        # Replace spatial next-edge clearance with the same pending tread used
+        # by landing/hold guidance. No descent or path objective is changed.
         if profile == PROFILE:
-            env_cfg.rewards.ascent_entry_clearance.func = narrow_ascent_clearance_cost
+            env_cfg.stair_ascent_pairing_v9 = True
+            env_cfg.rewards.ascent_entry_clearance.func = pairing.reward
+            env_cfg.rewards.ascent_entry_clearance.params = {'name':'clearance'}
             env_cfg.rewards.ascent_entry_clearance.weight = -.30
             env_cfg.rewards.ascent_riser_contact.func = narrow_ascent_riser_contact_cost
             env_cfg.rewards.ascent_riser_contact.weight = -.30
+            env_cfg.rewards.ascent_rear_paired = RewardTermCfg(func=pairing.reward,
+                weight=pairing.REAR_PAIR_WEIGHT,params={'name':'rear_paired'})
+            env_cfg.rewards.ascent_landing_order = RewardTermCfg(func=pairing.reward,
+                weight=pairing.LANDING_ORDER_WEIGHT,params={'name':'landing_order'})
+            env_cfg.rewards.ascent_rear_phase = RewardTermCfg(func=pairing.reward,
+                weight=pairing.REAR_PHASE_WEIGHT,params={'name':'rear_phase'})
         # The retained continuous ascent terms own entry + full-flight slip;
         # the common route objective owns descent lateral position/velocity.
         env_cfg.rewards.ascent_stage2_front_slip.weight = 0.
@@ -236,15 +247,36 @@ def apply_profile(env_cfg, agent_cfg, evaluation=False, profile=PROFILE):
         env_cfg.ascent_adaptive_depth_grid = [[.30]*columns for _ in HEIGHTS]
     manifest = configure_agent(agent_cfg, profile=profile)
     manifest['gated_positive_rewards'] = alternating.audit_positive_rewards(env_cfg.rewards)
+    if profile == PROFILE:
+        manifest.update(contact_curriculum=dict(prefixes=list(progressive.PREFIXES),
+            minimum_task_fractions={'2':.5,'3':.3,'4':.2},
+            promote='both_speeds_physical_6_of_8_and_graded_per_axle_pair_quality',
+            strict_success='final_full_episode_gait_acceptance',
+            demote_consecutive_failures=3,demotion_window='current_speed_8_trials_physical_success_at_most_half',
+            prefix_quality_thresholds=deepcopy(EVIDENCE_SETTINGS['prefix_pair_quality']),
+            height_quality_threshold=EVIDENCE_SETTINGS['height_pair_quality'],
+            height_rear_second_quality=EVIDENCE_SETTINGS['height_rear_second_quality'],
+            demotion='shorten_prefix_at_same_height_first_never_below_certified_prefix',
+            mastery='per_environment_geometry_and_height_both_speeds_6_of_8_retained_on_failure',
+            mastered_floor_height_fallback_failures=progressive.ProgressiveCourse.mastered_height_failure_episodes,
+            unmastered_minimum_height_fallback_failures=progressive.ProgressiveCourse.unmastered_height_failure_episodes,
+            height_change_promotion_hold_eligible_episodes=progressive.ProgressiveCourse.consolidation_episodes,
+            failures_can_demote_during_hold=True,geometry_probe_prefix=6,
+            new_height_prefix=4,demotion_retains_width_and_depth=True),
+            prefix_active_deadlines_s=list(progressive.DEADLINES),
+            course_diagnostics='100_iteration_matched_geometry_row_original_prefix_speed_jsonl_and_tensorboard',
+            ppo_diagnostics='approx_kl_clip_fraction_grad_norms_batch_explained_variance')
     return manifest
 
 
 def configure_agent(agent_cfg, profile=PROFILE):
     manifest = previous.configure_agent(agent_cfg)
-    agent_cfg.algorithm.learning_rate = 1.e-5
+    stage9 = profile == PROFILE
+    agent_cfg.algorithm.learning_rate = 1.5e-5 if stage9 else 1.e-5
     agent_cfg.algorithm.anchor_coefficient = .15
     agent_cfg.algorithm.critic_warmup_iterations = 30
-    stage9 = profile == PROFILE
+    if stage9:
+        agent_cfg.max_iterations = layout.SAMPLING_TOTAL_ITERATIONS
     profile_version = VERSION if stage9 else STAGE8_VERSION
     columns = TERRAIN_COLUMNS if stage9 else len(STAGE8_DEPTHS)
     reference_columns = [ASCENT_REFERENCE_COLUMN] if stage9 else list(STAGE8_REFERENCE_COLUMNS)
@@ -274,10 +306,12 @@ def configure_agent(agent_cfg, profile=PROFILE):
             outer_region='flat_ground_to_match_MuJoCo_scan_and_edge_support' if stage9 else None),
         narrow_ascent_contact_protection=(dict(depths_m=[.20,.25], clearance_weight=-.30,
             riser_contact_weight=-.30, scope='ascent_only') if stage9 else None),
-        staged_sampling=(dict(iteration_boundaries=[600,2000],
-            phases=[dict(easy=.70,middle=.20,hard=.10),
-                    dict(easy=.45,middle=.35,hard=.20),
-                    dict(all_ascent_geometries='uniform')],
+        staged_sampling=(dict(total_iterations=layout.SAMPLING_TOTAL_ITERATIONS,
+            advancement='manual_by_default_optional_matched_strata_plateau_and_automatic_demotion',
+            iteration_boundaries=[], budget_forces_advancement=False,
+            transition_iterations=ReadinessConfig().transition_iterations,
+            readiness=asdict(ReadinessConfig()),
+            phases=[dict(zip(('easy','middle','hard'), shares)) for shares in layout.READINESS_GROUP_SHARES],
             easy_columns=['30cm/1.2m','35cm/1.2m','5m reference'],
             middle_columns=['25cm/1.2m','30cm/1.0m','35cm/1.0m'],
             hard_columns=['20cm/1.0m','20cm/1.2m','25cm/1.0m'],
@@ -285,15 +319,20 @@ def configure_agent(agent_cfg, profile=PROFILE):
             descent_fraction=round(layout.DESCENT_FRACTION,4),
             non_stair_fraction=round(layout.NON_STAIR_FRACTION,4),
             non_stair_and_descent_absolute_samples_preserved_from_8192=True,
-            resample='reset_environments_only') if stage9 else None),
-        reward_adjustment=('unchanged_for_sampling_curriculum_ablation' if stage9 else None),
+            resample='minimal_surplus_to_deficit_ascent_transfers_on_reset',
+            fixed_descent_and_non_stair_assignments=True,
+            unchanged_geometry_progress_preserved=True,
+            changed_geometry_progress='minimum_pinned_prefix_and_fresh_both_speed_windows') if stage9 else None),
+        reward_adjustment=('ascent_only_rear_phase_guidance_and_physical_graded_pair_course' if stage9 else None),
+        ascent_pairing=(deepcopy(pairing.SETTINGS) if stage9 else None),
+        course_evidence=(deepcopy(EVIDENCE_SETTINGS) if stage9 else None),
         geometry=('fixed_width_and_depth_per_column_lowest_row_for_new_width_tasks' if stage9
                   else 'legacy_fixed_depth_per_column'),
         terrain_columns=columns, ascent_depths_m=[.20,.25,.30,.35],
         ascent_course=(dict(reference_column=ASCENT_REFERENCE_COLUMN, reference_width_m=5.0,
             task_widths_m=[1.0,1.2], demotion_retains_width_and_depth=True) if stage9 else
             dict(reference_columns=list(STAGE8_REFERENCE_COLUMNS), course_width_m=5.0)),
-        descent_course=dict(fraction=(8./TERRAIN_COLUMNS if stage9 else 4./len(STAGE8_DEPTHS)),
+        descent_course=dict(fraction=(layout.DESCENT_FRACTION if stage9 else 4./len(STAGE8_DEPTHS)),
             shape='straight_18_treads', speeds=[.5,.7], depths_m=[.20,.25,.30,.35],
             promote='both_speeds_6_of_8',demote_consecutive_failures=3, success_max_path_error_m=.20),
         mixed_terrain=(dict(flat_columns=list(layout.FLAT_COLUMNS),

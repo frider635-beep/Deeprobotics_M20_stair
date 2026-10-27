@@ -193,6 +193,15 @@ class StairGuardedPPO(PPO):
         mean_value_loss = 0
         mean_surrogate_loss = 0
         mean_entropy = 0
+        diagnostic_sum = None
+        sampled_diagnostics = {}
+        # Two extra backwards on one minibatch per100 updates. Keep the
+        # everyday training cost bounded and record the sampling frequency.
+        sample_gradients = self.guard_updates % 100 == 0
+        parameter_before = None
+        if sample_gradients:
+            from ..utils.ppo_diagnostics import parameter_snapshot
+            parameter_before = parameter_snapshot(self.actor.parameters())
         # RND loss
         mean_rnd_loss = 0 if self.rnd else None
         # Symmetry loss
@@ -280,6 +289,12 @@ class StairGuardedPPO(PPO):
                 ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
             )
             surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
+            with torch.no_grad():
+                log_ratio = actions_log_prob-torch.squeeze(batch.old_actions_log_prob)
+                # Sample estimate, available even with a fixed LR schedule.
+                diagnostic = torch.stack(((torch.exp(log_ratio)-1-log_ratio).mean(),
+                    ((ratio-1).abs() > self.clip_param).float().mean(),
+                    1-(batch.returns-values).var(unbiased=False)/batch.returns.var(unbiased=False).clamp_min(1.e-8)))
 
             # Value function loss
             if self.use_clipped_value_loss:
@@ -291,10 +306,15 @@ class StairGuardedPPO(PPO):
                 value_loss = (batch.returns - values).pow(2).mean()
 
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy.mean()
+            ppo_actor_loss = surrogate_loss-self.entropy_coef*entropy.mean()
             if self.reference_actor is not None and self.guard_updates >= self.critic_warmup_iterations:
                 anchor_loss = self._anchor_loss(batch.observations)
                 loss = loss + self.anchor_coefficient * anchor_loss
                 self._anchor_losses.append(float(anchor_loss.detach()))
+                if sample_gradients and not sampled_diagnostics:
+                    from ..utils.ppo_diagnostics import gradient_comparison
+                    sampled_diagnostics = gradient_comparison(ppo_actor_loss,self.anchor_coefficient*anchor_loss,
+                                                              self.actor.parameters())
             if self.stop_teacher_coefficient > 0 and self.guard_updates >= self.critic_warmup_iterations:
                 loss = loss + self.stop_teacher_coefficient*self._stop_teacher_loss(batch.observations)
             if self.stop_regularization_coefficient > 0 and self.guard_updates >= self.critic_warmup_iterations:
@@ -365,8 +385,10 @@ class StairGuardedPPO(PPO):
                 self.reduce_parameters()
 
             # Apply the gradients for PPO
-            nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
-            nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
+            actor_norm = nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
+            critic_norm = nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
+            diagnostic = torch.cat((diagnostic,torch.stack((actor_norm.to(diagnostic.device),critic_norm.to(diagnostic.device)))))
+            diagnostic_sum = diagnostic.detach() if diagnostic_sum is None else diagnostic_sum+diagnostic.detach()
             self.optimizer.step()
             # Apply the gradients for RND
             if self.rnd_optimizer:
@@ -402,6 +424,16 @@ class StairGuardedPPO(PPO):
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
         }
+        if diagnostic_sum is not None:
+            loss_dict.update(zip(('approx_kl','clip_fraction','explained_variance_batch',
+                                  'actor_grad_norm_before_clip','critic_grad_norm_before_clip'),
+                                 (diagnostic_sum/num_updates).cpu().tolist()))
+        if parameter_before:
+            from ..utils.ppo_diagnostics import parameter_change
+            sampled_diagnostics.update(parameter_change(parameter_before))
+        if sampled_diagnostics:
+            keys = list(sampled_diagnostics)
+            loss_dict.update(zip(keys,torch.stack([sampled_diagnostics[key] for key in keys]).cpu().tolist()))
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:

@@ -11,7 +11,74 @@ from .ascent_adaptive_init import attach_curriculum_checkpoint as attach_ascent
 PATH_PROFILES = ('ascent_entry_v1_stage8_fixed', 'ascent_entry_v1_stage9')
 PATH_VERSIONS = (VERSION, VERSION+'_reward_v2', VERSION+'_reward_v3_course_width',
                  'm20_stair_path_fixed247_20261023_v1_stage9_fixed_width_curriculum',
-                 'm20_stair_path_fixed247_20261023_v2_staged_sampling')
+                 'm20_stair_path_fixed247_20261023_v2_staged_sampling',
+                 'm20_stair_path_fixed247_20261023_v3_sampling_40k',
+                 'm20_stair_path_fixed247_20261026_v4_readiness_sampling',
+                 'm20_stair_path_fixed247_20261026_v5_progressive_course',
+                 'm20_stair_path_fixed247_20261027_v6_mastered_prefix_floor',
+                 'm20_stair_path_fixed247_20261027_v7_ascent_pairing',
+                 'm20_stair_path_fixed247_20261027_v8_soft_pairing',
+                 'm20_stair_path_fixed247_20261027_v9_course_evidence')
+
+
+def validate_ascent_pairing_resume(prior,target,weights,migrate=False,source='v8'):
+    """Explicit v8 -> v9; all old weights/path/descent contracts stay exact."""
+    from ...tasks.manager_based.locomotion.velocity.mdp.ascent import ascent_pairing as pairing
+    from ...tasks.manager_based.locomotion.velocity.mdp.path.stair_path_evidence import SETTINGS
+    expected_version=pairing.PREVIOUS_VERSION if migrate and source == 'v8' else pairing.VERSION
+    if ((migrate and source != 'v8') or prior.get('m20_profile') != 'ascent_entry_v1_stage9'
+            or prior.get('refinement_version') != expected_version or target.get('version') != pairing.VERSION):
+        raise ValueError('v9 requires explicit --stair_ascent_migrate_v8 from v8, or native v9 resume')
+    settings={key:target[key] for key in (
+        'stair_path_reward_weights','path_tracking_target','path_velocity_target','contact_slip','merged_entry_slip')}
+    if prior.get('stair_path_reward_settings') != settings:
+        raise ValueError('v9 cannot change shared path/descent reward settings')
+    for key in ('stair_path_reward_version','stair_path_config','control_profile',
+                'descent_limits_action_units','descent_authority_schedule'):
+        if prior.get(key) != target[key]:raise ValueError('v9 must retain '+key)
+    expected=dict(prior.get('reward_weights') or {})
+    if not expected:raise ValueError('Source must record all reward weights')
+    if migrate:
+        if prior.get('ascent_pairing') != pairing.V8_SETTINGS:
+            raise ValueError('Source v8 pairing contract mismatch')
+        if 'ascent_rear_phase' in expected:raise ValueError('v8 unexpectedly contains rear phase reward')
+        expected['ascent_rear_phase']=pairing.REAR_PHASE_WEIGHT
+    elif prior.get('ascent_pairing') != pairing.SETTINGS or prior.get('course_evidence') != SETTINGS:
+        raise ValueError('Native v9 pairing/course evidence settings mismatch')
+    if (weights != expected or target.get('ascent_pairing') != pairing.SETTINGS
+            or target.get('course_evidence') != SETTINGS):
+        raise ValueError('v9 permits only ascent_rear_phase -0.15; all existing weights must match')
+
+
+def validate_course_migration(prior, target, source='v4'):
+    from ...tasks.manager_based.locomotion.velocity.mdp.path.stair_path_course import VERSION, LEGACY_VERSION
+    from ...tasks.manager_based.locomotion.velocity.mdp.path.stair_path_layout import SAMPLING_VERSION
+    if (prior.get('m20_profile') != 'ascent_entry_v1_stage9'
+            or prior.get('refinement_version') != {'v4':SAMPLING_VERSION,'v5':LEGACY_VERSION}.get(source)
+            or target.get('version') != VERSION):
+        raise ValueError('Course migration requires the matching v4/v5 source flag and Stage9 v6 target')
+    settings = {key:target[key] for key in (
+        'stair_path_reward_weights','path_tracking_target','path_velocity_target','contact_slip','merged_entry_slip')}
+    if (prior.get('stair_path_reward_settings') != settings
+            or prior.get('stair_path_reward_version') != target['stair_path_reward_version']
+            or prior.get('stair_path_config') != target['stair_path_config']
+            or prior.get('control_profile') != target['control_profile']):
+        raise ValueError('Course migration must retain rewards and command feedback')
+
+
+def validate_sampling_only_migration(prior, profile_manifest):
+    """Keep full optimizer resume restricted to this sampling-only revision."""
+    from ...tasks.manager_based.locomotion.velocity.mdp.path import stair_path_layout as layout
+    if (prior.get('m20_profile') != 'ascent_entry_v1_stage9'
+            or prior.get('refinement_version') != layout.LEGACY_SAMPLING_VERSION
+            or profile_manifest.get('version') != layout.SAMPLING_VERSION):
+        raise ValueError('Sampling migration accepts only Stage9 v3 -> readiness v4')
+    settings = {key:profile_manifest[key] for key in (
+        'stair_path_reward_weights','path_tracking_target','path_velocity_target','contact_slip','merged_entry_slip')}
+    if prior.get('stair_path_reward_settings') != settings or prior.get('stair_path_reward_version') != profile_manifest['stair_path_reward_version']:
+        raise ValueError('Sampling-only migration cannot change path rewards')
+    if prior.get('stair_path_config') != profile_manifest['stair_path_config'] or prior.get('control_profile') != profile_manifest['control_profile']:
+        raise ValueError('Sampling-only migration cannot change command feedback')
 
 
 def frozen_digest(state):
@@ -136,20 +203,21 @@ def seed_curriculum(env, saved):
 
 
 def attach_curriculum_checkpoint(algorithm, env):
-    from ...tasks.manager_based.locomotion.velocity.mdp.path.stair_path_mdp import descent_course
+    from ...tasks.manager_based.locomotion.velocity.mdp.path.stair_path_mdp import descent_course, _sampling_stage, readiness_sampler
+    from ...tasks.manager_based.locomotion.velocity.mdp.path import stair_path_layout as layout
+    from ...tasks.manager_based.locomotion.velocity.mdp.path.stair_path_readiness import ReadinessSampler, validate_legacy_migration
     attach_ascent(algorithm, env)
     old_save, old_load = algorithm.save, algorithm.load
     def save(self):
         state = old_save(); state['stair_path_descent_curriculum'] = descent_course(env).state_dict()
         if getattr(env.cfg, 'm20_refinement_profile', None) == 'ascent_entry_v1_stage9':
             state['stair_path_terrain_types'] = env.scene.terrain.terrain_types.detach().cpu().clone()
-            state['stair_path_sampling_stage'] = getattr(
-                env, '_stair_path_sampling_stage', torch.full((env.num_envs,), -1, dtype=torch.long)).detach().cpu().clone()
+            state['stair_path_sampling'] = dict(version=layout.SAMPLING_VERSION,
+                initialized=bool(getattr(env, '_stair_path_sampling_initialized', False)),
+                iteration=_sampling_stage(env)[1],readiness=readiness_sampler(env).state_dict())
         return state
     def load(self, loaded, load_cfg=None, strict=True):
         if load_cfg is None or load_cfg.get('iteration', False):
-            if getattr(env.cfg, 'm20_refinement_profile', None) == 'ascent_entry_v1_stage9':
-                env._stair_path_sampling_iteration_offset = int(loaded.get('iter', 0))
             columns = (loaded.get('m20_training_manifest') or {}).get('curriculum_terrain_columns', 10)
             if columns != env.scene.terrain.terrain_origins.shape[1]:
                 raise ValueError('Full Stage8 resume requires the same terrain columns; use actor initialization to change the course')
@@ -157,19 +225,79 @@ def attach_curriculum_checkpoint(algorithm, env):
                 raise ValueError('Full Stage8 resume requires its descent curriculum')
             descent_course(env).load_state_dict(loaded['stair_path_descent_curriculum'])
             if getattr(env.cfg, 'm20_refinement_profile', None) == 'ascent_entry_v1_stage9':
+                from ...tasks.manager_based.locomotion.velocity.mdp.path.stair_path_course import VERSION as COURSE_VERSION, LEGACY_VERSION
+                from ...tasks.manager_based.locomotion.velocity.mdp.ascent import ascent_pairing as pairing
+                prior_version = (loaded.get('m20_training_manifest') or {}).get('refinement_version')
+                pairing_enabled = getattr(env.cfg,'stair_ascent_pairing_v9',False)
+                target_version = pairing.VERSION if pairing_enabled else COURSE_VERSION
+                migrating = prior_version != target_version
+                if pairing_enabled:
+                    from_v8 = prior_version == pairing.PREVIOUS_VERSION and getattr(env.cfg,'stair_ascent_migrate_v8',False)
+                    if migrating and not from_v8:
+                        raise ValueError('v9 requires --stair_ascent_migrate_v8 from a v8 checkpoint')
+                    if migrating:
+                        loaded=dict(loaded)
+                        loaded['ascent_adaptive_curriculum']=env._ascent_adaptive_curriculum.migrate_v8(
+                            loaded['ascent_adaptive_curriculum'])
+                        env._stair_ascent_migration=dict(source_version=prior_version,target_version=target_version,
+                            changed='ascent_graded_pair_quality_physical_windows_rear_phase_guidance',
+                            retained='actor_critic_optimizer_reference_iteration_mastery_prefix_height_geometry_sampling_ramp',
+                            evidence='fresh_physical_and_pair_quality_windows_v8_strict_windows_not_reused',
+                            descent='all_rewards_control_and_curriculum_unchanged')
+                elif migrating:
+                    from_v4 = prior_version == layout.SAMPLING_VERSION and getattr(env.cfg,'stair_course_migrate_v4',False)
+                    from_v5 = prior_version == LEGACY_VERSION and getattr(env.cfg,'stair_course_migrate_v5',False)
+                    if not (from_v4 or from_v5):
+                        raise ValueError('v6 requires --stair_course_migrate_v5 from v5, or --stair_course_migrate_v4 from v4')
+                    course = env._ascent_adaptive_curriculum
+                    loaded = dict(loaded)
+                    migrate = course.migrate_bridge if from_v4 else course.migrate_v5
+                    loaded['ascent_adaptive_curriculum'] = migrate(loaded['ascent_adaptive_curriculum'],
+                        loaded['ascent_adaptive_terrain_levels'])
+                    env._stair_path_course_migration = dict(source_version=prior_version,target_version=COURSE_VERSION,
+                        prefix_mapping='actual_target_tread_count_unchanged',
+                        mastery_initialization='current_both_speed_windows_or_conservative_4_6_tread_trajectory_evidence',
+                        retained='actor_critic_optimizer_reference_rows_assignments_speed_windows_sampling_ramp',
+                        readiness_history='new_evidence_required')
                 saved_types = loaded.get('stair_path_terrain_types')
-                saved_stage = loaded.get('stair_path_sampling_stage')
+                saved_sampling = loaded.get('stair_path_sampling') or {}
                 if saved_types is None or saved_types.shape != env.scene.terrain.terrain_types.shape or saved_types.dtype != torch.long:
                     raise ValueError('Full Stage9 resume requires its terrain sampling assignment')
-                if saved_stage is None or saved_stage.shape != (env.num_envs,) or saved_stage.dtype != torch.long:
-                    raise ValueError('Full Stage9 resume requires its terrain sampling phase')
+                if (type(saved_sampling.get('initialized')) is not bool
+                        or type(saved_sampling.get('iteration')) is not int
+                        or saved_sampling['iteration'] < 0):
+                    raise ValueError('Full Stage9 resume requires valid sampling state')
                 columns = env.scene.terrain.terrain_origins.shape[1]
-                if (saved_types < 0).any() or (saved_types >= columns).any() or (saved_stage < -1).any() or (saved_stage > 2).any():
+                if (saved_types < 0).any() or (saved_types >= columns).any():
                     raise ValueError('Invalid Stage9 terrain sampling state')
+                if saved_sampling.get('version') == layout.SAMPLING_VERSION:
+                    readiness = ReadinessSampler(env.device)
+                    readiness.load_state_dict(saved_sampling.get('readiness') or {},migrate_v4=migrating)
+                    if migrating:
+                        readiness.reset_evidence()
+                else:
+                    iteration = validate_legacy_migration(saved_sampling,saved_types,
+                        bool(getattr(env.cfg,'stair_path_sampling_migrate_v3',False)))
+                    readiness = ReadinessSampler(env.device,start_iteration=iteration,
+                        mode=getattr(env.cfg,'stair_path_sampling_mode',None) or 'manual')
+                    env._stair_path_sampling_migration = dict(source_version=saved_sampling['version'],
+                        source_iteration=iteration,target_version=layout.SAMPLING_VERSION,
+                        retained='actor_critic_optimizer_reference_all_environment_curricula_and_assignments',
+                        readiness_history='fresh_observations_required')
+                readiness.request(mode=getattr(env.cfg,'stair_path_sampling_mode',None),
+                    stage=getattr(env.cfg,'stair_path_sampling_stage',None),iteration=saved_sampling['iteration'])
+                env._stair_path_readiness = readiness
                 terrain = env.scene.terrain
                 terrain.terrain_types.copy_(saved_types.to(env.device))
+                env._stair_path_sampling_population = None
                 terrain.env_origins[:] = terrain.terrain_origins[terrain.terrain_levels, terrain.terrain_types]
-                env._stair_path_sampling_stage = saved_stage.to(env.device).clone()
-        return old_load(loaded, load_cfg, strict)
+                env._stair_path_sampling_initialized = saved_sampling['initialized']
+                steps = max(int(getattr(env.cfg, 'stair_path_sampling_steps_per_iteration', 24)), 1)
+                env._stair_path_sampling_iteration_offset = saved_sampling['iteration']-int(env.common_step_counter)//steps
+        env._stair_path_sampling_restoring = True
+        try:
+            return old_load(loaded, load_cfg, strict)
+        finally:
+            env._stair_path_sampling_restoring = False
     algorithm.save = MethodType(save, algorithm)
     algorithm.load = MethodType(load, algorithm)

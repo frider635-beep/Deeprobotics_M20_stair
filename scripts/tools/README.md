@@ -1,5 +1,11 @@
 # v0 教师训练工具清单
 
+2026-10-27 Stage9 v9：新增 `check_stair_path_evidence.py` 检查逐轴质量晋级、升高与后轴第2阶条件、近期通行窗口抑制偶发退级、必要降高/已学下限、v8状态迁移、真实课程调用与左右镜像相位；`check_stair_ascent_pairing.py`继续检查理想交替与物理硬约束、错序信用、奖励迁移和下楼对照（`--baseline-root <改动前rl_training包目录>`）。全部仅CPU，不加载策略。`resume_stair_mastery.py --print-only`预览从当前v8最新断点迁入v9；去掉预览参数才启动。后续恢复须指定 `--load-run <实际v9目录名>`。完整规则和命令见 [v9 调整与续训](../../docs/test_docs/07_上楼步态校正/v1_20261023/stage9_v9/调整与续训.md)。
+
+保留的v6课程检查：`check_stair_path_mastery.py`验证已学6阶保护、12→10→8→6同高度退级、持续失败降高、换几何清理、状态保存和v5迁移；规则见 [v6 记录](../../docs/test_docs/07_上楼步态校正/v1_20261023/stage9_v6/调整与续训.md)。
+
+2026-10-26 Stage9 v5 当前工具：`check_stair_path_course.py` 检查渐进课程、v4 状态映射与原回合标签；`check_ppo_diagnostics.py` 使用合成 Actor/Critic 检查实际 PPO 更新，确认非零保护梯度的诊断不改变更新结果；`analyze_stair_optimizer.py --run <运行目录> --last 600 --output <报告.json>` 读取 TensorBoard 的梯度、KL 与参数更新量，输出启发式学习率判断。这些工具不加载策略 checkpoint。续训命令和指标定义见 [v5 说明](../../docs/test_docs/07_上楼步态校正/v1_20261023/stage9_v5/改进与续训.md)。下文 v3→v4 迁移记录为历史流程，当前 v4→v5 使用 `--stair_course_migrate_v4`。
+
 整理日期：2026-10-19。当前教师训练工程记为 **v0 基线**；这是工程整理标签，不重写已有任务 ID、profile、控制器或 checkpoint 内部版本。
 
 2026-10-20 新增上楼参考节奏工具（不包含在下文10月19日的27个保留脚本统计中）：
@@ -141,3 +147,7 @@ python scripts/tools/check_m20_evaluation_cli.py
 当前路径工具采用固定网络版本：`prepare_stair_path.py`逐张量原样复制Actor/Critic，仅附加控制元数据；`check_stair_path.py`验证相同键名、形状、参数总数和真实PPO/断点恢复；`evaluate_stair_path.py`分别记录横移与理想步态，含上下楼20cm踏深。正式训练无需运行prepare，直接加载原model_11400.pt。
 
 `check_stair_path_objectives.py --output <json>`验证当前奖励修订v2的行为反例：有效/原始命令选择、受控回线与远离路线、正常滚动与纵向空转、单轮打滑/腾空排除、左右镜像/参考路线旋转、入口强调不重复放大。该工具不加载model12100，不启动训练。
+
+`check_stair_path_sampling.py`在CPU检查Stage9 v4：默认手动保持阶段、不按时间表切换、1000轮连续过渡、20cm始终覆盖、上楼重置时的最小必要换列、固定下楼/非楼梯任务池和未换几何的进度保留。`check_stair_path_readiness.py`使用合成回合数据检查可选趋势判稳、明显提升/退化时保持、低成功率降级及重试滞回、调度器状态序列化、中途反向切换连续性、v3初始配额迁移元数据和Ctrl+C在完整更新后保存的时机。均不加载策略checkpoint、不执行完整恢复或仿真。
+
+`check_stair_path_performance.py`使用合成CPU场景检查真实Stage9观测器、稀疏/显式重置与同一物理tick重复调用。可用`--baseline-root <旧rl_training包目录>`逐tick比较优化前后的全部观测器张量，并统计非零索引操作次数；`--num-envs 10584`覆盖正式环境数量。CPU计时不代表PhysX/GPU训练加速比例；不加载策略checkpoint、不启动仿真或PPO。

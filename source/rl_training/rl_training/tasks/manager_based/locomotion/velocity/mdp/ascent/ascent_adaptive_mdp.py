@@ -54,9 +54,10 @@ class AdaptivePhysicsObserver(Stage2PhysicsObserver):
         env = self.env
         if env._sim_step_counter == 0 or self.last_physics_tick == env._sim_step_counter:
             return
-        resets = env.episode_length_buf < self.previous_lengths
-        self.sequence.reset(resets); self.top.reset(resets)
-        self.speed_age[resets] = 0; self.active_time[resets] = 0.; self.adaptive_action_age[resets] = 0
+        resets = self.episode_reset_ids()
+        if len(resets):
+            self.sequence.reset(resets); self.top.reset(resets)
+            self.speed_age[resets] = 0; self.active_time[resets] = 0.; self.adaptive_action_age[resets] = 0
         super().observe()
         data = env.scene['robot'].data
         command = env.command_manager.get_command('base_velocity')
@@ -83,6 +84,11 @@ class AdaptivePhysicsObserver(Stage2PhysicsObserver):
         events['paired'] *= ~expired
         events['new_mask'] &= (~expired)[:, None, None]
         target, enabled, pair_target = self.sequence.front_targets(active)
+        if getattr(env.cfg,'stair_ascent_pairing_v9',False):
+            from .ascent_pairing import paired_targets
+            paired = paired_targets(self.sequence,goals,active)
+            target = paired['target'][:,:2]
+            enabled = paired['enabled'][:,:2] & ~paired['hold'][:,:2]
         enabled &= target <= goals[:, None]
         guide = landing_guidance(position[:, :2], data.body_com_lin_vel_w[:, self.wheels[:2], 2],
                                  target, enabled, first, self.first_floor, depth, height)
@@ -193,7 +199,8 @@ def critic_state(env):
         history[:, 6] = observer.active_time/24.
         history[:, 7] = observer.prefix_ready.float()
     skill_scale = max(len(getattr(state, 'prefixes', (2, 4, 6, 18)))-1, 1)
-    result = torch.cat((torch.stack((height/.25, depth/.35, prefix, state.skill.float()/skill_scale), -1), history), -1)
+    skill_feature = state.critic_skill() if hasattr(state,'critic_skill') else state.skill.float()/skill_scale
+    result = torch.cat((torch.stack((height/.25, depth/.35, prefix, skill_feature), -1), history), -1)
     return result*adaptive.ascent_mask(env)[:, None]
 
 
@@ -208,7 +215,7 @@ def finished(env):
     if observer is None: return torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
     # Short prefixes are real terminals, not timeouts that bootstrap an
     # imaginary continuation. Full courses retain the complete platform exit.
-    goals = curriculum_state(env).goals()
+    goals = getattr(observer, 'episode_goals', curriculum_state(env).goals())
     return observer.prefix_ready & ((goals < env.cfg.ascent_sequence_step_count) | observer.top_ready)
 
 
@@ -225,8 +232,13 @@ def curriculum(env, env_ids):
         # The environment computes curriculum immediately before the reset
         # event. Reward/contact histories still belong to the old geometry.
         eligible = observer.stats['physics_samples'][ids] > 0
+        options = {}
+        if getattr(env.cfg,'stair_ascent_pairing_v9',False):
+            from ..path.stair_path_evidence import pair_quality
+            quality,second=pair_quality(observer.sequence,observer.episode_goals)
+            options.update(pair_quality=quality[ids],rear_second_quality=second[ids])
         up, down = state.update(ids, success, eligible, terrain.terrain_levels[ids], reference,
-                                getattr(env.cfg, 'ascent_adaptive_training', True))
+                                getattr(env.cfg, 'ascent_adaptive_training', True), **options)
         terrain.update_env_origins(ids, up, down)
     height, depth = geometry(env)
     select = adaptive.ascent_mask(env)
@@ -249,7 +261,7 @@ def metrics(env, env_ids):
         result[wheel+'_best_dwell_s'] = ledger.best_dwell[ids, index, tread].sum()*.04/count
         result[wheel+'_support_frames'] = observer.stats['adaptive_'+wheel+'_support_frames'][ids].sum()/count
         result[wheel+'_longest_support_ms'] = observer.stats['adaptive_'+wheel+'_longest_support_s'][ids].sum()*1000./count
-    goals = curriculum_state(env).goals()[ids]
+    goals = getattr(observer, 'episode_goals', curriculum_state(env).goals())[ids]
     required = ledger.targets <= goals[:, None, None]
     denominator = goals.sum().clamp_min(1.)
     result['front_current_prefix_coverage'] = (ledger.covered[ids, :2]*required).float().sum()/(2.*denominator)

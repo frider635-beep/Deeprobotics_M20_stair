@@ -19,14 +19,23 @@ class UnifiedPhysicsObserver(previous.AlternatingPhysicsObserver):
         super().__init__(env)
         self.failure_reason = torch.zeros(env.num_envs, device=env.device, dtype=torch.long)
         self.unified_context_key = -1
+        self.pairing_diagnostics = None
+        if getattr(env.cfg, 'stair_ascent_pairing_v9', False):
+            from .ascent_pairing import PairingDiagnostics
+            self.pairing_diagnostics = PairingDiagnostics(env.num_envs,env.device,env.cfg.ascent_sequence_step_count)
 
     def reset(self, ids):
         super().reset(ids)
         self.failure_reason[ids] = 0; self.unified_context_key = -1
+        if self.pairing_diagnostics is not None:
+            self.pairing_diagnostics.reset(ids)
 
     def observe(self):
         env = self.env
         if env._sim_step_counter == 0 or self.last_physics_tick == env._sim_step_counter: return
+        if self.pairing_diagnostics is not None:
+            resets = self.episode_reset_ids()
+            if len(resets): self.pairing_diagnostics.reset(resets)
         super().observe()
         data = env.scene['robot'].data
         command = env.command_manager.get_command('base_velocity')
@@ -35,8 +44,17 @@ class UnifiedPhysicsObserver(previous.AlternatingPhysicsObserver):
         height, depth = geometry(env)
         position = data.body_pos_w[:, self.wheels]
         goals = adaptive.curriculum_state(env).goals()
-        guide, hold = paired_guidance(self.sequence, position, data.body_com_lin_vel_w[:, self.wheels, 2],
-            env.scene.env_origins[:, 0]+1.25, self.first_floor, depth, height, goals, active)
+        if self.pairing_diagnostics is None:
+            guide, hold = paired_guidance(self.sequence, position, data.body_com_lin_vel_w[:, self.wheels, 2],
+                env.scene.env_origins[:, 0]+1.25, self.first_floor, depth, height, goals, active)
+        else:
+            from .ascent_pairing import pairing_guidance
+            first = env.scene.env_origins[:,0]+1.25
+            guide,hold,clearance,state = pairing_guidance(self.sequence,self.turns,self.support,
+                self.stable_time,position,data.body_com_lin_vel_w[:,self.wheels,2],
+                first,self.first_floor,depth,height,goals,active)
+            self.pairing_diagnostics.observe(state,self.sequence,position,first,depth,
+                self.active_time,env.physics_dt)
         overspeed = ((data.root_lin_vel_w[:, 0]-command[:, 0]-.10).clamp_min(0.)/.20).square().clamp_max(9.)
         # A dedicated terminal corridor limits catastrophic path drift while the
         # dense whole-episode lateral cost remains active well inside it.
@@ -44,7 +62,8 @@ class UnifiedPhysicsObserver(previous.AlternatingPhysicsObserver):
         path_failed &= self.active_time > .5
         self.failure_reason = torch.where(self.failure_reason > 0, self.failure_reason, self.sequence.failure_reason)
         self.failure_reason = torch.where((self.failure_reason == 0) & self.turns.failed, 4, self.failure_reason)
-        deadline = self.active_time.new_tensor(BridgeCurriculum.deadlines)[adaptive.curriculum_state(env).skill]
+        course = adaptive.curriculum_state(env)
+        deadline = self.active_time.new_tensor(course.deadlines)[course.skill]
         self.failure_reason = torch.where((self.failure_reason == 0) & (self.active_time > deadline) & active, 5, self.failure_reason)
         self.failure_reason = torch.where((self.failure_reason == 0) & path_failed, 6, self.failure_reason)
         self.sequence.failed |= path_failed
@@ -53,6 +72,22 @@ class UnifiedPhysicsObserver(previous.AlternatingPhysicsObserver):
         for key in ('ordered', 'dwell', 'paired', 'landing_credit', 'top_front', 'top_rear', 'top_forward'):
             self.window['adaptive_'+key] *= self.positive_gate
         self.window['alternating_progress'] *= self.positive_gate
+        if self.pairing_diagnostics is not None:
+            for key,value in dict(clearance=clearance,rear_paired=self.sequence.rear_paired_event,landing_order=self.sequence.style_event,rear_phase=state['rear_phase']).items():
+                name = 'ascent_pairing_'+key
+                if name not in self.window: self.window[name] = torch.zeros_like(value)
+                self.window[name] += value*active
+            self.window['ascent_pairing_rear_paired'] *= self.positive_gate
+            # Local gait credit is blocked through a reversed pair and through
+            # the policy tick containing its violation. Good later pairs can
+            # learn again; heading, lateral and slip terms retain their gates.
+            style_gate = self.sequence.style_reward_allowed & (self.window['ascent_pairing_landing_order'] == 0)
+            for key in ('ordered','dwell','paired','landing_credit'):
+                self.window['adaptive_'+key] *= style_gate
+            self.window['alternating_progress'] *= style_gate
+            self.window['ascent_pairing_rear_paired'] *= style_gate
+            for key in ('top_front','top_rear','top_forward'):
+                self.window['adaptive_'+key] *= ~self.sequence.style_failed
         values = dict(landing_height=guide['height'], landing_horizontal=guide['horizontal'],
                       landing_velocity=guide['velocity'], hold_mate=hold, overspeed=overspeed)
         for key,value in values.items():
@@ -105,7 +140,27 @@ def metrics(env, env_ids):
         intervals = times[:,5:]-times[:,4:-1]
         result['__weighted_total__/'+leg+'_middle_interval_s'] = (intervals*valid_middle).sum()
         result['__weighted_count__/'+leg+'_middle_interval_s'] = valid_middle.sum().float()
+    if observer.pairing_diagnostics is not None:
+        physical = adaptive.finished(env)[ids]
+        result['strict_prefix_success_fraction'] = (physical & ~observer.sequence.style_failed[ids]).float().sum()/count
+        result['landing_order_violation_fraction'] = observer.sequence.style_failed[ids].float().sum()/count
     state = adaptive.curriculum_state(env)
-    for length in BridgeCurriculum.prefixes:
+    if observer.pairing_diagnostics is not None:
+        from .ascent_pairing import DIAGNOSTIC_FIELDS
+        values = observer.pairing_diagnostics.values(observer,ids).sum(0)
+        for j,name in enumerate(DIAGNOSTIC_FIELDS):
+            result['__weighted_total__/pairing_'+name] = values[j]
+            result['__weighted_count__/pairing_'+name] = torch.as_tensor(len(ids),device=env.device).float()
+        for label,numerator,denominator in (
+                ('rear_opportunity_coverage','rear_covered_attempts','rear_attempts'),
+                ('rear_mature_opportunity_coverage','rear_covered_mature_attempts','rear_mature_attempts'),
+                ('legacy_target_disagreement_fraction','legacy_spatial_target_disagreement_s','target_opportunity_s'),
+                *((f'rear_tread{tread}_{label}',f'rear_tread{tread}_{num}',f'rear_tread{tread}_{den}')
+                  for tread in range(1,19) for label,num,den in (
+                      ('opportunity_coverage','covered_attempts','attempts'),
+                      ('mature_opportunity_coverage','covered_mature_attempts','mature_attempts')))):
+            result['__weighted_total__/pairing_'+label] = values[DIAGNOSTIC_FIELDS.index(numerator)]
+            result['__weighted_count__/pairing_'+label] = values[DIAGNOSTIC_FIELDS.index(denominator)]
+    for length in state.prefixes:
         result['prefix'+str(length)+'_environment_fraction'] = (state.goals()[ids] == length).float().sum()/count
     return export_teacher_metrics(result, result.keys(), detailed=True)

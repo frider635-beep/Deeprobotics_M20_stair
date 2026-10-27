@@ -44,6 +44,8 @@ class EntryPhysicsObserver:
         self.wheels = robot.find_bodies([f'{leg}_wheel' for leg in ('fl','fr','hl','hr')], preserve_order=True)[0]
         n, device = env.num_envs, env.device
         self.previous_lengths = torch.zeros(n, device=device, dtype=torch.long)
+        self._episode_reset_tick = -1
+        self._episode_reset_ids = torch.empty(0, device=device, dtype=torch.long)
         self.highest_z = env.scene.env_origins[:, 2:3].repeat(1,4).clone()
         self.stable_time = torch.zeros(n,4,device=device)
         self.previous_top_z = self.highest_z.clone()
@@ -78,6 +80,18 @@ class EntryPhysicsObserver:
         for value in self.stats.values(): value[ids]=0.
         for value in self.window.values(): value[ids]=0.
 
+    def episode_reset_ids(self):
+        """Share one sparse reset selection across the observer inheritance chain.
+
+        Boolean indexing every history tensor launches repeated nonzero scans
+        on CUDA, including on substeps with no resets. Select once before the
+        base observer updates previous_lengths; consumers skip empty batches.
+        """
+        if self._episode_reset_tick != self.env._sim_step_counter:
+            self._episode_reset_ids = (self.env.episode_length_buf < self.previous_lengths).nonzero().flatten()
+            self._episode_reset_tick = self.env._sim_step_counter
+        return self._episode_reset_ids
+
     def observe(self):
         env = self.env
         if env._sim_step_counter==0:
@@ -85,15 +99,16 @@ class EntryPhysicsObserver:
         if self.last_physics_tick == env._sim_step_counter:
             return
         self.last_physics_tick = env._sim_step_counter
-        reset = env.episode_length_buf < self.previous_lengths
+        reset = self.episode_reset_ids()
         self.previous_lengths.copy_(env.episode_length_buf)
-        self.highest_z[reset] = env.scene.env_origins[reset, 2:3]
-        self.first_floor[reset] = env.scene.env_origins[reset,2]
-        self.stable_time[reset] = 0.
-        self.last_landing_time[reset] = -100.
-        self.action_age[reset] = 0
-        for value in self.stats.values():
-            value[reset] = 0.
+        if len(reset):
+            self.highest_z[reset] = env.scene.env_origins[reset, 2:3]
+            self.first_floor[reset] = env.scene.env_origins[reset,2]
+            self.stable_time[reset] = 0.
+            self.last_landing_time[reset] = -100.
+            self.action_age[reset] = 0
+            for value in self.stats.values():
+                value[reset] = 0.
         if self.window_key != env.common_step_counter:
             self.window_key = env.common_step_counter
             z = torch.zeros(env.num_envs,4,device=env.device)
@@ -111,6 +126,7 @@ class EntryPhysicsObserver:
         robot = env.scene['robot'].data
         slip, support, face, normal, self.contact_tangent = contact_patch_velocity(robot.body_com_pos_w[:,self.wheels],
                     robot.body_com_lin_vel_w[:,self.wheels], robot.body_ang_vel_w[:,self.wheels], point, force, return_tangent=True)
+        self.contact_slip, self.contact_support = slip, support
         point = torch.nan_to_num(point)
         # Bounded pseudo-Huber: retain initial contact slip without letting a
         # single impact dominate all task progress rewards.

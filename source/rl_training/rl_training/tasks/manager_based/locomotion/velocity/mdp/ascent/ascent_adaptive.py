@@ -19,6 +19,9 @@ def ascent_column_count(env):
 
 def column_mask(env, columns):
     types = env.scene.terrain.terrain_types
+    columns = tuple(columns)
+    if columns and columns == tuple(range(columns[0], columns[-1]+1)):
+        return (types >= columns[0]) & (types <= columns[-1])
     result = torch.zeros_like(types, dtype=torch.bool)
     for column in columns:
         result |= types == int(column)

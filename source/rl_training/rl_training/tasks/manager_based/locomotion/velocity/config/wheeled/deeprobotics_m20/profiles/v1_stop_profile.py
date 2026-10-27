@@ -32,7 +32,7 @@ PROFILE_VERSIONS = {PROFILE: VERSION, "v1_stop_v2": VERSION_V2,
                     "ascent_entry_v1_stage6": "m20_ascent_alternating_20261021_v1_stage6_geom_v2",
                     "ascent_entry_v1_stage7": "m20_ascent_unified_20261021_v1_stage7",
                     "ascent_entry_v1_stage8_fixed": "m20_stair_path_fixed247_20261022_v1_stage8_reward_v2",
-                    "ascent_entry_v1_stage9": "m20_stair_path_fixed247_20261023_v2_staged_sampling"}
+                    "ascent_entry_v1_stage9": "m20_stair_path_fixed247_20261027_v9_course_evidence"}
 PROFILES = tuple(PROFILE_VERSIONS)
 
 

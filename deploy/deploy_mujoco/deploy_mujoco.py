@@ -156,7 +156,7 @@ def load_actor(checkpoint: Path) -> MLPModel:
         config = manifest.get("actor_model_config", {})
         extra = dict(stop_std_factor=config.get("stop_std_factor", .1),
                      stop_hidden_dims=config.get("stop_hidden_dims", [128, 64]))
-    elif manifest.get('m20_profile') in ('ascent_entry_v1_stage8', 'ascent_entry_v1_stage8_fixed'):
+    elif manifest.get('m20_profile') in ('ascent_entry_v1_stage8', 'ascent_entry_v1_stage8_fixed', 'ascent_entry_v1_stage9'):
         expanded = manifest['m20_profile'] == 'ascent_entry_v1_stage8'
         actor_type = training_module('models.legacy.stair_path_expanded_actor' if expanded else 'models.stair_path_actor').StairPathMLPModel
         obs['motion_control'] = torch.zeros(1, 3)

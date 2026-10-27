@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import torch
 from types import MethodType
-from .ascent_entry_mdp import EntryPhysicsObserver, contact_patch_velocity, context as entry_context, smooth01
+from .ascent_entry_mdp import EntryPhysicsObserver, context as entry_context, smooth01
 
 
 class TreadLedger:
@@ -90,8 +90,9 @@ class Stage2PhysicsObserver(EntryPhysicsObserver):
         env = self.env
         if env._sim_step_counter == 0 or self.last_physics_tick == env._sim_step_counter:
             return
-        reset = env.episode_length_buf < self.previous_lengths
-        self.ledger.reset(reset)
+        reset = self.episode_reset_ids()
+        if len(reset):
+            self.ledger.reset(reset)
         super().observe()
         command = env.command_manager.get_command('base_velocity')
         active = ascent_mask(env) & (command[:, 0] > .1)
@@ -115,22 +116,9 @@ class Stage2PhysicsObserver(EntryPhysicsObserver):
         self.lifetime_missing += events['missing'].sum()
         self.stats['stage2_covered'] += events['ordered'].sum(-1)
         self.stats['stage2_missing'] += events['missing'].sum(-1)
-        # Sensor data are cached at this same physics tick. Reconstruct raw
-        # per-wheel tangent speed for diagnostics independently of the reward
-        # pseudo-Huber transform in the inherited observer.
-        points, forces = [], []
-        for leg in ('fl', 'fr', 'hl', 'hr'):
-            sensor = env.scene.sensors[f'entry_{leg}_contact'].data
-            force = sensor.force_matrix_w[:, 0]
-            index = torch.linalg.vector_norm(force, dim=-1).argmax(-1)
-            row = torch.arange(env.num_envs, device=env.device)
-            points.append(sensor.contact_pos_w[:, 0][row, index])
-            forces.append(force[row, index])
-        slip, support, _, _ = contact_patch_velocity(data.body_com_pos_w[:, self.wheels],
-            data.body_com_lin_vel_w[:, self.wheels], data.body_ang_vel_w[:, self.wheels],
-            torch.stack(points, 1), torch.stack(forces, 1))
-        # Reuse the same physical contact calculation in later observers.
-        self.contact_slip, self.contact_support = slip, support
+        # The base observer already measured these same contacts at this tick.
+        # Retain raw slip for diagnostics independently of its reward transform.
+        slip, support = self.contact_slip, self.contact_support
         supported = slip*support*active[:, None]
         self.stats['stage2_front_slip_sum'] += supported[:, :2].sum(-1)
         self.stats['stage2_rear_slip_sum'] += supported[:, 2:].sum(-1)

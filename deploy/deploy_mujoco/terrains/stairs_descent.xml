@@ -9,7 +9,7 @@
     <text name="terrain_kind" data="descent"/>
     <!-- 公共参数：长度单位 m；世界 +X 为路线前进方向，+Y 为左，+Z 为上。 -->
     <!-- width：路线宽度；生成障碍之外保留 z=0 无限平面，方便自由操控。 -->
-    <numeric name="width" data="4.0"/>
+    <numeric name="width" data="1.2"/>
     <!-- friction：滑动 / 扭转 / 滚动摩擦；应用于生成的地面和障碍。 -->
     <numeric name="friction" data="1.0 0.01 0.01"/>
     <!-- spawn_xy：机器人出生世界坐标 x y；z 自动射线查询 + 站立/趴下偏置。 -->

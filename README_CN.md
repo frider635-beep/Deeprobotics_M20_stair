@@ -2,6 +2,8 @@
 
 [English](README.md) · 更新日期：**2026-10-20**
 
+2026-10-27 当前 Stage9 为 **v9 课程证据分离与后轴顺序引导**：用两速度的物理完成窗口和逐轴配对质量渐进晋级，升高额外要求后轴第2阶质量；缩短前缀须同时满足连续失败与近期物理成功率偏低，保留已学前缀下限和必要降高。新增后轴跟随轮等待原先手落当前阶的有界引导，理想全程交替验收保持。网络仍为3分支、Actor247/Critic300，原下楼奖励/课程及路径、横移、偏航、打滑项保持。采样手动stage1，学习率 `1.5e-5`。旧v8按一次Ctrl+C等待保存退出后，在 `isaaclab` 环境执行 `OMP_NUM_THREADS=4 python scripts/tools/resume_stair_mastery.py`，从当前v8最新断点迁入v9；加 `--print-only`仅预览。后续恢复用 `--load-run <实际v9目录名>`。规则、迁移和验证见 [Stage9 v9 调整与续训](docs/test_docs/07_上楼步态校正/v1_20261023/stage9_v9/调整与续训.md)。下文为历史记录。
+
 当前教师训练工程记为 **v0 基线**，保留已有任务、profile 和 checkpoint 的兼容版本标记。常用程序见[工具清单](scripts/tools/README.md)。
 
 本工程基于 [DeepRoboticsLab/rl_training](https://github.com/DeepRoboticsLab/rl_training) 与 Isaac Lab，包含 M20 轮式预训练、特权楼梯教师训练、MuJoCo 部署、遥测、回归评测和实验性感知学生接口。
@@ -183,17 +185,46 @@ Stage8的旧13列布局与Stage9的28列布局分别保留，避免旧配置回�
 
 Stage9 针对1.0/1.2m楼梯路线的横向漂移、踏面不足和25cm踏深下的滑移/立板碰撞增加路径约束与窄踏面接触代价。地形列固定为28列：0–7是20/25/30/35cm踏深与1.0/1.2m宽度组合的上楼，8是5m参考上楼，9–11是平地，12–19是对应的下楼任务，20–27是箱体、粗糙地面和双向坡面。上下楼高度行仍为10/12/15/18/20/25cm；降级仅降低高度行，列上的踏深和宽度不变。平地与非楼梯地形保留原命令、奖励及基于行走距离的地形课程，路径反馈只作用于楼梯列。
 
-Stage9 v2在episode重置时按三段课程重新分配下一回合的地形列，不重建地形网格、不改变各列几何。前600轮的上楼样本中，70%来自30/35cm、1.2m及5m参考楼梯，20%来自25cm/1.2m和30/35cm/1.0m，10%来自20cm和25cm/1.0m；600–2000轮调整为45%/35%/20%；之后九种上楼几何均匀采样。20cm任务始终保留非零概率。10584环境下，下楼与非楼梯地形的绝对样本数约维持8192环境旧配置的水平，上楼样本约增加到旧配置的1.9倍。不同几何间切换时重置该环境的接触前缀计数，避免把容易几何上学到的全程目标错误带入困难列。`sampling_stage`及各类目标采样比例写入课程日志。奖励权重暂不调整，先单独验证课程采样带来的变化。
+Stage9 v4（2026-10-26）取消3k/6k/1w等固定时间切换，默认由用户手动选择配比阶段；`--stair_sampling_mode auto`可选用趋势判稳与低成功率回退。容易组为30/35cm踏深、1.2m宽及5m参考楼梯；中等组为25cm/1.2m和30/35cm/1.0m；困难组为20cm/1.0m、20cm/1.2m和25cm/1.0m。表中比例仅指上楼环境内部，各组内三列均匀分配。
+
+| 阶段参数 | 容易组目标 | 中等组目标 | 困难组目标 |
+| --- | --- | --- | --- |
+| 0 | 70% | 20% | 10% |
+| 1 | 65% | 22.5% | 12.5% |
+| 2 | 60% | 25% | 15% |
+| 3 | 55% | 27.5% | 17.5% |
+| 4 | 50% | 30% | 20% |
+| 5 | 45% | 32.5% | 22.5% |
+| 6 | 40% | 35% | 25% |
+| 7 | 37.5% | 35% | 27.5% |
+| 8 | 35% | 35% | 30% |
+| 9 | 34.17% | 34.17% | 31.67% |
+| 10 | 33.33% | 33.33% | 33.33% |
+
+每次修改阶段后，在1000轮内从保存时的目标进度连续过渡到新配比；上调、下调、过渡中断后改方向均保留连续性。手动模式保持所选目标，达到3k/6k/1w或预算末尾都不会自行切换。高度和接触前缀仍独立按回合表现升降，降低阶高时保留踏深和宽度，20cm任务一直覆盖。40000轮是总预算，不是必须在预算内完成所有配比的要求。
+
+初始化时按整数配额分配环境；随后下楼和平地/箱体/粗糙地面/坡面环境固定任务列，上楼仅在episode重置时从超额列向缺额列迁移必要的环境。满足当前配额后，重复重置不会换列；不会在阶段切换时让所有环境重新抽签。未换几何环境的高度行和接触课程进度保留；只有实际换了上楼几何的环境回到最低高度行及其规定的最短练习前缀，并清空连续计数和两档速度成功窗口。地形网格、各列踏深/宽度和奖励权重保持原配置。10584环境下，按当前逐列整数配额实际分配上楼5022个，下楼与非楼梯环境合计5562个，接近旧8192环境Stage9对应任务的绝对覆盖量。
+
+日志在`Curriculum/stair_path/`下记录`sampling_stage`、`sampling_transition_fraction`、`sampling_budget_fraction`；`sampling_target_easy_fraction`/`middle`/`hard`和`sampling_actual_easy_fraction`/`middle`/`hard`分别显示目标与实际的上楼组内比例。`sampling_pending_ascent_fraction`表示尚需换列的上楼份额，`sampling_changed_fraction`表示本次重置批次实际换列比例。实际比例会等待相应环境结束回合后逐渐追上目标；`sampling_actual_ascent_fraction`、`sampling_actual_descent_fraction`和`sampling_actual_non_stair_fraction`可检查三个固定环境池。
 
 Actor/Critic维度、参数形状和Stage7统一分支结构均不变。冻结的基础运动分支保留其原策略输出，但最终动作仍叠加可训练统一修正分支；因此冻结降低了遗忘风险，却不能单独证明粗糙地面、箱体、坡面上的组合策略无回归。Stage9继续采样这些地形并记录分类型地形等级，验收时要同时看各非楼梯类别行走表现和楼梯课程，不以楼梯成功率替代全地形回归。
 
-在仓库根目录、现有isaaclab环境启动Stage9 v2；这条命令从用户选定的Stage7 `model_12100.pt`初始化Actor/Critic并使用新优化器，不做完整恢复，也不重复检查该检查点：
+在仓库根目录、现有isaaclab环境，从原v3实验的2000轮分支续训。这是显式的采样逻辑迁移，保留Actor/Critic、优化器、参考策略、环境分配、前缀/高度和双速度历史；不采用仅初始化权重的方式。`--stair_sampling_migrate_v3`仅接受首次切换前且配额仍为70/20/10的v3 checkpoint，不接受后期3k/6k/7200状态。课程版本为`m20_stair_path_fixed247_20261026_v4_readiness_sampling`：
 
 ```bash
-OMP_NUM_THREADS=4 python -u scripts/reinforcement_learning/rsl_rl/train.py --task Rough-Deeprobotics-M20-StairTeacher-v1 --m20_profile ascent_entry_v1_stage9 --init_actor_from logs/rsl_rl/deeprobotics_m20_stair_teacher_v1_stage2/2026-10-21_18-29-16_ascent_entry_v1_stage7/model_12100.pt --init_critic_from logs/rsl_rl/deeprobotics_m20_stair_teacher_v1_stage2/2026-10-21_18-29-16_ascent_entry_v1_stage7/model_12100.pt --run_name ascent_entry_v1_stage9_v2_staged_sampling_from12100 --num_envs 10584 --max_iterations 120000 --seed 42 --device cuda:0 --headless
+OMP_NUM_THREADS=4 python -u scripts/reinforcement_learning/rsl_rl/train.py \
+  --task Rough-Deeprobotics-M20-StairTeacher-v1 --m20_profile ascent_entry_v1_stage9 \
+  --resume --load_run 2026-10-23_19-15-28_ascent_entry_v1_stage9_v3 --checkpoint model_2000.pt \
+  --stair_sampling_migrate_v3 --stair_sampling_mode manual --stair_sampling_stage 0 \
+  --run_name ascent_entry_v1_stage9_v4_manual_from2000 \
+  --num_envs 10584 --max_iterations 38000 --seed 42 --device cuda:0 --headless
 ```
 
-28列、6个高度行共168个地形单元；10584环境下简单平均每列约378个、每列每高度行约63个环境。Stage9 v2按课程阶段对reset环境分配地形，因此实际上楼列的样本量按阶段变化；下楼和非楼梯类别的期望绝对采样量维持在旧8192环境Stage9的大致水平。检查 `sampling_stage`、`sampling_ascent_fraction`、`sampling_descent_fraction`、`sampling_non_stair_fraction`，以及 `general_flat_terrain_level_mean`、`general_boxes_terrain_level_mean`、`general_random_rough_terrain_level_mean`、两个坡面地形等级和各楼梯列的成功/缺阶/路径误差、横向速度与接触滑移。当前环境缺少IsaacLab依赖时，只能做静态配置与掩码检查；正式训练由用户启动。
+后续判断近期约600–1000轮的主要曲线基本平稳、不再明显提升时，按一次Ctrl+C，程序在本次PPO更新结束后保存并打印checkpoint路径，再退出；连续第二次Ctrl+C为强制退出，只能使用之前已保存的文件。下一次`--resume`指向**新v4分支**的实际`--load_run`和刚保存的`--checkpoint model_N.pt`，去掉`--stair_sampling_migrate_v3`，把`--stair_sampling_stage`加一；表现明显恶化时减一。`--max_iterations`是本次追加训练轮数，若仍希望到40000轮，应设为`40000-N`。不要每次都重新指向原v3的model_2000。正式长训练仍由用户启动。
+
+自动模式为可选项，不要求高绝对成功率：在配比实际稳定后至少学习1000轮，用最近三个200轮窗口、相同几何/原阶高/原前缀/速度的足量回合统计拟合趋势；8项指标中至少5项趋稳、成功率也不再明显提升且无明显退化，连续两次复核才加一档。TensorBoard的0.9仅是显示平滑，不直接作用到200轮大窗口。若低于20%成功率且没有明显进步的任务组占上楼人口至少20%，或同条件成功率低于35%且没有明显进步，连续两次复核则退一档；被退回的档位需相关成功率至少改善5个百分点才自动重试，避免来回振荡。初始档不再降低几何配比，仍可通过原逐环境课程缩短前缀/降低阶高。样本不足会等待，不以缺数据当作零值或平台。具体阈值和诊断在`stair_path_readiness.py`与manifest中记录；这些判据已做CPU逻辑检查，训练效果尚待观察。
+
+28列、6个高度行共168个地形单元；10584环境下简单平均每列约378个、每列每高度行约63个环境，实际占用由采样配额和各环境独立高度课程决定。检查上述采样日志，以及 `general_flat_terrain_level_mean`、`general_boxes_terrain_level_mean`、`general_random_rough_terrain_level_mean`、两个坡面地形等级和各楼梯列的成功/缺阶/路径误差、横向速度与接触滑移。CPU检查命令为`python scripts/tools/check_stair_path_sampling.py`和`python scripts/tools/check_stair_path_readiness.py`，不加载策略checkpoint、不执行完整恢复或仿真。详细切换步骤见[操作说明](docs/test_docs/07_上楼步态校正/v1_20261023/stage9_v4/阶段切换与续训.md)。
 
 ## 代码与开发记录
 
