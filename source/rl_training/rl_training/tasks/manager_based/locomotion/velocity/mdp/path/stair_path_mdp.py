@@ -57,6 +57,11 @@ class PathPhysicsObserver(UnifiedPhysicsObserver):
             self.curriculum_type = EvidenceCourse
             from ..ascent.ascent_pairing import AlternatingPairLedger
             self.ledger_type = AlternatingPairLedger
+        if getattr(env.cfg, 'stair_ascent_rear_entry_v10', False):
+            from .stair_path_evidence import RearEntryEvidenceCourse
+            from ..ascent.ascent_pairing import RearEntryPairLedger
+            self.curriculum_type = RearEntryEvidenceCourse
+            self.ledger_type = RearEntryPairLedger
         super().__init__(env)
         self.path_max = torch.zeros(env.num_envs, device=env.device)
         self.path_signed = torch.zeros_like(self.path_max)
@@ -77,6 +82,10 @@ class PathPhysicsObserver(UnifiedPhysicsObserver):
         # Curriculum updates run before metrics. Keep the completed episode's
         # original row instead of attaching its outcome to a promoted row.
         self.episode_terrain_rows = env.scene.terrain.terrain_levels.clone()
+        if getattr(env.cfg,'ascent_practice_only_columns',()):
+            practice = terrain_adaptive.column_mask(env,env.cfg.ascent_practice_only_columns)
+            ascent_mdp.curriculum_state(env).skill[practice] = len(ProgressiveCourse.prefixes)-1
+            self.episode_goals = ascent_mdp.curriculum_state(env).goals().clone()
 
     def reset(self, ids):
         super().reset(ids)
@@ -108,6 +117,14 @@ class PathPhysicsObserver(UnifiedPhysicsObserver):
         slip_cost, lateral_slip, longitudinal_slip = contact_slip_cost(
             self.contact_tangent, self.contact_support, normal, descending)
         relative_yaw = yaw-ctrl.heading
+        # Publish the same route frame used by path feedback.  The ascent
+        # direction reward consumes this snapshot so its heading/lateral
+        # errors cannot silently use a second, command-integrated reference.
+        env._m20_stair_path_route_context = dict(
+            step=int(env.common_step_counter), error=error.detach(),
+            lateral_speed=speed.detach(), heading_error=torch.atan2(
+                torch.sin(relative_yaw), torch.cos(relative_yaw)).detach(),
+            active=active.detach())
         self.path_heading_total += torch.atan2(torch.sin(relative_yaw),torch.cos(relative_yaw)).abs()*active
         desired_side = command[:, 0]*torch.sin(relative_yaw)+ctrl.correction*torch.cos(relative_yaw)
         velocity_cost, return_target = return_velocity_cost(error, speed, desired_side)
@@ -279,7 +296,12 @@ def _observe_sampling_readiness(env, ids, iteration):
     if state.mode != 'auto':
         return
     observer = env._ascent_entry_observer
+    practice_columns = getattr(env.cfg, 'ascent_practice_only_columns', ())
+    practice_mask = (torch.isin(env.scene.terrain.terrain_types[ids],
+                                env.scene.terrain.terrain_types.new_tensor(practice_columns))
+                     if practice_columns else torch.zeros(len(ids), dtype=torch.bool, device=ids.device))
     selected = ids[(env.scene.terrain.terrain_types[ids] < layout.ASCENT_COLUMNS)
+                   & ~practice_mask
                    & (observer.path_samples[ids] > 0)]
     if not len(selected):
         return
@@ -340,6 +362,10 @@ def _resample_reset_terrains(env, ids, iteration):
         reset_ids = changed_ids[ascent_changed]
         state = ascent_mdp.curriculum_state(env)
         sampling.reset_ascent_progress(state, reset_ids)
+        if getattr(env.cfg,'ascent_practice_only_columns',()):
+            from .stair_path_height_practice import resample_height_practice
+            resample_height_practice(terrain,state,reset_ids,
+                torch.ones(len(reset_ids),dtype=torch.bool,device=env.device))
 
     descent_changed = ((old_changed >= layout.DESCENT_START) & (old_changed < layout.DESCENT_START + len(layout.DESCENT_COLUMNS)))
     descent_changed |= ((new_changed >= layout.DESCENT_START) & (new_changed < layout.DESCENT_START + len(layout.DESCENT_COLUMNS)))
@@ -368,11 +394,18 @@ def metrics(env, env_ids):
             from .stair_path_course_diagnostics import CourseDiagnostics
             if not hasattr(env,'_stair_path_course_diagnostics'):
                 env._stair_path_course_diagnostics = CourseDiagnostics(env.device)
+            # CourseDiagnostics keeps main and narrow practice rows in
+            # separate accumulators; pass both pools so practice remains
+            # observable without affecting the main aggregate.
             selected = ids[(terrain.terrain_types[ids] < layout.ASCENT_COLUMNS)
                            & (observer.path_samples[ids] > 0)]
             env._stair_path_course_diagnostics.observe(env,selected,iteration)
     for label, select in (('ascent', terrain_adaptive.ascent_mask(env)),
                           ('descent', terrain_adaptive.descent_mask(env))):
+        if label == 'ascent' and getattr(env.cfg, 'ascent_practice_only_columns', ()):
+            select = select & ~torch.isin(
+                terrain.terrain_types,
+                terrain.terrain_types.new_tensor(env.cfg.ascent_practice_only_columns))
         picked = ids[select[ids] & (observer.path_samples[ids] > 0)]
         count = len(picked); samples = observer.path_samples[picked].sum()
         for name, total, denominator in (
@@ -448,10 +481,12 @@ def metrics(env, env_ids):
                                ('descent', layout.DESCENT_COLUMNS),
                                ('non_stair', (*layout.FLAT_COLUMNS, *layout.GENERAL_COLUMNS))):
             result['sampling_actual_'+label+'_fraction'] = sum(counts[c] for c in columns)/env.num_envs
+        result['sampling_practice_fraction_of_ascent'] = sum(counts[c] for c in layout.NARROW_ASCENT_COLUMNS)/ascent_count
         result['sampling_pending_ascent_fraction'] = population.pending(targets)/ascent_count
         readiness.population_pending = result['sampling_pending_ascent_fraction']
         if readiness.mode == 'auto':
             ascent_ids = terrain.terrain_types < layout.ASCENT_COLUMNS
+            ascent_ids &= ~torch.isin(terrain.terrain_types,terrain.terrain_types.new_tensor(layout.NARROW_ASCENT_COLUMNS))
             readiness.population_long_fraction = float((ascent_mdp.curriculum_state(env).goals()[ascent_ids] == 18).float().mean())
         result.update({'sampling_readiness_'+name:value for name,value in readiness.telemetry().items()})
     return export_teacher_metrics(result, result.keys(), detailed=True)

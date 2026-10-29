@@ -127,7 +127,9 @@ class EntryPhysicsObserver:
         slip, support, face, normal, self.contact_tangent = contact_patch_velocity(robot.body_com_pos_w[:,self.wheels],
                     robot.body_com_lin_vel_w[:,self.wheels], robot.body_ang_vel_w[:,self.wheels], point, force, return_tangent=True)
         self.contact_slip, self.contact_support = slip, support
+        self.contact_face, self.contact_force = face, force
         point = torch.nan_to_num(point)
+        self.contact_point = point
         # Bounded pseudo-Huber: retain initial contact slip without letting a
         # single impact dominate all task progress rewards.
         self.window['slip'] += (torch.sqrt(1.+(slip/.2).square())-1.).clamp_max(8.)*support
@@ -240,6 +242,8 @@ def context(env):
     observer.action_delta_prev.copy_(delta)
     observer.action_age += 1
     w = observer.window
+    rear_face_cost = (w['face'][:,2:].amax(-1)/max(observer.substeps,1)
+                      *active*(.5+.5*entry))
     result = dict(entry=entry, active=active.float(), phase=phase,
                   phase_cost=phase_cost*entry,
                   landing_cost=(w['landing_inset_cost']+w['skip']).sum(-1)*entry/env.step_dt,
@@ -247,7 +251,8 @@ def context(env):
                   clearance_cost=clearance_cost*entry,
                   slip_cost=w['slip'].mean(-1)/max(observer.substeps,1)*active*(.5+.5*entry),
                   face_cost=w['face'].mean(-1)/max(observer.substeps,1)*active*(.5+.5*entry),
-                  continuity_cost=continuity*entry)
+                  continuity_cost=continuity*entry,
+                  rear_face_cost=rear_face_cost)
     observer.context_key, observer.cached = env.common_step_counter,result
     return result
 
@@ -258,6 +263,7 @@ def landing_bonus(env): return context(env)['landing_bonus']
 def clearance_cost(env): return context(env)['clearance_cost']
 def wheel_slip_cost(env): return context(env)['slip_cost']
 def riser_contact_cost(env): return context(env)['face_cost']
+def rear_riser_contact_cost(env): return context(env)['rear_face_cost']
 def entry_continuity_cost(env): return context(env)['continuity_cost']
 
 

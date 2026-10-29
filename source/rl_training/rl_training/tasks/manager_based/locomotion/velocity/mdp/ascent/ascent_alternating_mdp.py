@@ -27,7 +27,9 @@ class AlternatingPhysicsObserver(adaptive.AdaptivePhysicsObserver):
         self.combined_context_key = -1
         self.reward_gate_key = -1
         for key in ('front_swing_starts', 'rear_swing_starts', 'front_repeat_or_simultaneous',
-                    'rear_repeat_or_simultaneous', 'front_slip_cost', 'rear_slip_cost', 'lateral_max'):
+                    'rear_repeat_or_simultaneous', 'front_slip_cost', 'rear_slip_cost',
+                    'front_lateral_slip_cost', 'rear_lateral_slip_cost',
+                    'front_longitudinal_slip_cost', 'rear_longitudinal_slip_cost', 'lateral_max'):
             self.stats['alternating_'+key] = torch.zeros(env.num_envs, device=env.device)
 
     def reset(self, ids):
@@ -56,9 +58,22 @@ class AlternatingPhysicsObserver(adaptive.AdaptivePhysicsObserver):
         first = env.scene.env_origins[:, 0]+1.25
         pair_x = position[..., 0].reshape(-1, 2, 2).amax(-1)
         near = pair_x >= first[:, None]-.35
+        turn_options = {}
+        if getattr(self.sequence, 'rear_entry_transition', False):
+            grace = torch.zeros_like(near)
+            grace[:,1] = self.sequence.first_side[:,1] < 0
+            turn_options['repeat_grace'] = grace
+            soft = torch.zeros_like(near);soft[:,1] = True
+            turn_options['soft_repeat'] = soft
         turn = self.turns.update(self.support, position[..., 2],
-            data.body_com_lin_vel_w[:, self.wheels, 2], near, active & ~self.sequence.failed, env.physics_dt)
+            data.body_com_lin_vel_w[:, self.wheels, 2], near, active & ~self.sequence.failed, env.physics_dt, **turn_options)
         self.sequence.failed |= self.turns.failed & active
+        if getattr(self.sequence,'rear_entry_transition',False):
+            # Rear order affects gait acceptance/reward, never the physical
+            # completion label used by terrain demotion and success windows.
+            rear_bad = turn['soft_violation'][:,1] & active
+            self.sequence.style_failed |= rear_bad
+            self.sequence.rear_swing_style_failed |= rear_bad
         self.positive_gate = turn['valid'] & ~self.sequence.failed
         self.prefix_ready &= self.positive_gate
         self.top_ready &= self.positive_gate
@@ -73,7 +88,8 @@ class AlternatingPhysicsObserver(adaptive.AdaptivePhysicsObserver):
                           1.-2.*(q[:, 2].square()+q[:, 3].square()))
         costs = dense_costs(command[:, 0], data.root_lin_vel_w[:, 0],
             data.root_pos_w[:, 1]-env.scene.env_origins[:, 1], yaw,
-            self.contact_slip, self.contact_support, height, depth, progress, self.active_time)
+            self.contact_slip, self.contact_support, height, depth, progress, self.active_time,
+            tangent=self.contact_tangent)
         if getattr(env.cfg, 'stair_path_merge_entry_slip', False):
             from ..path.stair_path_objectives import merged_entry_slip_multiplier
             multiplier = merged_entry_slip_multiplier(progress)
@@ -91,7 +107,7 @@ class AlternatingPhysicsObserver(adaptive.AdaptivePhysicsObserver):
         values = dict(progress=forward/env.physics_dt/command[:, 0].clamp_min(.1)*self.positive_gate,
             stall=costs['stall'], front_slip=costs['front_slip'], rear_slip=costs['rear_slip'],
             lateral=costs['lateral'], heading=costs['heading'], cadence=cadence,
-            overdue=overdue, turn=turn['failed_now'].float())
+            overdue=overdue, turn=(turn['failed_now'] | turn['soft_violation'].any(-1)).float())
         for name, value in values.items():
             key = 'alternating_'+name
             if key not in self.window: self.window[key] = torch.zeros_like(value)
@@ -101,6 +117,8 @@ class AlternatingPhysicsObserver(adaptive.AdaptivePhysicsObserver):
         for i, pair in enumerate(('front', 'rear')):
             self.stats['alternating_'+pair+'_repeat_or_simultaneous'] += turn['violation'][:, i]
             self.stats['alternating_'+pair+'_slip_cost'] += costs[pair+'_slip']*active
+            self.stats['alternating_'+pair+'_lateral_slip_cost'] += costs[pair+'_lateral_slip']*active
+            self.stats['alternating_'+pair+'_longitudinal_slip_cost'] += costs[pair+'_longitudinal_slip']*active
         self.stats['alternating_lateral_max'] = torch.maximum(self.stats['alternating_lateral_max'],
             (data.root_pos_w[:, 1]-env.scene.env_origins[:, 1]).abs()*active)
 
@@ -151,7 +169,7 @@ def resolve_reward_params(env, source_params):
         cache.add(id(source_params))
 
 
-def positive_reward(env, source_func, source_params, require_progress=False):
+def positive_reward(env, source_func, source_params, require_progress=False, require_clean_landing=False):
     """Preserve original parameter resolution and gate every positive ascent term.
 
     Isaac resolves SceneEntityCfg only at the top level of term.params. Resolve
@@ -183,6 +201,11 @@ def positive_reward(env, source_func, source_params, require_progress=False):
             observer.moving_factor = torch.where(progress_required, 1.-grace+grace*moving, torch.ones_like(moving))
         observer.reward_gate_key = step
     value = torch.where(observer.reward_allowed | (value <= 0.), value, torch.zeros_like(value))
+    quality=getattr(observer,'landing_quality',None)
+    if require_clean_landing and quality is not None:
+        ascent=terrain_adaptive.ascent_mask(env)
+        clean=~quality.scrubbed.any((1,2))
+        value=torch.where(~ascent | clean | (value <= 0.),value,torch.zeros_like(value))
     if require_progress:
         # A stationary robot must not collect the old positive heading reward.
         value = torch.where(value > 0., value*observer.moving_factor, value)
@@ -268,7 +291,9 @@ def metrics(env, env_ids):
     ids = ids[terrain_adaptive.ascent_mask(env)[ids]]
     count = max(len(ids), 1)
     result = {key: observer.stats['alternating_'+key][ids].sum()/count
-              for key in ('front_swing_starts', 'rear_swing_starts', 'front_repeat_or_simultaneous', 'rear_repeat_or_simultaneous')}
+              for key in ('front_swing_starts', 'rear_swing_starts', 'front_repeat_or_simultaneous', 'rear_repeat_or_simultaneous',
+                          'front_lateral_slip_cost', 'rear_lateral_slip_cost',
+                          'front_longitudinal_slip_cost', 'rear_longitudinal_slip_cost')}
     result['positive_gate_fraction'] = observer.positive_gate[ids].float().sum()/count
     # Episode maxima are retained, alongside the inherited mean path diagnostic.
     result['lateral_episode_max_mean_m'] = observer.stats['alternating_lateral_max'][ids].sum()/count

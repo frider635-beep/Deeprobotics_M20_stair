@@ -20,6 +20,10 @@ class UnifiedPhysicsObserver(previous.AlternatingPhysicsObserver):
         self.failure_reason = torch.zeros(env.num_envs, device=env.device, dtype=torch.long)
         self.unified_context_key = -1
         self.pairing_diagnostics = None
+        self.landing_quality = None
+        if getattr(env.cfg,'stair_ascent_landing_quality_v12',False):
+            from .ascent_landing_quality import LandingQuality
+            self.landing_quality = LandingQuality(env.num_envs,env.device,env.cfg.ascent_sequence_step_count)
         if getattr(env.cfg, 'stair_ascent_pairing_v9', False):
             from .ascent_pairing import PairingDiagnostics
             self.pairing_diagnostics = PairingDiagnostics(env.num_envs,env.device,env.cfg.ascent_sequence_step_count)
@@ -29,6 +33,8 @@ class UnifiedPhysicsObserver(previous.AlternatingPhysicsObserver):
         self.failure_reason[ids] = 0; self.unified_context_key = -1
         if self.pairing_diagnostics is not None:
             self.pairing_diagnostics.reset(ids)
+        if self.landing_quality is not None:
+            self.landing_quality.reset(ids)
 
     def observe(self):
         env = self.env
@@ -36,6 +42,7 @@ class UnifiedPhysicsObserver(previous.AlternatingPhysicsObserver):
         if self.pairing_diagnostics is not None:
             resets = self.episode_reset_ids()
             if len(resets): self.pairing_diagnostics.reset(resets)
+            if len(resets) and self.landing_quality is not None: self.landing_quality.reset(resets)
         super().observe()
         data = env.scene['robot'].data
         command = env.command_manager.get_command('base_velocity')
@@ -52,7 +59,9 @@ class UnifiedPhysicsObserver(previous.AlternatingPhysicsObserver):
             first = env.scene.env_origins[:,0]+1.25
             guide,hold,clearance,state = pairing_guidance(self.sequence,self.turns,self.support,
                 self.stable_time,position,data.body_com_lin_vel_w[:,self.wheels,2],
-                first,self.first_floor,depth,height,goals,active)
+                first,self.first_floor,depth,height,goals,active,
+                velocity_x=data.body_com_lin_vel_w[:,self.wheels,0],
+                quality_guidance=self.landing_quality is not None)
             self.pairing_diagnostics.observe(state,self.sequence,position,first,depth,
                 self.active_time,env.physics_dt)
         overspeed = ((data.root_lin_vel_w[:, 0]-command[:, 0]-.10).clamp_min(0.)/.20).square().clamp_max(9.)
@@ -73,11 +82,19 @@ class UnifiedPhysicsObserver(previous.AlternatingPhysicsObserver):
             self.window['adaptive_'+key] *= self.positive_gate
         self.window['alternating_progress'] *= self.positive_gate
         if self.pairing_diagnostics is not None:
-            for key,value in dict(clearance=clearance,rear_paired=self.sequence.rear_paired_event,landing_order=self.sequence.style_event,rear_phase=state['rear_phase']).items():
+            rear_pair=(self.quality_events['rear_paired'] if self.landing_quality is not None
+                       else self.sequence.rear_paired_event)
+            impulses=dict(clearance=clearance,rear_paired=rear_pair,
+                landing_order=self.sequence.style_event,rear_phase=state['rear_phase'])
+            if self.landing_quality is not None:
+                impulses['rear_landing_credit']=self.quality_events['rear_credit']
+            for key,value in impulses.items():
                 name = 'ascent_pairing_'+key
                 if name not in self.window: self.window[name] = torch.zeros_like(value)
                 self.window[name] += value*active
             self.window['ascent_pairing_rear_paired'] *= self.positive_gate
+            if self.landing_quality is not None:
+                self.window['ascent_pairing_rear_landing_credit'] *= self.positive_gate
             # Local gait credit is blocked through a reversed pair and through
             # the policy tick containing its violation. Good later pairs can
             # learn again; heading, lateral and slip terms retain their gates.
@@ -86,6 +103,16 @@ class UnifiedPhysicsObserver(previous.AlternatingPhysicsObserver):
                 self.window['adaptive_'+key] *= style_gate
             self.window['alternating_progress'] *= style_gate
             self.window['ascent_pairing_rear_paired'] *= style_gate
+            if self.landing_quality is not None:
+                self.window['ascent_pairing_rear_landing_credit'] *= style_gate
+                # Forward pushing cannot replace clean landing credit. This
+                # is a reward-only gate; physical course evidence is untouched.
+                required=self.sequence.targets <= goals[:,None,None]
+                clean_episode=~(self.landing_quality.scrubbed & required).any((1,2))
+                self.window['alternating_progress'] *= clean_episode
+                clean_complete=(self.landing_quality.paid | ~required).all((1,2))
+                for key in ('top_front','top_rear','top_forward'):
+                    self.window['adaptive_'+key] *= clean_complete
             for key in ('top_front','top_rear','top_forward'):
                 self.window['adaptive_'+key] *= ~self.sequence.style_failed
         values = dict(landing_height=guide['height'], landing_horizontal=guide['horizontal'],
@@ -154,6 +181,8 @@ def metrics(env, env_ids):
         for label,numerator,denominator in (
                 ('rear_opportunity_coverage','rear_covered_attempts','rear_attempts'),
                 ('rear_mature_opportunity_coverage','rear_covered_mature_attempts','rear_mature_attempts'),
+                ('rear_tail_ordered_pair_quality','rear_tail_ordered_pairs','rear_tail_required_pairs'),
+                ('rear_tail_strict_success_rate','rear_tail_strict_success','rear_tail_evaluated'),
                 ('legacy_target_disagreement_fraction','legacy_spatial_target_disagreement_s','target_opportunity_s'),
                 *((f'rear_tread{tread}_{label}',f'rear_tread{tread}_{num}',f'rear_tread{tread}_{den}')
                   for tread in range(1,19) for label,num,den in (

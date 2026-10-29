@@ -125,6 +125,18 @@ def guidance_checks():
         torch.ones(2,4)*.1,position,torch.zeros(2),torch.ones(2)*.2)
     assert permission.reshape(2,2,2).sum(-1).eq(1).all()
     assert not torch.equal(permission[0],permission[1])
+    # The v10 transition guard holds both axles briefly after tread2 becomes
+    # stable, then releases the next target without changing physical ledger
+    # coverage.
+    locked = pair.AlternatingPairLedger(1,'cpu',targets=6)
+    locked.covered[:, :, :2] = True
+    locked.landing_time[:, :, 1] = .40
+    locked.time.fill_(.45)
+    state = pair.paired_targets(locked, torch.tensor([4]), torch.tensor([True]))
+    assert state['target'].eq(3).all() and state['transition_hold'].all()
+    assert state['hold_target'].eq(2).all()
+    locked.time.fill_(.55)
+    assert not pair.paired_targets(locked, torch.tensor([4]), torch.tensor([True]))['transition_hold'].any()
 
 
 def bridge_checks():
@@ -215,17 +227,21 @@ def migration_checks():
     evidence=loader.load_module(BASE+'path.stair_path_evidence')
     settings=dict(stair_path_reward_weights={'slip':-.4,'down_complete':2.},
         path_tracking_target='effective',path_velocity_target='return',contact_slip='support',merged_entry_slip='max')
-    prior=dict(m20_profile='ascent_entry_v1_stage9',refinement_version=pair.PREVIOUS_VERSION,
-        ascent_pairing=deepcopy(pair.V8_SETTINGS),stair_path_reward_settings=settings,
+    prior=dict(m20_profile='ascent_entry_v1_stage9',refinement_version=pair.V9_VERSION,
+        ascent_pairing=deepcopy(pair.V9_SETTINGS),course_evidence=deepcopy(evidence.SETTINGS),stair_path_reward_settings=settings,
         stair_path_reward_version='same',stair_path_config={'gain':.6},control_profile='same',
         descent_limits_action_units=[.18],descent_authority_schedule={'ramp':800},
         reward_weights={'ascent_entry_clearance':-.3,'heading':-.45,'front_slip':-.65,
-            'rear_slip':-.55,'stair_path_slip':-.4,'down_complete':2.,'ascent_rear_paired':.75,'ascent_landing_order':-.5})
-    target=dict(settings,version=pair.VERSION,ascent_pairing=deepcopy(pair.SETTINGS),course_evidence=deepcopy(evidence.SETTINGS),
+            'rear_slip':-.55,'stair_path_slip':-.4,'down_complete':2.,'ascent_rear_paired':.75,'ascent_landing_order':-.5,'ascent_rear_phase':-.15})
+    target=dict(settings,version=pair.VERSION,ascent_pairing=deepcopy(pair.SETTINGS),course_evidence=deepcopy(evidence.TRANSITION_SETTINGS),
+        narrow_ascent_practice=deepcopy(loader.load_module(BASE+'path.stair_path_layout').NARROW_ASCENT_SETTINGS),
+        ascent_height_practice=deepcopy(loader.load_module(BASE+'path.stair_path_height_practice').SETTINGS),
         **{k:prior[k] for k in ('stair_path_reward_version','stair_path_config','control_profile',
                               'descent_limits_action_units','descent_authority_schedule')})
-    weights=dict(prior['reward_weights'],ascent_rear_phase=-.15)
-    init.validate_ascent_pairing_resume(prior,target,weights,migrate=True,source='v8')
+    weights=dict(prior['reward_weights'],ascent_rear_paired=pair.REAR_PAIR_WEIGHT,
+        ascent_landing_order=pair.LANDING_ORDER_WEIGHT,ascent_rear_phase=pair.REAR_PHASE_WEIGHT,
+        ascent_rear_landing_credit=pair.LANDING_QUALITY_SETTINGS['rear_landing_credit_weight'])
+    init.validate_ascent_pairing_resume(prior,target,weights,migrate=True,source='v9')
     for field in ('heading','rear_slip','stair_path_slip','down_complete','ascent_landing_order'):
         bad=dict(weights);bad[field]*=.5
         try:init.validate_ascent_pairing_resume(prior,target,bad,migrate=True)
@@ -236,9 +252,16 @@ def migration_checks():
         except ValueError:pass
         else:raise AssertionError('protected control contract changed')
     native=dict(prior,refinement_version=pair.VERSION,reward_weights=weights,
-                ascent_pairing=deepcopy(pair.SETTINGS),course_evidence=deepcopy(evidence.SETTINGS))
+                narrow_ascent_practice=deepcopy(target['narrow_ascent_practice']),
+                ascent_height_practice=deepcopy(target['ascent_height_practice']),
+                ascent_pairing=deepcopy(pair.SETTINGS),course_evidence=deepcopy(evidence.TRANSITION_SETTINGS))
     init.validate_ascent_pairing_resume(native,target,weights)
-    for source in ('v5','v6'):
+    # The first v10 checkpoint predates the transition-hold manifest field;
+    # it must remain resumable into the hold-enabled v10 target.
+    old_native=dict(native,refinement_version=pair.V10_VERSION,ascent_pairing=deepcopy(pair.PREVIOUS_V10_SETTINGS))
+    old_native['ascent_pairing']['rear_entry_transition'].pop('stable_transition_hold_s',None)
+    init.validate_ascent_pairing_resume(old_native,target,weights,migrate=True,source='v10')
+    for source in ('v5','v6','v8'):
         try:init.validate_ascent_pairing_resume(prior,target,weights,migrate=True,source=source)
         except ValueError:pass
         else:raise AssertionError('wrong migration accepted')
@@ -273,7 +296,7 @@ def diagnostics_checks():
     assert values[2,field['rear_truncated_attempts']]==2
     course=loader.load_module(BASE+'path.stair_path_course')
     mdp=loader.load_module(BASE+'path.stair_path_course_diagnostics')
-    scene=perf.Scene();scene.terrain=NS(terrain_types=torch.zeros(n,dtype=torch.long))
+    scene=perf.Scene();scene.terrain=NS(terrain_types=torch.ones(n,dtype=torch.long))
     env=NS(_ascent_entry_observer=observer,_ascent_adaptive_curriculum=course.ProgressiveCourse(n,'cpu'),
         scene=scene,command_manager=NS(get_command=lambda _:torch.tensor([[.5,0.,0.]]).expand(n,-1)))
     aggregate=mdp.CourseDiagnostics('cpu');aggregate.observe(env,torch.arange(n),12000)
@@ -289,10 +312,12 @@ def diagnostics_checks():
 
 
 def observer_checks(baseline_root=None):
+    fixture_rng=torch.get_rng_state()
     env,observer=perf.fixture(loader,56,progressive=True,pairing=True)
     baseline=None
     if baseline_root:
         old=perf.load_source(baseline_root,'_m20_pairing_frozen_v6')
+        torch.set_rng_state(fixture_rng)
         old_env,old_observer=perf.fixture(old,56,progressive=True,pairing=True)
         baseline=(old,old_env,old_observer)
     modules = {name:loader.load_module(BASE+'ascent.'+name) for name in (
@@ -301,6 +326,7 @@ def observer_checks(baseline_root=None):
     masks=loader.load_module(BASE+'ascent.ascent_adaptive')
     comparisons=0
     for tick in range(1,65):
+        step_rng=torch.get_rng_state()
         perf.step(env,observer,tick)
         down=masks.descent_mask(env)
         assert pair.reward(env,'rear_paired')[down].eq(0).all()
@@ -309,6 +335,7 @@ def observer_checks(baseline_root=None):
         assert pair.reward(env,'rear_phase')[down].eq(0).all()
         if baseline:
             old,old_env,old_observer=baseline
+            torch.set_rng_state(step_rng)
             perf.step(old_env,old_observer,tick)
             before=perf.tensors(old_observer);after=perf.tensors(observer)
             for key,value in before.items():

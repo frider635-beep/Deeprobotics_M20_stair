@@ -84,6 +84,9 @@ class ReadinessSampler:
         # Invalid data must not silently become a small, apparently stable sample.
         if not valid.all() or values.shape != (len(columns), len(METRICS)) or not torch.isfinite(values).all():
             raise ValueError('Invalid readiness episode observations')
+        main = ~torch.isin(columns,columns.new_tensor(layout.NARROW_ASCENT_COLUMNS))
+        columns,rows,goals,speeds,values = (value[main] for value in (columns,rows,goals,speeds,values))
+        if not len(columns):return
         prefix = (goals[:,None] == prefixes).long().argmax(-1)
         indices = (((columns*SHAPE[1]+rows)*SHAPE[2]+prefix)*2+(speeds > .6).long())
         packed = torch.cat((torch.ones(len(columns), 1, device=values.device), values), -1)
@@ -209,7 +212,9 @@ class ReadinessSampler:
         # speeds and every geometry must retain sufficient comparable coverage.
         coverage = (count*common).sum((2,3))/count.sum((2,3)).clamp_min(1)
         usable = (coverage >= cfg.min_comparable_fraction).all((0,2)) & common.any((1,2)).all(-1)
-        if int(usable.sum()) < math.ceil(SHAPE[0]*cfg.min_geometry_fraction) or not all(
+        usable[list(layout.NARROW_ASCENT_COLUMNS)] = False
+        main_count = SHAPE[0]-len(layout.NARROW_ASCENT_COLUMNS)
+        if int(usable.sum()) < math.ceil(main_count*cfg.min_geometry_fraction) or not all(
                 usable[list(columns)].any() for columns in (
                     layout.ASCENT_EASY_COLUMNS,layout.ASCENT_MIDDLE_COLUMNS,layout.ASCENT_HARD_COLUMNS)):
             self.diagnostics = {'comparable_fraction_min':float(coverage.min())}
@@ -224,7 +229,7 @@ class ReadinessSampler:
         latest = scores[-1]
         diagnostics = dict(zip(METRICS, latest.tolist()))
         diagnostics['comparable_fraction_min'] = float(coverage[:,usable].min())
-        diagnostics['comparable_geometry_fraction'] = float(usable.double().mean())
+        diagnostics['comparable_geometry_fraction'] = float(usable.sum()/main_count)
         diagnostics['low_success_warning'] = float(latest[0] < cfg.low_success_warning)
         reasons = []
         x = torch.tensor([b['end'] for b in self.history],dtype=torch.float64)/1000

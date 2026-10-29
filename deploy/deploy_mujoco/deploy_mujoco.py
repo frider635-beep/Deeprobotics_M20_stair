@@ -42,6 +42,7 @@ from tensordict import TensorDict
 
 from keyboard_input import KEYPAD_MOTION, MOTION_KEYS, X11WindowKeys, launch_teleop_viewer
 from terrain_loader import PRESETS, STAIR_OVERRIDES, Terrain, attach_terrain, select_terrain
+from ascent_stop_hold import AscentStopHold, VERSION as ASCENT_STOP_VERSION
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -362,6 +363,7 @@ class M20Contract:
             raise ValueError("Model has no static group-0 terrain geometry for the height scan")
 
     def reset(self, data: mujoco.MjData, prone: bool = False) -> None:
+        if hasattr(self,'ascent_stop_hold'):self.ascent_stop_hold.reset()
         self._stop_reference = None
         self._stop_control_tick = None
         mujoco.mj_resetData(self.model, data)
@@ -741,6 +743,7 @@ class HeadingHoldController:
         self.reset()
 
     def reset(self) -> None:
+        if hasattr(self.contract,'ascent_stop_hold'):self.contract.ascent_stop_hold.reset()
         self.mode = "manual"
         self.target_yaw = 0.0
         self.target_xy = np.zeros(2, dtype=np.float64)
@@ -1071,13 +1074,97 @@ class StairPathHeadingHold(HeadingHoldController):
         return effective, info
 
 
-def make_heading_hold(contract, actor, enabled=True, legacy=None):
+def make_heading_hold(contract, actor, enabled=True, legacy=None, ascent_stop_enabled=True):
+    contract.ascent_stop_hold = AscentStopHold(DEFAULT_JOINT_POS,ACTION_SCALE,
+        enabled=ascent_stop_enabled and bool(getattr(actor,'uses_merged_ascent',False)))
     if legacy is None:
         legacy = use_checkpoint_control_profile(argparse.Namespace(legacy_heading_hold=False), actor)
     if getattr(actor, 'uses_path_control', False) or getattr(actor, 'uses_path_feedback', False):
         config = getattr(actor, 'm20_training_manifest', {}).get('stair_path_config')
         return StairPathHeadingHold(contract, enabled=enabled, legacy=legacy, config=config)
     return HeadingHoldController(contract, enabled=enabled, legacy=legacy)
+
+
+def ascent_static_support_effort(contract,data,support):
+    """Balance gravity with nonnegative vertical forces at loaded wheels.
+
+    This is a small static force solve, not an override of the simulator or
+    added world forces. Its joint torques become preload in the normal PD.
+    An infeasible support polygon leaves the controller in braking mode.
+    """
+    if np.count_nonzero(support) < 3:return None
+    model = contract.model
+    if not hasattr(contract,'_ascent_stop_scratch'):
+        contract._ascent_stop_scratch = mujoco.MjData(model)
+    scratch = contract._ascent_stop_scratch
+    scratch.qpos[:] = data.qpos;scratch.qvel[:] = 0.
+    mujoco.mj_forward(model,scratch)
+    columns = []
+    for body in contract.wheel_body_ids[support]:
+        point = scratch.xpos[body].copy();point[2] -= WHEEL_RADIUS
+        jac = np.zeros((3,model.nv))
+        mujoco.mj_jac(model,scratch,jac,None,point,int(body))
+        columns.append(jac[2])
+    jacobian = np.stack(columns,-1)
+    base = int(contract.root_joint.dofadr[0])
+    matrix = jacobian[base:base+6];gravity = scratch.qfrc_bias[base:base+6]
+    # Four wheels: enumerate the at most 15 active sets, avoiding another
+    # solver dependency and requiring nonnegative normal forces explicitly.
+    best = None
+    for bits in range(1,1 << len(columns)):
+        mask = np.array([bool(bits & (1 << i)) for i in range(len(columns))])
+        weight = np.linalg.lstsq(matrix[:,mask],gravity,rcond=None)[0]
+        if np.any(weight < -1.e-6):continue
+        force = np.zeros(len(columns));force[mask] = weight.clip(0.)
+        residual = np.linalg.norm(matrix@force-gravity)
+        score = residual+1.e-9*np.linalg.norm(force)
+        if best is None or score < best[0]:best = (score,residual,force)
+    if best is None or best[1] > .01:return None
+    effort = (scratch.qfrc_bias-jacobian@best[2])[contract.qvel_ids]
+    if np.max(np.abs(effort[:12])) > LEG_EFFORT_LIMIT*.95:return None
+    return effort
+
+
+def apply_ascent_stop_hold(contract,data,requested,action,heading_info):
+    """External hold for ascent raw-zero requests, including legacy path actors."""
+    control = getattr(contract,'ascent_stop_hold',None)
+    if control is None:return action,heading_info
+    # Descent/flat outputs retain the exact original policy/control path.
+    if contract.terrain.kind != 'ascent' or not control.enabled:
+        control.reset()
+        return action,dict(heading_info,**control.info)
+    if not control.active and np.max(np.abs(requested)) > 1.e-6:
+        control.reset()
+        return action,dict(heading_info,**control.info)
+    rotation = data.xmat[contract.base_id].reshape(3,3)
+    velocity = np.zeros(6)
+    mujoco.mj_objectVelocity(contract.model,data,mujoco.mjtObj.mjOBJ_BODY,
+        contract.base_id,velocity,1)
+    force,_,_,_ = wheel_ground_contact_wrenches(contract.model,data,contract.wheel_body_ids,
+        data.xpos[contract.base_id])
+    norm = np.linalg.norm(force,axis=-1)
+    support = (force[:,2] > 5.) & (force[:,2]/np.maximum(norm,1.e-6) > .7)
+    wheels = data.xpos[contract.wheel_body_ids]
+    start = contract.terrain.parameters['start_x'][0]
+    on_stairs = (start-.70 <= data.xpos[contract.base_id,0] <= contract.terrain.goal_x+.50
+        and any(contract.ground_height(data,float(w[0]),float(w[1])) > .05 for w in wheels)
+        and rotation[2,2] > .5)
+    eligible = on_stairs and (control.active or np.count_nonzero(support) >= 2)
+    yaw = math.atan2(rotation[1,0],rotation[0,0])
+    world_velocity = rotation@velocity[3:]
+    hold_effort = None
+    if (not control.legs_latched and np.max(np.abs(requested)) <= 1.e-6
+            and np.linalg.norm(world_velocity[:2]) < .30
+            and np.linalg.norm(velocity[:3]) < 1.2
+            and np.max(np.abs(data.qvel[contract.qvel_ids[:12]])) < 4.0):
+        hold_effort = ascent_static_support_effort(contract,data,support)
+    lateral = (wheels[:,:2]-data.xpos[contract.base_id,:2])@np.array([-math.sin(yaw),math.cos(yaw)])
+    result = control.update(float(data.time),np.asarray(requested),action,
+        data.xpos[contract.base_id,:2],world_velocity[:2],yaw,
+        horizontal_heading_rate(rotation,velocity[:3]),
+        data.qpos[contract.qpos_ids],data.qvel[contract.qvel_ids],
+        support,lateral,eligible,hold_effort=hold_effort)
+    return result,dict(heading_info,**control.info)
 
 
 class StairTelemetry:
@@ -1301,6 +1388,13 @@ def render_stair_telemetry(sample: dict, data: mujoco.MjData, contract: M20Contr
     for name, force, level in zip(StairTelemetry.LEG_NAMES, sample["wheel_forces"], sample["wheel_levels"]):
         norm = float(np.linalg.norm(force))
         lines.append(f"  {name} L{level}: [{force[0]:+7.1f}, {force[1]:+7.1f}, {force[2]:+7.1f}]  |F|={norm:7.1f}")
+    stop_info = sample["heading_hold"]
+    if stop_info.get("ascent_stop_hold_active", False):
+        lines.append(
+            f"上楼驻停={stop_info['ascent_stop_hold_phase']}  "
+            f"位置误差={stop_info['ascent_stop_hold_position_error_m']:.3f} m  "
+            f"承重轮={stop_info['ascent_stop_hold_support_wheels']}"
+        )
     wheel_torques = sample["wheel_motor_torques"]
     contact_moments = sample["wheel_contact_yaw_moments"]
     lines.append("轮电机力矩 / 轮地接触偏航力矩（相对机身基座，+为左转）:")
@@ -1431,6 +1525,13 @@ def export_stair_telemetry(samples: list[dict], args: argparse.Namespace) -> tup
             "rear_wheel_front_leg_contacts": sample["rear_wheel_front_leg_contacts"],
             "descent_drop_count": sample["descent_drop_count"],
         }
+        for key, default in (
+            ("active", False), ("phase", "inactive"), ("blend", 0.),
+            ("position_error_m", 0.), ("yaw_error_rad", 0.),
+            ("held_legs", 0), ("support_wheels", 0), ("version", ASCENT_STOP_VERSION),
+        ):
+            field = "ascent_stop_hold_" + key
+            row[field] = sample["heading_hold"].get(field, default)
         for key in StairTelemetry._empty_physics_window():
             row[key] = sample.get(key, 0)
         for group in ("leg", "wheel"):
@@ -1560,6 +1661,8 @@ def export_stair_telemetry(samples: list[dict], args: argparse.Namespace) -> tup
         f"- 遥测版本：`{TELEMETRY_VERSION}`；航向修正启用：`{not args.disable_heading_hold}`。",
         f"- 航向参数（kp, kd, limit, deadband）：flat={HEADING_HOLD_FLAT}，stairs={HEADING_HOLD_STAIRS}。",
         f"- 航向控制器：{'legacy_v1' if getattr(args, 'legacy_heading_hold', False) else 'filtered_v5'}；滤波 tau={HEADING_HOLD_FILTER_TAU}s，退出死区={math.degrees(HEADING_HOLD_EXIT_DEADBAND)}°，角速度进入/退出={HEADING_HOLD_RATE_ENTER}/{HEADING_HOLD_RATE_EXIT}rad/s，修正变化率 flat/stairs={HEADING_HOLD_SLEW_FLAT}/{HEADING_HOLD_SLEW_STAIRS}rad/s²。",
+        f"- 上楼零指令驻停：`{ASCENT_STOP_VERSION}`；命令行禁用：`{getattr(args, 'disable_ascent_stop_hold', False)}`；实际激活帧：{sum(row['ascent_stop_hold_active'] for row in rows)}，保持帧：{sum(row['ascent_stop_hold_phase'] == 'hold' for row in rows)}。",
+        "- `ascent_stop_hold_*` 独立记录制动、保持和恢复前进过渡；位置误差相对落稳时锁存位置，不能当作松键后的总位移；`held_legs` 为锁存腿数，`support_wheels` 才是当前承重轮数。",
         f"- 机器人模型：`{args.model.resolve()}`",
         f"- 地形：`{args.terrain_config.path}`（{args.terrain_config.kind}）",
         f"- 策略有效采样：{len(rows)} 帧，约 {duration:.2f} 秒；采样周期约 {POLICY_DT:.3f} 秒。",
@@ -1753,7 +1856,8 @@ def interactive_rollout(args: argparse.Namespace) -> dict:
     show_height_scan = True
     previous_action = np.zeros(ACTION_DIM, dtype=np.float32)
     heading_hold = make_heading_hold(contract, actor, enabled=not args.disable_heading_hold,
-                                         legacy=getattr(args, "legacy_heading_hold", False))
+        legacy=getattr(args, "legacy_heading_hold", False),
+        ascent_stop_enabled=not getattr(args,'disable_ascent_stop_hold',False))
     telemetry = StairTelemetry(contract)
     telemetry_samples = []
     records = {"time": [], "root_pos": [], "command": [], "requested_command": [],
@@ -1868,6 +1972,9 @@ def interactive_rollout(args: argparse.Namespace) -> dict:
                     raise RuntimeError(f"Invalid actor action at step {step}: {raw_action}")
                 blend = min(1.0, (data.time - policy_start) / 0.3)
                 applied_action = np.clip(raw_action * blend, -100.0, 100.0).astype(np.float32)
+                applied_action,heading_info = apply_ascent_stop_hold(
+                    contract,data,requested_command,applied_action,heading_info)
+                applied_action = applied_action.astype(np.float32)
                 previous_action = applied_action.copy()
             elif mode == "standing":
                 elapsed = data.time - stand_start
@@ -1997,7 +2104,8 @@ def rollout(args: argparse.Namespace) -> dict:
     print_deployment_contract(args)
     command = np.array([args.command_x, args.command_y, args.command_yaw], dtype=np.float32)
     heading_hold = make_heading_hold(contract, actor, enabled=not args.disable_heading_hold,
-                                         legacy=getattr(args, "legacy_heading_hold", False))
+        legacy=getattr(args, "legacy_heading_hold", False),
+        ascent_stop_enabled=not getattr(args,'disable_ascent_stop_hold',False))
     telemetry = StairTelemetry(contract)
     telemetry_samples = []
     previous_action = np.zeros(ACTION_DIM, dtype=np.float32)
@@ -2033,6 +2141,7 @@ def rollout(args: argparse.Namespace) -> dict:
             if action.shape != (ACTION_DIM,) or not np.isfinite(action).all():
                 raise RuntimeError(f"Invalid actor action at step {step}: {action}")
             action = np.clip(action, -100.0, 100.0)
+            action,heading_info = apply_ascent_stop_hold(contract,data,command,action,heading_info)
             records["time"].append(float(data.time))
             records["root_pos"].append(data.xpos[contract.base_id].copy())
             records["root_quat"].append(data.xquat[contract.base_id].copy())
@@ -2112,7 +2221,9 @@ def rollout(args: argparse.Namespace) -> dict:
 def print_deployment_contract(args: argparse.Namespace) -> None:
     print(f"[CONTROL] {TELEMETRY_VERSION} heading_hold={not args.disable_heading_hold} "
           f"controller={'legacy_v1' if getattr(args, 'legacy_heading_hold', False) else 'filtered_v5'} "
-          f"flat={HEADING_HOLD_FLAT} stairs={HEADING_HOLD_STAIRS}", flush=True)
+          f"flat={HEADING_HOLD_FLAT} stairs={HEADING_HOLD_STAIRS} "
+          f"ascent_stop_hold={not getattr(args, 'disable_ascent_stop_hold', False)} "
+          f"ascent_stop_version={ASCENT_STOP_VERSION}", flush=True)
 
 
 def command_profile_at(segments: list[dict], elapsed: float) -> np.ndarray:
@@ -2145,6 +2256,8 @@ def parse_args() -> argparse.Namespace:
                         help="JSON list of {duration_s, command:[vx,vy,wz]} for batch/autoplay replay")
     parser.add_argument("--disable-heading-hold", action="store_true",
                         help="Send raw commands for a controlled comparison; default enables heading hold")
+    parser.add_argument('--disable-ascent-stop-hold',action='store_true',
+        help='Disable the external ascent-only zero-command leg/wheel hold for A/B comparison')
     parser.add_argument("--legacy-heading-hold", action="store_true",
                         help="Use the previous unfiltered heading controller for an otherwise identical A/B replay")
     parser.add_argument("--steps", type=int, help="Limit to this many 50 Hz steps; viewer teleop runs until Esc by default")

@@ -84,6 +84,12 @@ parser.add_argument('--stair_ascent_migrate_v5', action='store_true',
                     help='Explicit Stage9 v5 -> v8 soft ascent rewards plus mastered-prefix floor; retain full training state.')
 parser.add_argument('--stair_ascent_migrate_v8', action='store_true',
                     help='Explicit Stage9 v8 -> v9 physical/graded gait course evidence and rear phase guidance.')
+parser.add_argument('--stair_ascent_migrate_v9', action='store_true',
+                    help='Explicit Stage9 v9 -> v10 rear entry transition and tread3 phase anchor.')
+parser.add_argument('--stair_ascent_migrate_v10', action='store_true',
+                    help='Explicit v10 -> v11 short-tread rear clearance and narrow-width practice; retain full training state.')
+parser.add_argument('--stair_ascent_migrate_v11', action='store_true',
+                    help='Explicit v11 -> v12 clean loaded landing rewards; retain full training state.')
 parser.add_argument('--stair_sampling_mode', choices=('manual','auto'), default=None,
                     help='Stage9 sampling control; fresh runs default to manual, resumes retain saved mode.')
 parser.add_argument('--stair_sampling_stage', type=int, default=None,
@@ -116,6 +122,21 @@ if args_cli.stair_ascent_migrate_v8 and (not args_cli.resume or args_cli.m20_pro
         or args_cli.stair_sampling_migrate_v3 or args_cli.stair_course_migrate_v4 or args_cli.stair_course_migrate_v5
         or args_cli.stair_ascent_migrate_v5 or args_cli.stair_ascent_migrate_v6):
     parser.error('--stair_ascent_migrate_v8 requires Stage9 --resume and no other migration flag')
+if args_cli.stair_ascent_migrate_v9 and (not args_cli.resume or args_cli.m20_profile != 'ascent_entry_v1_stage9'
+        or args_cli.stair_sampling_migrate_v3 or args_cli.stair_course_migrate_v4 or args_cli.stair_course_migrate_v5
+        or args_cli.stair_ascent_migrate_v5 or args_cli.stair_ascent_migrate_v6 or args_cli.stair_ascent_migrate_v8):
+    parser.error('--stair_ascent_migrate_v9 requires Stage9 --resume and no other migration flag')
+if args_cli.stair_ascent_migrate_v10 and (not args_cli.resume or args_cli.m20_profile != 'ascent_entry_v1_stage9'
+        or any((args_cli.stair_sampling_migrate_v3,args_cli.stair_course_migrate_v4,
+                args_cli.stair_course_migrate_v5,args_cli.stair_ascent_migrate_v5,
+                args_cli.stair_ascent_migrate_v6,args_cli.stair_ascent_migrate_v8,args_cli.stair_ascent_migrate_v9))):
+    parser.error('--stair_ascent_migrate_v10 requires Stage9 --resume and no other migration flag')
+if args_cli.stair_ascent_migrate_v11 and (not args_cli.resume or args_cli.m20_profile != 'ascent_entry_v1_stage9'
+        or any((args_cli.stair_sampling_migrate_v3,args_cli.stair_course_migrate_v4,
+                args_cli.stair_course_migrate_v5,args_cli.stair_ascent_migrate_v5,
+                args_cli.stair_ascent_migrate_v6,args_cli.stair_ascent_migrate_v8,
+                args_cli.stair_ascent_migrate_v9,args_cli.stair_ascent_migrate_v10))):
+    parser.error('--stair_ascent_migrate_v11 requires Stage9 --resume and no other migration flag')
 if args_cli.stair_sampling_mode is not None or args_cli.stair_sampling_stage is not None:
     if args_cli.m20_profile != 'ascent_entry_v1_stage9':
         parser.error('Sampling mode/stage arguments require --m20_profile ascent_entry_v1_stage9')
@@ -314,6 +335,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             env_cfg.stair_ascent_migrate_v6 = args_cli.stair_ascent_migrate_v6
             env_cfg.stair_ascent_migrate_v5 = args_cli.stair_ascent_migrate_v5
             env_cfg.stair_ascent_migrate_v8 = args_cli.stair_ascent_migrate_v8
+            env_cfg.stair_ascent_migrate_v9 = args_cli.stair_ascent_migrate_v9
+            env_cfg.stair_ascent_migrate_v10 = args_cli.stair_ascent_migrate_v10
+            env_cfg.stair_ascent_migrate_v11 = args_cli.stair_ascent_migrate_v11
             env_cfg.stair_path_sampling_mode = args_cli.stair_sampling_mode
             env_cfg.stair_path_sampling_stage = args_cli.stair_sampling_stage
         if args_cli.ascent_learning_rate is not None:
@@ -504,11 +528,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             from rl_training.algorithms.initialization.stair_path_init import validate_ascent_pairing_resume
             if profile_manifest.get('ascent_pairing'):
                 validate_ascent_pairing_resume(prior,profile_manifest,weights,
-                    migrate=args_cli.stair_ascent_migrate_v8 or args_cli.stair_ascent_migrate_v6 or args_cli.stair_ascent_migrate_v5,
-                    source=('v8' if args_cli.stair_ascent_migrate_v8 else 'v5' if args_cli.stair_ascent_migrate_v5 else 'v6'))
+                    migrate=args_cli.stair_ascent_migrate_v11 or args_cli.stair_ascent_migrate_v10 or args_cli.stair_ascent_migrate_v9 or args_cli.stair_ascent_migrate_v8 or args_cli.stair_ascent_migrate_v6 or args_cli.stair_ascent_migrate_v5,
+                    source=('v11' if args_cli.stair_ascent_migrate_v11 else 'v10' if args_cli.stair_ascent_migrate_v10 else 'v9' if args_cli.stair_ascent_migrate_v9 else 'v8' if args_cli.stair_ascent_migrate_v8 else 'v5' if args_cli.stair_ascent_migrate_v5 else 'v6'))
             if prior.get("refinement_version") != profile_manifest["version"]:
                 from rl_training.algorithms.initialization.stair_path_init import validate_sampling_only_migration, validate_course_migration
-                if args_cli.stair_ascent_migrate_v8 or args_cli.stair_ascent_migrate_v6 or args_cli.stair_ascent_migrate_v5:
+                if args_cli.stair_ascent_migrate_v11 or args_cli.stair_ascent_migrate_v10 or args_cli.stair_ascent_migrate_v9 or args_cli.stair_ascent_migrate_v8 or args_cli.stair_ascent_migrate_v6 or args_cli.stair_ascent_migrate_v5:
                     pass  # Explicit ascent-only migration was validated above.
                 elif args_cli.stair_course_migrate_v4 or args_cli.stair_course_migrate_v5:
                     validate_course_migration(prior,profile_manifest,
@@ -517,7 +541,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     validate_sampling_only_migration(prior,profile_manifest)
                 else:
                     raise ValueError('Revision mismatch; Stage9 v5 -> v6 requires --stair_course_migrate_v5 (v4 source uses --stair_course_migrate_v4)')
-                if not (args_cli.stair_ascent_migrate_v8 or args_cli.stair_ascent_migrate_v6 or args_cli.stair_ascent_migrate_v5) and prior.get('reward_weights') != weights:
+                if not (args_cli.stair_ascent_migrate_v11 or args_cli.stair_ascent_migrate_v10 or args_cli.stair_ascent_migrate_v9 or args_cli.stair_ascent_migrate_v8 or args_cli.stair_ascent_migrate_v6 or args_cli.stair_ascent_migrate_v5) and prior.get('reward_weights') != weights:
                     raise ValueError('Full-state course migration requires identical reward weights')
         # load previously trained model
         runner.load(resume_path)
@@ -674,6 +698,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             'tasks/manager_based/locomotion/velocity/mdp/path/stair_path_evidence.py',
             'tasks/manager_based/locomotion/velocity/mdp/path/stair_path_course_diagnostics.py',
             'tasks/manager_based/locomotion/velocity/mdp/ascent/ascent_pairing.py',
+            'tasks/manager_based/locomotion/velocity/mdp/ascent/ascent_landing_quality.py',
             'utils/iteration_stop.py',
             'utils/ppo_diagnostics.py',
             'tasks/manager_based/locomotion/velocity/mdp/path/stair_path_objectives.py',
@@ -760,6 +785,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             if profile_manifest.get('ascent_pairing'):
                 manifest['ascent_pairing'] = profile_manifest['ascent_pairing']
                 manifest['course_evidence'] = profile_manifest['course_evidence']
+                manifest['narrow_ascent_practice'] = profile_manifest['narrow_ascent_practice']
+                manifest['ascent_height_practice'] = profile_manifest['ascent_height_practice']
                 manifest['stair_ascent_migration'] = getattr(env.unwrapped,'_stair_ascent_migration',
                     source_manifest.get('stair_ascent_migration'))
             manifest['path_curriculum_seed'] = path_curriculum_seed

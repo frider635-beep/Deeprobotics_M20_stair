@@ -108,7 +108,7 @@ def main():
 
     # Preserve all provided episode labels and sufficient statistics exactly.
     acc=module.ReadinessSampler(mode='auto')
-    acc.observe(torch.tensor([0,0]),torch.tensor([0,1]),torch.tensor([2,4]),
+    acc.observe(torch.tensor([1,1]),torch.tensor([0,1]),torch.tensor([2,4]),
                 torch.tensor([.5,.7]),torch.tensor([[1,0,0,1,1,.01,.02,.01],[0,1,0,.5,.5,.1,.03,.02]]))
     assert acc.totals[:,0].sum()==2 and (acc.totals[:,0]>0).sum()==2
     assert torch.equal(clone(acc).totals,acc.totals)

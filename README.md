@@ -2,6 +2,8 @@
 
 [中文说明](README_CN.md) · Updated **2026-10-19**
 
+Stage9 v10 (2026-10-27) changes ascent rear entry only: treads1–2 allow a leader change, tread3 fixes the rear leader, and subsequent rear order errors use rewards and strict gait metrics rather than terrain promotion gates. Front order, descent objectives/control and network shapes are retained. After stopping the current v9 run and waiting for its checkpoint, use `OMP_NUM_THREADS=4 python scripts/tools/resume_stair_mastery.py` in the activated IsaacLab environment. See [v10 rules and resume](docs/test_docs/07_上楼步态校正/v1_20261023/stage9_v10/调整与续训.md).
+
 Current teacher engineering baseline: **v0**. This label preserves existing task/profile/checkpoint compatibility identifiers. See the [maintained tool list](scripts/tools/README.md).
 
 This M20 workspace builds on [DeepRoboticsLab/rl_training](https://github.com/DeepRoboticsLab/rl_training) and Isaac Lab. It includes wheeled pretraining, privileged stair-teacher training, MuJoCo deployment, telemetry, regression evaluation and an experimental perception-student interface.

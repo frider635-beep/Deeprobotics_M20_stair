@@ -1,7 +1,7 @@
-"""Stage9 v9 ascent-only pairing quality and rear same-tread phase guidance.
+"""Stage9 v12 clean loaded landing credit and short-tread clearance guidance.
 
 Neither actor inputs nor descent objectives consume this training-side state.
-Each axle independently follows L1,R1,L2,R2,... or its mirror for a full episode.
+Front keeps its full-flight leader; rear chooses one at tread3 after free entry.
 """
 import torch
 from .ascent_unified import PairedSequenceLedger
@@ -9,11 +9,15 @@ from .ascent_adaptive import landing_guidance
 from .ascent_entry_mdp import smooth01
 
 PREVIOUS_VERSION = 'm20_stair_path_fixed247_20261027_v8_soft_pairing'
-VERSION = 'm20_stair_path_fixed247_20261027_v9_course_evidence'
+V9_VERSION = 'm20_stair_path_fixed247_20261027_v9_course_evidence'
+V10_VERSION = 'm20_stair_path_fixed247_20261027_v10_rear_entry_transition'
+V11_VERSION = 'm20_stair_path_fixed247_20261028_v11_short_tread_rear'
+VERSION = 'm20_stair_path_fixed247_20261029_v12_clean_landing'
 SOURCE_VERSION = 'm20_stair_path_fixed247_20261027_v6_mastered_prefix_floor'
 REWARD_VERSION = 'ascent_pairing_20261027_v2'
-REAR_PAIR_WEIGHT = .75
-LANDING_ORDER_WEIGHT = -.5
+REAR_PAIR_WEIGHT = 1.0
+LANDING_ORDER_WEIGHT = -.65
+TRANSITION_HOLD_S = .08
 SETTINGS = dict(version=REWARD_VERSION, scope='ascent_only',
     target='unresolved_same_tread_per_axle_until_both_stably_supported',
     alternation='continuous_landing_and_swing_alternation_independent_per_axle',
@@ -30,8 +34,11 @@ SETTINGS = dict(version=REWARD_VERSION, scope='ascent_only',
 # Exact v8 contract for explicit migration; old running jobs retain this version.
 from copy import deepcopy
 V8_SETTINGS = deepcopy(SETTINGS)
+for _legacy in (V8_SETTINGS,):
+    _legacy['rear_pair_weight'] = .75
+    _legacy['landing_order']['weight'] = -.5
 REWARD_VERSION = 'ascent_pairing_20261027_v3'
-REAR_PHASE_WEIGHT = -.15
+REAR_PHASE_WEIGHT = -.20
 SETTINGS['version'] = REWARD_VERSION
 SETTINGS['landing_order']['promotion'] = 'physical_success_with_graded_per_axle_pair_quality'
 SETTINGS['landing_order']['demotion'] = 'physical_streak_and_low_recent_physical_success'
@@ -39,6 +46,40 @@ SETTINGS['rear_phase'] = dict(weight=REAR_PHASE_WEIGHT,start_tread=2,
     waiting='follower_on_previous_tread_until_original_leader_stably_lands_current_tread',
     ideal_order='same_episode_first_side_per_axle',dense_cost_cap=4.,
     existing_landing_target='waiting_rear_follower_uses_previous_tread_all_others_current')
+V9_SETTINGS = deepcopy(SETTINGS)
+V9_SETTINGS['rear_pair_weight'] = .75
+V9_SETTINGS['landing_order']['weight'] = -.5
+V9_SETTINGS['rear_phase']['weight'] = -.15
+REWARD_VERSION = 'ascent_pairing_20261027_v4_rear_entry_transition'
+SETTINGS['version'] = REWARD_VERSION
+SETTINGS['alternation'] = 'front_full_episode_rear_fixed_from_first_stable_tread3_landing'
+SETTINGS['landing_order']['leader'] = 'front_tread1_rear_tread3_fixed_independently'
+SETTINGS['rear_phase'].update(start_tread=3,
+    waiting='rear_tread3_anchor_follower_waits_for_same_leader_on_all_later_treads',
+    ideal_order='rear_free_entry_treads1_2_then_fixed_tread3_leader')
+SETTINGS['rear_entry_transition'] = dict(treads=[1,2],anchor_tread=3,
+    front='unchanged_full_episode',rear_swing_repeat_grace='until_first_stable_tread3_landing',
+    simultaneous_swing='still_failure',physical_tread_coverage='all_treads_still_required',
+    phase_reanchors_per_episode=1)
+SETTINGS['rear_entry_transition']['post_entry_repeat'] = 'soft_penalty_with_strict_gait_failure_no_physical_failure'
+SETTINGS['rear_entry_transition']['stable_transition_hold_s'] = TRANSITION_HOLD_S
+SETTINGS['landing_order']['promotion'] = 'physical_windows_with_retained_front_quality_rear_reward_only'
+SETTINGS['landing_order']['demotion'] = 'physical_failures_only_rear_style_does_not_fail_task'
+PREVIOUS_V10_SETTINGS = deepcopy(SETTINGS)
+PREVIOUS_V10_SETTINGS['rear_pair_weight'] = .75
+PREVIOUS_V10_SETTINGS['landing_order']['weight'] = -.5
+PREVIOUS_V10_SETTINGS['rear_phase']['weight'] = -.15
+V10_SETTINGS = deepcopy(SETTINGS)
+from .ascent_short_tread import SETTINGS as SHORT_TREAD_SETTINGS
+REWARD_VERSION = 'ascent_pairing_20261028_v5_short_tread_rear'
+SETTINGS['version'] = REWARD_VERSION
+SETTINGS['short_tread_rear'] = deepcopy(SHORT_TREAD_SETTINGS)
+V11_SETTINGS = deepcopy(SETTINGS)
+from .ascent_landing_quality import SETTINGS as LANDING_QUALITY_SETTINGS
+REWARD_VERSION = 'ascent_pairing_20261029_v6_clean_landing'
+REAR_PAIR_WEIGHT = LANDING_QUALITY_SETTINGS['rear_pair_weight']
+SETTINGS.update(version=REWARD_VERSION, rear_pair_weight=REAR_PAIR_WEIGHT,
+    landing_quality=deepcopy(LANDING_QUALITY_SETTINGS))
 
 
 class AlternatingPairLedger(PairedSequenceLedger):
@@ -86,6 +127,11 @@ class AlternatingPairLedger(PairedSequenceLedger):
         count = new_side.sum(-1)
         side = new_side.long().argmax(-1)
         first_landing = (self.first_side < 0) & (count == 1) & valid[:,None]
+        if getattr(self, 'rear_entry_transition', False):
+            # Rear entry has no fixed leader. Anchor only on the first stable
+            # tread3 landing, never again on subsequent treads.
+            third = physical_new[:,1,:,2] if self.covered.shape[-1] >= 3 else torch.zeros_like(new_side[:,1])
+            first_landing[:,1] &= third.sum(-1) == 1
         self.first_side = torch.where(first_landing,side,self.first_side)
         self.last_landing_side = torch.where((count == 1) & valid[:,None],side,self.last_landing_side)
         # Require the same leading side on every tread. This also permits a
@@ -96,6 +142,8 @@ class AlternatingPairLedger(PairedSequenceLedger):
         expected = torch.where(leader_done,1-self.first_side[:,:,None],self.first_side[:,:,None])
         sides = torch.arange(2,device=self.time.device)[None,None,:,None]
         wrong = (physical_new & (sides != expected[:,:,None])).any(2) & valid[:,None,None]
+        if getattr(self, 'rear_entry_transition', False):
+            wrong[:,1,:2] = False
         newly_bad = wrong & ~self.style_bad_treads
         self.style_bad_treads |= wrong
         self.style_failed |= newly_bad.any((1,2))
@@ -129,19 +177,49 @@ class AlternatingPairLedger(PairedSequenceLedger):
         return result
 
 
+class RearEntryPairLedger(AlternatingPairLedger):
+    """Front keeps its original leader; rear chooses its tail leader at tread3."""
+    rear_entry_transition = True
+
+    def __init__(self,*args,**kwargs):
+        super().__init__(*args,**kwargs)
+        self.rear_swing_style_failed = torch.zeros_like(self.failed)
+
+    def reset(self,ids):
+        super().reset(ids)
+        self.rear_swing_style_failed[ids] = False
+
+
 def paired_targets(ledger, goals, active):
     """One unresolved target per axle; a landed leader holds that exact tread."""
     required = ledger.targets[:,0] <= goals[:,None]
     pending = ~ledger.covered.reshape(-1,2,2,ledger.covered.shape[-1]).all(2) & required[:,None]
-    target = (pending.long().argmax(-1)+1).repeat_interleave(2,-1)
+    axle_target = pending.long().argmax(-1)+1
+    target = axle_target.repeat_interleave(2,-1)
     enabled = pending.any(-1).repeat_interleave(2,-1) & active[:,None] & ~ledger.failed[:,None]
     done = ledger.covered.gather(-1,(target-1)[:,:,None]).squeeze(-1)
+    # Add a short, explicit settling interval after the difficult 2->3 and
+    # 3->4 transitions. The physical ledger remains unchanged; this only
+    # prevents the guidance target from switching on the same tick that the
+    # previous pair becomes stable.
+    landing = ledger.landing_time.reshape(-1,2,2,ledger.covered.shape[-1])
+    pair_time = landing.amax(2)
+    previous = (axle_target-2).clamp_min(0)[:,:,None]
+    previous_time = pair_time.gather(-1,previous).squeeze(-1)
+    transition_hold_axle = (axle_target >= 3) & torch.isfinite(previous_time) & (
+        ledger.time[:,None]-previous_time < TRANSITION_HOLD_S)
+    transition_hold = transition_hold_axle.repeat_interleave(2,-1) & enabled
     result = dict(target=target, enabled=enabled, hold=done & enabled)
+    result['transition_hold'] = transition_hold
+    result['hold_target'] = torch.where(transition_hold, target-1, target)
     if hasattr(ledger,'first_side'):
         leader = ledger.first_side
         lead_index = leader.clamp_min(0)[:,:,None]
         leader_done = done.reshape(-1,2,2).gather(-1,lead_index).squeeze(-1)
         result['expected_side'] = torch.where(leader_done,1-leader,leader)
+        if getattr(ledger, 'rear_entry_transition', False):
+            result['rear_entry_free'] = (leader[:,1] < 0) & enabled[:,2:].any(-1)
+            result['expected_side'][:,1] = torch.where(leader[:,1] < 0,-1,result['expected_side'][:,1])
     return result
 
 
@@ -159,9 +237,13 @@ def swing_permissions(state, turns, support, stable_time, position, first, depth
     armed = turns.armed.reshape(n,2,2)
     ongoing = (last == sides) & ~armed & turns.seen_support.reshape(n,2,2) & ~hold & enabled
     x = position[...,0].reshape(n,2,2)
-    tie_side = (torch.arange(n,device=x.device)[:,None]+torch.arange(2,device=x.device))%2
+    tie_side = getattr(turns, 'tie_side',
+        (torch.arange(n,device=x.device)[:,None]+torch.arange(2,device=x.device))%2)
     first_side = torch.where((x[:,:,0]-x[:,:,1]).abs() > 1.e-5,x.argmax(-1),tie_side)
     next_side = torch.where(turns.last_side < 0,first_side,1-turns.last_side)
+    if 'rear_entry_free' in state:
+        free_side = torch.where(hold[:,:,0],1,torch.where(hold[:,:,1],0,first_side))
+        next_side[:,1] = torch.where(state['rear_entry_free'],free_side[:,1],next_side[:,1])
     mate_stable = ((stable_time >= .04-1.e-6) & support).reshape(n,2,2).flip(-1)
     start = (sides == next_side[:,:,None]) & ~ongoing.any(-1)[:,:,None]
     # Keep legal preparation active during the <20ms airborne confirmation
@@ -202,7 +284,8 @@ def rear_phase_state(ledger,state,position,first,floor,depth,height,active):
 
 
 def pairing_guidance(ledger, turns, support, stable_time, position, velocity_z,
-                     first, floor, depth, height, goals, active):
+                     first, floor, depth, height, goals, active, velocity_x=None,
+                     quality_guidance=False):
     state = paired_targets(ledger,goals,active)
     permission = swing_permissions(state,turns,support,stable_time,position,first,depth)
     target, enabled, hold = state['target'],state['enabled'],state['hold']
@@ -210,8 +293,13 @@ def pairing_guidance(ledger, turns, support, stable_time, position, velocity_z,
     # Only the rear follower awaiting the current leader uses the PREVIOUS
     # tread. Legal swings keep continuous current-target guidance.
     guide_target = torch.where(rear_wait,target-1,target)
+    guide_target = torch.where(state['transition_hold'],state['hold_target'],guide_target)
+    staged = None
+    if quality_guidance:
+        staged = enabled & ~hold & ~state['transition_hold'] & ~rear_wait
+        staged &= depth[:,None] <= .25+1.e-6
     guide = landing_guidance(position,velocity_z,guide_target,enabled,
-                             first,floor,depth,height)
+                             first,floor,depth,height,staged=staged,permission=permission)
     edge = first[:,None]+(target-1)*depth[:,None]
     offset = position[...,0]-edge
     bottom = position[...,2]-.09
@@ -220,12 +308,27 @@ def pairing_guidance(ledger, turns, support, stable_time, position, velocity_z,
     near = smooth01((offset+.35)/.25)*(offset < depth[:,None]+.09)
     prepare = ((top+.04-bottom).clamp_min(0.)/.10).square().clamp_max(4.)
     prepare *= (1.-blend)*near*permission*enabled*(depth[:,None] <= .25+1.e-6)
-    hold_cost = (((bottom-top)/.08).square()
-        +((offset-(depth[:,None]-.08)).clamp_min(0.)/.08).square()
+    from .ascent_short_tread import aggregate_rear_cost, rear_riser_cost
+    vx = torch.zeros_like(bottom) if velocity_x is None else velocity_x
+    rear_enabled = enabled[:,2:] & ~hold[:,2:] & ~state['transition_hold'][:,2:]
+    prepare[:,2:],rear_diagnostic = rear_riser_cost(offset[:,2:],bottom[:,2:],top[:,2:],
+        depth,rear_enabled,permission[:,2:] & ~rear_wait[:,2:],vx[:,2:])
+    state['short_rear'] = rear_diagnostic
+    hold_target = state.get('hold_target', target)
+    hold_edge = first[:,None]+(hold_target-1)*depth[:,None]
+    hold_top = floor[:,None]+hold_target*height[:,None]
+    hold_offset = position[...,0]-hold_edge
+    hold_bottom = position[...,2]-.09
+    hold_cost = (((hold_bottom-hold_top)/.08).square()
+        +((hold_offset-(depth[:,None]-.08)).clamp_min(0.)/.08).square()
         +(velocity_z.clamp_min(0.)/.3).square()).clamp_max(9.)
-    hold_cost = (hold_cost*hold).sum(-1)/hold.sum(-1).clamp_min(1)
+    hold_mask = hold | state['transition_hold']
+    hold_cost = (hold_cost*hold_mask).sum(-1)/hold_mask.sum(-1).clamp_min(1)
     state.update(offset=offset,permission=permission,rear_wait=rear_wait,rear_phase=rear_phase)
-    return guide,hold_cost,prepare.sum(-1),state
+    # Preserve the all-wheel sum and add the worst rear-wheel term so a single
+    # HR/HL clearance failure remains visible to the scalar reward.
+    clearance = prepare[:,:2].sum(-1) + aggregate_rear_cost(prepare[:,2:])
+    return guide,hold_cost,clearance,state
 
 
 DIAGNOSTIC_FIELDS = ('pairing_attempts','pairing_mature_attempts','pairing_covered_attempts',
@@ -241,6 +344,17 @@ DIAGNOSTIC_FIELDS = ('pairing_attempts','pairing_mature_attempts','pairing_cover
     *(f'first_style_tread{tread}_count' for tread in range(1,19)),
     *(f'rear_tread{tread}_{kind}' for tread in range(1,19)
       for kind in ('attempts','mature_attempts','covered_attempts','covered_mature_attempts')))
+DIAGNOSTIC_FIELDS += ('rear_tail_required_pairs','rear_tail_ordered_pairs','rear_tail_evaluated',
+    'rear_tail_strict_success','rear_tread3_anchor_set','rear_post_entry_swing_violation',
+    *(f'rear_tread{tread}_order_violation' for tread in range(1,19)),
+    *(f'rear_tread{tread}_ordered_pair' for tread in range(1,19)),
+    'first_side_front_left','first_side_front_right',
+    'first_side_rear_left','first_side_rear_right')
+SHORT_REAR_FIELDS = ('short_rear_near_wheel_s','short_rear_deficit_m_wheel_s',
+    'short_rear_permitted_wheel_s','short_rear_low_approach_wheel_s')
+DIAGNOSTIC_FIELDS += SHORT_REAR_FIELDS
+from .ascent_landing_quality import DIAGNOSTIC_FIELDS as QUALITY_FIELDS
+DIAGNOSTIC_FIELDS += QUALITY_FIELDS
 
 
 class PairingDiagnostics:
@@ -249,10 +363,12 @@ class PairingDiagnostics:
         self.mature = torch.zeros_like(self.started,dtype=torch.bool)
         self.disagreement = torch.zeros(count,device=device)
         self.opportunity_frames = torch.zeros_like(self.disagreement)
+        self.short_rear = torch.zeros(count,len(SHORT_REAR_FIELDS),device=device)
 
     def reset(self,ids):
         self.started[ids] = float('inf'); self.mature[ids] = False
         self.disagreement[ids] = 0; self.opportunity_frames[ids] = 0
+        self.short_rear[ids] = 0
 
     def observe(self,state,ledger,position,first,depth,time,dt):
         index = (state['target']-1)[:,:,None]
@@ -268,6 +384,11 @@ class PairingDiagnostics:
         spatial = (torch.floor((position[...,0]-first[:,None])/depth[:,None])+2).clamp(1,18)
         self.disagreement += ((spatial != state['target']) & opportunity).sum(-1)*dt
         self.opportunity_frames += opportunity.sum(-1)*dt
+        if 'short_rear' in state:
+            rear = state['short_rear']; near = rear['near']
+            self.short_rear += torch.stack((near.sum(-1),
+                (rear['deficit']*near).sum(-1),(rear['permitted'] & near).sum(-1),
+                rear['low_approach'].sum(-1)),-1)*dt
 
     def values(self,observer,ids):
         ledger = observer.sequence
@@ -296,7 +417,22 @@ class PairingDiagnostics:
             *(value for tread in range(18) for value in (
                 rear[:,:,tread].sum(-1),rear_mature[:,:,tread].sum(-1),rear_covered[:,:,tread].sum(-1),
                 (rear_covered[:,:,tread] & rear_mature[:,:,tread]).sum(-1))))
-        return torch.stack((*values,*extra),-1)[ids].float()
+        tail_required = required[:,0] & (ledger.targets[:,0] >= 3)
+        tail_ordered = ledger.rear_pair_paid & ~ledger.style_bad_treads[:,1] & tail_required
+        tail_evaluated = observer.episode_goals >= 4
+        rear_swing_bad = getattr(ledger,'rear_swing_style_failed',torch.zeros_like(ledger.failed))
+        tail_clean = (tail_ordered | ~tail_required).all(-1) & tail_evaluated & ~rear_swing_bad
+        tail = (tail_required.sum(-1),tail_ordered.sum(-1),tail_evaluated,
+            physical & tail_clean,ledger.first_side[:,1] >= 0,rear_swing_bad,
+            *ledger.style_bad_treads[:,1].unbind(-1),
+            *(ledger.rear_pair_paid & ~ledger.style_bad_treads[:,1] & required[:,0]).unbind(-1),
+            (ledger.first_side[:,0] == 0).float(), (ledger.first_side[:,0] == 1).float(),
+            (ledger.first_side[:,1] == 0).float(), (ledger.first_side[:,1] == 1).float())
+        base = torch.cat((torch.stack((*values,*extra,*tail),-1).float(),self.short_rear),-1)[ids]
+        quality = getattr(observer,'landing_quality',None)
+        detail = (quality.diagnostics(ids) if quality is not None else
+                  torch.zeros(len(ids),len(QUALITY_FIELDS),device=base.device))
+        return torch.cat((base,detail),-1)
 
 
 def reward(env,name):
@@ -306,9 +442,9 @@ def reward(env,name):
     command = env.command_manager.get_command('base_velocity')
     active = ascent_mask(env) & (command[:,0] > .1) & (command[:,1:].abs().amax(-1) < .1)
     value = observer.window.get('ascent_pairing_'+name,torch.zeros(env.num_envs,device=env.device))
-    if name == 'rear_paired':
+    if name in ('rear_paired','rear_landing_credit'):
         active &= observer.positive_gate & ~observer.sequence.failed
         if hasattr(observer,'path_failed'):
             active &= ~observer.path_failed
-    divisor = env.step_dt if name in ('rear_paired','landing_order') else max(observer.substeps,1)
+    divisor = env.step_dt if name in ('rear_paired','rear_landing_credit','landing_order') else max(observer.substeps,1)
     return value/divisor*active

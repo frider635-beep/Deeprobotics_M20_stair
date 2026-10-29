@@ -132,7 +132,8 @@ def main():
     assert metrics['sampling_stage'] == 10
     assert metrics['sampling_pending_ascent_fraction'] == 0.
     assert mdp._sampling_population(env).current == torch.bincount(terrain.terrain_types,minlength=28).tolist()
-    assert abs(metrics['sampling_target_hard_fraction']-1./3) < 1.e-12
+    expected_hard = sum(sampling.probabilities_at(21000,ready)[c] for c in layout.ASCENT_HARD_COLUMNS)/layout.ASCENT_FRACTION
+    assert abs(metrics['sampling_target_hard_fraction']-expected_hard) < 1.e-12
     assert all(torch.isfinite(torch.tensor(value)) for value in metrics.values())
     # Exercise the environment -> scheduler adapter with ORIGINAL episode rows
     # and goals, even when the live curriculum has already advanced.
@@ -150,7 +151,9 @@ def main():
     selected=all_ids[terrain.terrain_types<9][:50]
     mdp._observe_sampling_readiness(env,selected,21000)
     bins=ready.totals.reshape(9,6,len(ready.state_dict()['prefixes']),2,9)
-    assert bins[...,0].sum()==50 and bins[:,1:,...,0].sum()==0
+    expected = (~torch.isin(terrain.terrain_types[selected],torch.tensor(layout.NARROW_ASCENT_COLUMNS))).sum()
+    assert bins[...,0].sum()==expected and bins[:,1:,...,0].sum()==0
+    assert not bins[list(layout.NARROW_ASCENT_COLUMNS)].any()
     # Evaluation keeps its own course/goal assignment even at a different phase.
     env.cfg.ascent_adaptive_training = False
     env.common_step_counter = 0

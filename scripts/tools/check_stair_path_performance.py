@@ -30,7 +30,7 @@ class Scene(dict):
     pass
 
 
-def fixture(loader, count, progressive=False, pairing=False):
+def fixture(loader, count, progressive=False, pairing=False, rear_entry=False, landing_quality=False):
     mdp = loader.load_module(PREFIX+'path.stair_path_mdp')
     scene = Scene()
     scene.env_origins = torch.zeros(count, 3)
@@ -45,6 +45,8 @@ def fixture(loader, count, progressive=False, pairing=False):
         cfg=NS(ascent_entry_depth=.30, ascent_entry_height=.15, ascent_sequence_step_count=18,
                m20_refinement_profile='ascent_entry_v1_stage9' if progressive else None,
                stair_ascent_pairing_v9=pairing, stair_ascent_pairing_v8=pairing, stair_ascent_pairing_v7=pairing,
+               stair_ascent_rear_entry_v10=rear_entry,
+               stair_ascent_landing_quality_v12=landing_quality,
                ascent_adaptive_geometry=True, ascent_adaptive_training=True,
                ascent_adaptive_height_grid=[[.1+.03*r]*28 for r in range(6)],
                ascent_adaptive_depth_grid=[[.20+.05*(c%4) for c in range(28)]]*6,

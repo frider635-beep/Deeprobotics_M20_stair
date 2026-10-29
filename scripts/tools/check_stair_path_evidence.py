@@ -173,17 +173,21 @@ def integration():
     # Validate actual launch metadata without loading any policy file.
     import json
     from copy import deepcopy
-    run=ROOT/'logs/rsl_rl/deeprobotics_m20_stair_teacher_v1_stage2/2026-10-27_13-52-28_ascent_entry_v1_stage9_v8'
+    run=ROOT/'logs/rsl_rl/deeprobotics_m20_stair_teacher_v1_stage2/2026-10-27_16-40-32_ascent_entry_v1_stage9_v9'
     manifest=run/'params/launch_manifest.json'
     if manifest.exists():
         prior=json.loads(manifest.read_text())
         target=dict(prior['stair_path_reward_settings'],version=p.VERSION,
-            ascent_pairing=deepcopy(p.SETTINGS),course_evidence=deepcopy(e.SETTINGS),
+            ascent_pairing=deepcopy(p.SETTINGS),course_evidence=deepcopy(e.TRANSITION_SETTINGS),
+            narrow_ascent_practice=deepcopy(m.loader.load_module(m.BASE+'path.stair_path_layout').NARROW_ASCENT_SETTINGS),
+            ascent_height_practice=deepcopy(m.loader.load_module(m.BASE+'path.stair_path_height_practice').SETTINGS),
             **{k:prior[k] for k in ('stair_path_reward_version','stair_path_config','control_profile',
                                   'descent_limits_action_units','descent_authority_schedule')})
-        weights=dict(prior['reward_weights'],ascent_rear_phase=p.REAR_PHASE_WEIGHT)
+        weights=dict(prior['reward_weights'],ascent_rear_paired=p.REAR_PAIR_WEIGHT,
+            ascent_landing_order=p.LANDING_ORDER_WEIGHT,ascent_rear_phase=p.REAR_PHASE_WEIGHT,
+            ascent_rear_landing_credit=p.LANDING_QUALITY_SETTINGS['rear_landing_credit_weight'])
         init=m.loader.load_module('algorithms.initialization.stair_path_init')
-        init.validate_ascent_pairing_resume(prior,target,weights,migrate=True,source='v8')
+        init.validate_ascent_pairing_resume(prior,target,weights,migrate=True,source='v9')
 
 
 def main():

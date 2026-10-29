@@ -8,6 +8,8 @@ from .ascent_sequence_mdp import orientation
 from . import ascent_adaptive as adaptive
 from .ascent_adaptive import StrictSequenceLedger, ContactCurriculum, geometry, landing_guidance, REFERENCE_COLUMNS, DEADLINES
 
+METRICS_VERSION = 'ascent_adaptive_metrics_main_practice_v1'
+
 
 def curriculum_state(env):
     if not hasattr(env, '_ascent_adaptive_curriculum'):
@@ -72,6 +74,18 @@ class AdaptivePhysicsObserver(Stage2PhysicsObserver):
         blend = ((command[:, 0]-.5)/.2).clamp(0., 1.)
         period = torch.lerp(self.periods[0], self.periods[1], blend)*(depth/.30)
         period *= (.5/command[:, 0].clamp_min(.3)).clamp(1., 1.67)
+        quality=getattr(self,'landing_quality',None)
+        if quality is not None:
+            from .ascent_pairing import paired_targets, swing_permissions, rear_phase_state
+            state=paired_targets(self.sequence,goals,active)
+            permission=swing_permissions(state,self.turns,self.support,self.stable_time,
+                position,first,depth)
+            state['rear_wait'],_=rear_phase_state(self.sequence,state,position,first,
+                self.first_floor,depth,height,active)
+            quality.observe(state,permission,position,data.body_com_lin_vel_w[:,self.wheels,2],
+                self.support,self.contact_face,self.contact_force,self.contact_slip,
+                level,first,self.first_floor,depth,height,active,env.physics_dt,
+                contact_point=self.contact_point)
         events = self.sequence.update_strict(level, self.support, position[..., 0], first,
                                              active, env.physics_dt, goals, period)
         self.active_time += active*env.physics_dt
@@ -87,12 +101,19 @@ class AdaptivePhysicsObserver(Stage2PhysicsObserver):
         if getattr(env.cfg,'stair_ascent_pairing_v9',False):
             from .ascent_pairing import paired_targets
             paired = paired_targets(self.sequence,goals,active)
-            target = paired['target'][:,:2]
+            target = torch.where(paired['transition_hold'][:,:2],
+                                 paired['hold_target'][:,:2], paired['target'][:,:2])
             enabled = paired['enabled'][:,:2] & ~paired['hold'][:,:2]
         enabled &= target <= goals[:, None]
         guide = landing_guidance(position[:, :2], data.body_com_lin_vel_w[:, self.wheels[:2], 2],
                                  target, enabled, first, self.first_floor, depth, height)
-        credit = self.sequence.landing_credit(target, guide['error'], guide['inside'], events['new_mask'])
+        if quality is None:
+            credit = self.sequence.landing_credit(target, guide['error'], guide['inside'], events['new_mask'])
+        else:
+            self.quality_events=quality.credit(self.sequence,events['valid'],goals)
+            events.update({key:self.quality_events[key] for key in ('ordered','dwell','new_mask')})
+            events['paired']=self.quality_events['front_paired']
+            credit=self.quality_events['front_credit']
         valid = events['valid']
         required = self.sequence.targets <= goals[:, None, None]
         pair_done = (self.sequence.pair_paid | ~required[:, 0]).all(-1)
@@ -133,6 +154,9 @@ class AdaptivePhysicsObserver(Stage2PhysicsObserver):
             self.action_history.copy_(action); self.action_delta.copy_(delta)
             self.adaptive_action_age += 1; self.adaptive_action_step = env.common_step_counter
         weights = position.new_tensor([1.5, 1.5, 1., 1.])
+        if quality is not None:
+            from .ascent_landing_quality import SETTINGS
+            weights = weights.new_tensor([1.5,1.5,SETTINGS['rear_ordered_multiplier'],SETTINGS['rear_ordered_multiplier']])
         values = dict(ordered=(events['ordered']*weights).sum(-1),
             missing=(events['missing']*weights).sum(-1), dwell=(events['dwell']*weights).sum(-1),
             paired=events['paired'], failure=events['failure'], early=events['early_advance'],
@@ -225,6 +249,11 @@ def curriculum(env, env_ids):
     ids = torch.arange(env.num_envs, device=env.device) if env_ids is None else torch.as_tensor(env_ids, device=env.device, dtype=torch.long)
     terrain = env.scene.terrain
     ids = ids[adaptive.ascent_mask(env)[ids]]
+    practice_columns = getattr(env.cfg,'ascent_practice_only_columns',())
+    if not getattr(env.cfg,'ascent_adaptive_training',True):practice_columns = ()
+    practice = adaptive.column_mask(env,practice_columns)[ids]
+    practice_ids = ids[practice]
+    ids = ids[~practice]
     if observer is not None and len(ids):
         reference = torch.zeros(len(ids), device=env.device, dtype=torch.bool)
         for column in adaptive.reference_columns(env): reference |= terrain.terrain_types[ids] == column
@@ -236,42 +265,83 @@ def curriculum(env, env_ids):
         if getattr(env.cfg,'stair_ascent_pairing_v9',False):
             from ..path.stair_path_evidence import pair_quality
             quality,second=pair_quality(observer.sequence,observer.episode_goals)
-            options.update(pair_quality=quality[ids],rear_second_quality=second[ids])
+            rear_key = 'rear_tail_quality' if getattr(observer.sequence,'rear_entry_transition',False) else 'rear_second_quality'
+            options.update(pair_quality=quality[ids],**{rear_key:second[ids]})
         up, down = state.update(ids, success, eligible, terrain.terrain_levels[ids], reference,
                                 getattr(env.cfg, 'ascent_adaptive_training', True), **options)
         terrain.update_env_origins(ids, up, down)
+    if observer is not None and len(practice_ids):
+        from ..path.stair_path_height_practice import resample_height_practice
+        resample_height_practice(terrain,state,practice_ids,
+            observer.stats['physics_samples'][practice_ids] > 0)
     height, depth = geometry(env)
     select = adaptive.ascent_mask(env)
-    mean = lambda x: x[select].float().mean() if select.any() else torch.zeros((), device=env.device)
-    return dict(skill_mean=mean(state.skill), terrain_level_mean=mean(terrain.terrain_levels),
-                step_height_m=mean(height), tread_depth_m=mean(depth))
+    practice = (adaptive.column_mask(env, practice_columns) & select) if practice_columns else torch.zeros_like(select)
+    main = select & ~practice
+    mean = lambda x, mask: x[mask].float().mean() if mask.any() else torch.zeros((), device=env.device)
+    result = dict(skill_mean=mean(state.skill, main), terrain_level_mean=mean(terrain.terrain_levels, main),
+                  step_height_m=mean(height, main), tread_depth_m=mean(depth, main))
+    if practice_columns:
+        count = practice.sum().clamp_min(1)
+        result['practice_skill_mean'] = (state.skill*practice).sum()/count
+        result['practice_terrain_level_mean'] = (terrain.terrain_levels*practice).sum()/count
+        result['height_practice_mean_m'] = (height*practice).sum()/count
+        for row,h in enumerate(adaptive.HEIGHTS):
+            result[f'height_practice_h{int(round(h*100)):02d}_fraction'] = (
+                practice & (terrain.terrain_levels == row)).sum()/count
+        for column in adaptive.reference_columns(env):main &= terrain.terrain_types != column
+        result['main_course_height_mean_m'] = (height*main).sum()/main.sum().clamp_min(1)
+    return result
 
 
 def metrics(env, env_ids):
     observer = getattr(env, '_ascent_entry_observer', None)
     if observer is None: return {}
-    ids = torch.arange(env.num_envs, device=env.device)
-    if env_ids is not None: ids = ids[env_ids]
-    ids = ids[adaptive.ascent_mask(env)[ids]]
-    count = max(len(ids), 1); ledger = observer.sequence
-    result = {key: observer.stats['adaptive_'+key][ids].sum()/count
-              for key in ('pairs', 'ordered', 'missing', 'early', 'failure', 'landing_credit')}
-    for wheel, index, tread in [('FL2', 0, 1), ('FR1', 1, 0)]:
-        result[wheel+'_covered'] = ledger.covered[ids, index, tread].float().sum()/count
-        result[wheel+'_best_dwell_s'] = ledger.best_dwell[ids, index, tread].sum()*.04/count
-        result[wheel+'_support_frames'] = observer.stats['adaptive_'+wheel+'_support_frames'][ids].sum()/count
-        result[wheel+'_longest_support_ms'] = observer.stats['adaptive_'+wheel+'_longest_support_s'][ids].sum()*1000./count
-    goals = getattr(observer, 'episode_goals', curriculum_state(env).goals())[ids]
-    required = ledger.targets <= goals[:, None, None]
-    denominator = goals.sum().clamp_min(1.)
-    result['front_current_prefix_coverage'] = (ledger.covered[ids, :2]*required).float().sum()/(2.*denominator)
-    result['front_same_tread_sequential_current_prefix'] = (ledger.pair_paid[ids]*required[:, 0]).float().sum()/denominator
-    result['prefix_success_fraction'] = finished(env)[ids].float().sum()/count
-    result['front_first_four_coverage'] = ledger.covered[ids, :2, :4].float().sum()/(count*8)
-    result['front_same_tread_sequential_first_four'] = ledger.pair_paid[ids, :4].float().sum()/(count*4)
-    full_four = goals >= 4
-    result['__weighted_total__/front_first_four_coverage_opportunity'] = ledger.covered[ids[full_four], :2, :4].float().sum()
-    result['__weighted_count__/front_first_four_coverage_opportunity'] = full_four.sum()*8.
-    result['__weighted_total__/target_height_error_abs_m'] = observer.stats['adaptive_height_total'][ids].sum()
-    result['__weighted_count__/target_height_error_abs_m'] = observer.stats['adaptive_opportunity'][ids].sum()
+    all_ids = torch.arange(env.num_envs, device=env.device)
+    if env_ids is not None: all_ids = all_ids[env_ids]
+    all_ids = all_ids[adaptive.ascent_mask(env)[all_ids]]
+
+    # The narrow 1 m columns are a fixed 18-tread practice pool. They must
+    # remain visible for diagnostics, but their fixed-task outcomes cannot
+    # change the denominator of the adaptive/main-course metrics.
+    practice_columns = getattr(env.cfg, 'ascent_practice_only_columns', ())
+    if not getattr(env.cfg, 'ascent_adaptive_training', True):
+        practice_columns = ()
+    practice_mask = adaptive.column_mask(env, practice_columns)[all_ids]
+    groups = (("", all_ids[~practice_mask]),
+              ("practice_", all_ids[practice_mask]))
+    ledger = observer.sequence
+    goals_all = getattr(observer, 'episode_goals', curriculum_state(env).goals())
+
+    def subset_metrics(ids, prefix):
+        count = max(len(ids), 1)
+        goals = goals_all[ids]
+        # targets is shared [1, 1, treads], not indexed by environment ID.
+        required = ledger.targets <= goals[:, None, None]
+        denominator = goals.sum().clamp_min(1.)
+        values = {prefix+'sample_count': torch.as_tensor(len(ids), device=env.device).float()}
+        values.update({prefix+key: observer.stats['adaptive_'+key][ids].sum()/count
+                       for key in ('pairs', 'ordered', 'missing', 'early', 'failure', 'landing_credit')})
+        for wheel, index, tread in [('FL2', 0, 1), ('FR1', 1, 0)]:
+            values[prefix+wheel+'_covered'] = ledger.covered[ids, index, tread].float().sum()/count
+            values[prefix+wheel+'_best_dwell_s'] = ledger.best_dwell[ids, index, tread].sum()*.04/count
+            values[prefix+wheel+'_support_frames'] = observer.stats['adaptive_'+wheel+'_support_frames'][ids].sum()/count
+            values[prefix+wheel+'_longest_support_ms'] = observer.stats['adaptive_'+wheel+'_longest_support_s'][ids].sum()*1000./count
+        values[prefix+'front_current_prefix_coverage'] = (
+            ledger.covered[ids, :2]*required).float().sum()/(2.*denominator)
+        values[prefix+'front_same_tread_sequential_current_prefix'] = (
+            ledger.pair_paid[ids]*required[:, 0]).float().sum()/denominator
+        values[prefix+'prefix_success_fraction'] = finished(env)[ids].float().sum()/count
+        values[prefix+'front_first_four_coverage'] = ledger.covered[ids, :2, :4].float().sum()/(count*8)
+        values[prefix+'front_same_tread_sequential_first_four'] = ledger.pair_paid[ids, :4].float().sum()/(count*4)
+        full_four = goals >= 4
+        values['__weighted_total__/'+prefix+'front_first_four_coverage_opportunity'] = ledger.covered[ids[full_four], :2, :4].float().sum()
+        values['__weighted_count__/'+prefix+'front_first_four_coverage_opportunity'] = full_four.sum()*8.
+        values['__weighted_total__/'+prefix+'target_height_error_abs_m'] = observer.stats['adaptive_height_total'][ids].sum()
+        values['__weighted_count__/'+prefix+'target_height_error_abs_m'] = observer.stats['adaptive_opportunity'][ids].sum()
+        return values
+
+    result = {}
+    for prefix, ids in groups:
+        result.update(subset_metrics(ids, prefix))
     return result

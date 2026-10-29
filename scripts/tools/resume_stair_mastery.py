@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Resume Stage9 v8 -> v9 graded course evidence; never deserialize policies here.
+"""Resume Stage9 v9/v10/v11 -> v12 clean loaded landing rewards; no policy loads here.
 
 Stop the old training process and wait for its saved-checkpoint message first.
 Use --print-only to inspect the resolved command without starting training.
@@ -15,19 +15,19 @@ import sys
 
 ROOT=Path(__file__).resolve().parents[2]
 LOGS=ROOT/'logs/rsl_rl/deeprobotics_m20_stair_teacher_v1_stage2'
-V5='m20_stair_path_fixed247_20261026_v5_progressive_course'
-V6='m20_stair_path_fixed247_20261027_v6_mastered_prefix_floor'
-V8='m20_stair_path_fixed247_20261027_v8_soft_pairing'
 V9='m20_stair_path_fixed247_20261027_v9_course_evidence'
+V10='m20_stair_path_fixed247_20261027_v10_rear_entry_transition'
+V11='m20_stair_path_fixed247_20261028_v11_short_tread_rear'
+V12='m20_stair_path_fixed247_20261029_v12_clean_landing'
 
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--load-run',default='2026-10-27_13-52-28_ascent_entry_v1_stage9_v8')
+    parser.add_argument('--load-run',default='2026-10-29_12-31-27_ascent_entry_v1_stage11_rear_worst_v1')
     parser.add_argument('--checkpoint',help='Exact filename; default: greatest saved iteration number')
     parser.add_argument('--total-iterations',type=int,default=40000)
     parser.add_argument('--sampling-stage',type=int,choices=range(11),default=1)
-    parser.add_argument('--run-name',default='ascent_entry_v1_stage9_v9')
+    parser.add_argument('--run-name',default='ascent_entry_v1_stage12_clean_landing_v1')
     parser.add_argument('--device',default='cuda:0')
     parser.add_argument('--ascent-learning-rate','--ascent_learning_rate',type=float,default=1.5e-5,
                         help='Fixed PPO learning rate for resume (default: 1.5e-5).')
@@ -42,7 +42,7 @@ def main():
     manifest=json.loads(manifest_path.read_text())
     if manifest.get('m20_profile')!='ascent_entry_v1_stage9':parser.error('Source must be Stage9')
     version=manifest.get('refinement_version')
-    if version not in (V8,V9):parser.error('v9 accepts the current v8 or native v9 source only')
+    if version not in (V9,V10,V11,V12):parser.error('v12 accepts v9/v10/v11 or native v12 source only')
     checkpoints=[]
     for path in run.glob('model_*.pt'):
         match=re.fullmatch(r'model_(\d+)\.pt',path.name)
@@ -59,7 +59,9 @@ def main():
         '--task','Rough-Deeprobotics-M20-StairTeacher-v1',
         '--m20_profile','ascent_entry_v1_stage9','--resume',
         '--load_run',re.escape(args.load_run)+'$','--checkpoint',re.escape(checkpoint)+'$']
-    if version==V8:command+=['--stair_ascent_migrate_v8']
+    if version==V9:command+=['--stair_ascent_migrate_v9']
+    if version==V10:command+=['--stair_ascent_migrate_v10']
+    if version==V11:command+=['--stair_ascent_migrate_v11']
     command+=['--stair_sampling_mode','manual','--stair_sampling_stage',str(args.sampling_stage),
         '--run_name',args.run_name,'--num_envs',str(source_args['num_envs']),
         '--max_iterations',str(remaining),'--seed',str(source_args['seed']),

@@ -30,6 +30,14 @@ GENERAL_COLUMN_GROUPS = {
 GENERAL_COLUMNS = tuple(column for columns in GENERAL_COLUMN_GROUPS.values() for column in columns)
 TERRAIN_COLUMNS = GENERAL_START + len(GENERAL_TERRAINS)*GENERAL_COPIES
 TASK_WIDTHS_M = tuple(sorted({width for _, width in ASCENT_TASKS}))
+NARROW_ASCENT_COLUMNS = tuple(c for c,(_,w) in enumerate(ASCENT_TASKS) if w == 1.0)
+NARROW_ASCENT_PRACTICE_SHARE = .05
+NARROW_ASCENT_SETTINGS = dict(width_m=1.0, columns=list(NARROW_ASCENT_COLUMNS),
+    fraction_of_ascent_pool=NARROW_ASCENT_PRACTICE_SHARE, each_depth_fraction=.0125,
+    transfer='surplus_to_same_depth_1p2m_column', terrain_height='uniform_random_all_six_rows_at_reset',
+    prefix_course='disabled_fixed_full_flight18', sampling_readiness='excluded',
+    height_course='disabled_no_link_to_any_mastery_or_outcomes',
+    reward_and_physical_failure='unchanged', descent='unchanged')
 
 BASELINE_NUM_ENVS = 8192
 STAGED_NUM_ENVS = 10584
@@ -85,7 +93,7 @@ def staged_sampling_probabilities(stage, blend=1.):
     return probabilities_for_shares(group_shares)
 
 
-def probabilities_for_shares(group_shares):
+def probabilities_for_shares(group_shares, practice_share=NARROW_ASCENT_PRACTICE_SHARE):
     if len(group_shares) != 3 or min(group_shares) <= 0 or abs(sum(group_shares)-1.) > 1.e-9:
         raise ValueError('Invalid ascent population shares')
     probabilities = [0.] * TERRAIN_COLUMNS
@@ -97,6 +105,13 @@ def probabilities_for_shares(group_shares):
         probabilities[column] = DESCENT_FRACTION / len(DESCENT_COLUMNS)
     for column in (*FLAT_COLUMNS, *GENERAL_COLUMNS):
         probabilities[column] = NON_STAIR_FRACTION / (len(FLAT_COLUMNS) + len(GENERAL_COLUMNS))
+    if practice_share is not None:
+        if not 0. < practice_share <= .10:
+            raise ValueError('Narrow ascent practice share must be in (0,.10]')
+        for column in NARROW_ASCENT_COLUMNS:
+            target = ASCENT_FRACTION*practice_share/len(NARROW_ASCENT_COLUMNS)
+            probabilities[column+1] += probabilities[column]-target
+            probabilities[column] = target
     return tuple(probabilities)
 
 if (ASCENT_REFERENCE_COLUMN != 8 or FLAT_COLUMNS != (9, 10, 11)

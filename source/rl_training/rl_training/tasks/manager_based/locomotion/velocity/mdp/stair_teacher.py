@@ -1694,6 +1694,15 @@ def _ascent_direction_context(env, asset_cfg, sensor_cfg, contact_sensor_cfg,
     clear = state["engaged"] & ~seen_up & loaded.all(-1) & on_top.all(-1) & (
         past > TUNING["direction_exit_inset"]).all(-1)
     heading_error = torch.atan2(torch.sin(actual_yaw - reference), torch.cos(actual_yaw - reference))
+    route = getattr(env, '_m20_stair_path_route_context', None)
+    has_route = route is not None and route.get('step') == step
+    route_use = route['active'] & moving_up if has_route else None
+    if has_route:
+        # Path feedback and the direction reward now share one signed route
+        # error and one heading reference during ascent. Descent never enters
+        # this branch because moving_up is false there.
+        state['cross_track'] = torch.where(route_use, route['error'], state['cross_track'])
+        heading_error = torch.where(route_use, route['heading_error'], heading_error)
     flight_exit = clear & state["engaged"]
     state["stats"]["exit_heading_sum"] += heading_error.abs() * flight_exit
     state["stats"]["exit_samples"] += flight_exit
@@ -1709,6 +1718,8 @@ def _ascent_direction_context(env, asset_cfg, sensor_cfg, contact_sensor_cfg,
     path /= new_norm.clamp_min(1e-6)[:, None]
     velocity = robot.data.root_lin_vel_w[:, :2]
     lateral_speed = -velocity[:, 0] * path[:, 1] + velocity[:, 1] * path[:, 0]
+    if has_route:
+        lateral_speed = torch.where(route_use, route['lateral_speed'], lateral_speed)
     active = state["engaged"] & moving_up
     straight_active = active & (command[:, 1].abs() <= TUNING["translation_threshold"]) & (
         command[:, 2].abs() <= TUNING["yaw_threshold"])

@@ -23,6 +23,12 @@ until reset. Front/rear swings may overlap; no diagonal or axle-gap rule exists.
         self.engaged = torch.zeros(count, 2, device=device, dtype=torch.bool)
         self.last_side = torch.full((count, 2), -1, device=device, dtype=torch.long)
         self.last_start = torch.full((count, 2), -100., device=device)
+        # A fixed environment-index tie breaker can imprint a persistent
+        # left/right bias on the first swing. Choose the tie side per episode.
+        ids = torch.arange(count, device=device)
+        pair = ids // 2
+        base = torch.randint(0, 2, (int(pair[-1].item()) + 1, 1), device=device)
+        self.tie_side = ((base[pair] + (ids % 2)[:, None]) % 2).expand(-1, 2).clone()
         self.failed = torch.zeros(count, device=device, dtype=torch.bool)
         self.starts = torch.zeros(count, 2, device=device)
         self.violations = torch.zeros_like(self.starts)
@@ -33,8 +39,12 @@ until reset. Front/rear swings may overlap; no diagonal or axle-gap rule exists.
             getattr(self, name)[ids] = 0
         self.last_side[ids] = -1
         self.last_start[ids] = -100.
+        pair = ids // 2
+        unique, inverse = torch.unique(pair, sorted=True, return_inverse=True)
+        base = torch.randint(0, 2, (len(unique), 1), device=self.tie_side.device)
+        self.tie_side[ids] = ((base[inverse] + (ids % 2)[:, None]) % 2).expand(-1, 2)
 
-    def update(self, support, wheel_z, wheel_vz, pair_near, active, dt):
+    def update(self, support, wheel_z, wheel_vz, pair_near, active, dt, repeat_grace=None, soft_repeat=None):
         self.clock += dt
         self.engaged |= pair_near & active[:, None]
         monitor = self.engaged.repeat_interleave(2, -1) & active[:, None]
@@ -52,15 +62,19 @@ until reset. Front/rear swings may overlap; no diagonal or axle-gap rule exists.
         count = events.sum(-1)
         side = events.long().argmax(-1)
         repeated = (count == 1) & (side == self.last_side)
+        if repeat_grace is not None:
+            repeated &= ~repeat_grace
         bad = ((count > 1) | repeated) & ~self.failed[:, None]
+        soft = torch.zeros_like(bad) if soft_repeat is None else (repeated & soft_repeat & ~self.failed[:,None])
+        hard = bad & ~soft
         self.violations += bad
         self.starts += count
         self.last_side = torch.where(count > 0, side, self.last_side)
         self.last_start = torch.where(count > 0, self.clock[:, None], self.last_start)
-        failed_now = bad.any(-1) & ~self.failed
-        self.failed |= bad.any(-1)
+        failed_now = hard.any(-1) & ~self.failed
+        self.failed |= hard.any(-1)
         ready = (~self.engaged | self.seen_support.reshape(-1, 2, 2).all(-1)).all(-1)
-        return dict(lift=lift, violation=bad, failed_now=failed_now,
+        return dict(lift=lift, violation=bad, failed_now=failed_now,soft_violation=soft,
                     valid=~self.failed & ready, front_valid=~self.failed & (~self.engaged[:, 0] | self.seen_support[:, :2].all(-1)),
                     rear_valid=~self.failed & (~self.engaged[:, 1] | self.seen_support[:, 2:].all(-1)))
 
@@ -133,20 +147,41 @@ class BalancedContactCurriculum(ContactCurriculum):
 
 
 def dense_costs(command_x, velocity_x, lateral_error, heading_error, slip, support,
-                height, depth, progress, age):
+                height, depth, progress, age, tangent=None):
     """Dimensionless costs, with no positive reward for waiting or wheel spin."""
     target = command_x.clamp_min(.1)
     grace = ((age-.5)/.5).clamp(0., 1.)
     stall = ((.8*target-velocity_x).clamp_min(0.)/(.8*target)).square().clamp_max(4.)*grace
     transition = 1.+.5*((progress >= 2.) & (progress <= 4.5))
-    slip_cost = (torch.sqrt(1.+(slip/.15).square())-1.).clamp_max(8.)*support
-    denominator = (velocity_x.clamp_min(.15)/target).clamp(.3, 2.)
+    # Separate lateral drift from rolling-direction contact motion. A single
+    # tangent norm hides the distinction and makes the policy trade speed for
+    # a lower normalized slip signal.
+    if tangent is None:
+        lateral_slip = slip
+        longitudinal_slip = torch.zeros_like(slip)
+    else:
+        lateral_slip = tangent[..., 1].abs()
+        longitudinal_slip = tangent[..., 0].abs()
+    lateral_cost = (torch.sqrt(1.+(lateral_slip/.15).square())-1.).clamp_max(8.)*support
+    longitudinal_cost = (torch.sqrt(1.+(longitudinal_slip/.20).square())-1.).clamp_max(8.)*support
+    slip_cost = lateral_cost + .35*longitudinal_cost
+    # Do not triple the slip penalty merely because the robot slows at a
+    # riser. Slow forward motion is already covered by the stall term; keep
+    # the slip scale in a bounded command-relative band.
+    denominator = (velocity_x.clamp_min(.15)/target).clamp(.6, 1.4)
     front = (.5*slip_cost[:, :2].mean(-1)+.5*slip_cost[:, :2].amax(-1))/denominator
     rear = (.5*slip_cost[:, 2:].mean(-1)+.5*slip_cost[:, 2:].amax(-1))/denominator
     lateral = ((lateral_error.abs()-.03).clamp_min(0.)/.12).square().clamp_max(9.)
     heading = ((heading_error.abs()-.025).clamp_min(0.)/.15).square().clamp_max(9.)
     period = depth/target*(1.+.4*(height/.15-1.)).clamp(.8, 1.4)
+    front_lateral = (.5*lateral_cost[:, :2].mean(-1)+.5*lateral_cost[:, :2].amax(-1))/denominator
+    rear_lateral = (.5*lateral_cost[:, 2:].mean(-1)+.5*lateral_cost[:, 2:].amax(-1))/denominator
+    front_longitudinal = (.5*longitudinal_cost[:, :2].mean(-1)+.5*longitudinal_cost[:, :2].amax(-1))/denominator
+    rear_longitudinal = (.5*longitudinal_cost[:, 2:].mean(-1)+.5*longitudinal_cost[:, 2:].amax(-1))/denominator
     return dict(stall=stall, front_slip=front*transition, rear_slip=rear*transition,
+                front_lateral_slip=front_lateral*transition, rear_lateral_slip=rear_lateral*transition,
+                front_longitudinal_slip=front_longitudinal*transition,
+                rear_longitudinal_slip=rear_longitudinal*transition,
                 lateral=lateral, heading=heading, period=period.clamp(.25, 1.2))
 
 

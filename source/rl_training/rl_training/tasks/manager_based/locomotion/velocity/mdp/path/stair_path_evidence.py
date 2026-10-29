@@ -1,5 +1,6 @@
-"""Stage9 v9 physical outcome windows and graded per-axle gait evidence."""
+"""Physical terrain evidence, legacy v9 quality, and v10 rear gait diagnostics."""
 import torch
+from copy import deepcopy
 from .stair_path_course import ProgressiveCourse, PREFIXES, EVENTS
 from ..ascent.ascent_adaptive import HEIGHTS
 
@@ -12,6 +13,16 @@ SETTINGS = dict(version=VERSION, physical_passes_per_speed=6, window_per_speed=8
     quality_denominator='required_pairs_per_axle_then_mean_over_physical_successes_each_speed',
     strict_episode_success='final_acceptance_only', mastery='physical_ability_independent_of_style',
     prefix_consolidation_episodes=16)
+TRANSITION_VERSION = 'm20_course_evidence_20261027_v2_rear_tail'
+TRANSITION_SETTINGS = deepcopy(SETTINGS)
+TRANSITION_SETTINGS.pop('height_rear_second_quality')
+TRANSITION_SETTINGS.update(version=TRANSITION_VERSION,
+    rear_quality='treads3_to_goal_only_or_physical_pairs_for_entry_only_tasks',
+    rear_tail_quality='all_required_rear_pairs_from_tread3_ordered_and_complete',
+    strict_episode_success='front_all_treads_rear_from_tread3_physical_all_treads',
+    promotion_pair_quality_axes=[0],
+    rear_quality_role='reward_and_strict_gait_acceptance_only_not_terrain_promotion',
+    rear_swing_order='penalty_only_after_entry_not_physical_failure')
 
 
 def pair_quality(ledger, goals):
@@ -19,32 +30,47 @@ def pair_quality(ledger, goals):
     paired = torch.stack((ledger.pair_paid,ledger.rear_pair_paid),1)
     clean = paired & ~ledger.style_bad_treads & required[:,None]
     quality = clean.float().sum(-1)/goals[:,None].clamp_min(1)
+    if getattr(ledger, 'rear_entry_transition', False):
+        tail = required & (ledger.targets[:,0] >= 3)
+        count = tail.sum(-1)
+        tail_quality = (clean[:,1] & tail).sum(-1)/count.clamp_min(1)
+        quality[:,1] = torch.where(count > 0,tail_quality,quality[:,1])
+        tail_clean = ((clean[:,1] | ~tail).all(-1) & (goals >= 4)).float()
+        tail_clean *= ~ledger.rear_swing_style_failed
+        return quality,tail_clean
     return quality,clean[:,1,1].float()
 
 
 class EvidenceCourse(ProgressiveCourse):
     """Protect physical mastery; gate upward moves with separate gait quality."""
     evidence_fields = ('quality_window','rear_second_window')
+    settings = SETTINGS
+    evidence_version = VERSION
+    height_quality_key = 'height_rear_second_quality'
+    rear_entry_transition = False
     def __init__(self,count,device):
         super().__init__(count,device)
         self.quality_window = torch.zeros(count,2,8,2,device=device)
-        self.rear_second_window = torch.zeros(count,2,8,device=device)
+        setattr(self,self.evidence_fields[1],torch.zeros(count,2,8,device=device))
         # Per-finished-episode diagnostic flags. These are deliberately not
         # persistent evidence, and are only read on completed ascent slots.
         self.evidence_last = torch.zeros(count,6,device=device)
 
     def update(self,ids,success,eligible,rows,reference,training=True,
-               promotion_success=None,pair_quality=None,rear_second_quality=None):
+               promotion_success=None,pair_quality=None,rear_second_quality=None,rear_tail_quality=None):
         up = torch.zeros_like(success);down = torch.zeros_like(success)
         self.last_events[ids] = 0;self.evidence_last[ids] = 0
         if not training:return up,down
+        if self.rear_entry_transition:
+            rear_second_quality = rear_tail_quality
         if pair_quality is None or rear_second_quality is None:
-            raise ValueError('EvidenceCourse needs per-axle pair quality and rear tread2 evidence')
+            raise ValueError('EvidenceCourse needs pair quality and its versioned rear evidence')
         bucket = self.speed_bucket[ids];slot = self.cursor[ids,bucket]
         old = self.skill[ids].clone()
         self.window[ids,bucket,slot] = torch.where(eligible,success.long(),self.window[ids,bucket,slot])
         self.quality_window[ids,bucket,slot] = torch.where(eligible[:,None],pair_quality,self.quality_window[ids,bucket,slot])
-        self.rear_second_window[ids,bucket,slot] = torch.where(eligible,rear_second_quality,self.rear_second_window[ids,bucket,slot])
+        anchor_window = getattr(self,self.evidence_fields[1])
+        anchor_window[ids,bucket,slot] = torch.where(eligible,rear_second_quality,anchor_window[ids,bucket,slot])
         self.cursor[ids,bucket] = (slot+eligible.long())%8
         self.trials[ids,bucket] = (self.trials[ids,bucket]+eligible.long()).clamp_max(8)
         self.completed[ids] += eligible.long()
@@ -58,11 +84,13 @@ class EvidenceCourse(ProgressiveCourse):
         enough = (self.trials[ids] >= 8).all(-1)
         physical_ready = good & enough & (passes >= 6).all(-1)
         quality = (self.quality_window[ids]*self.window[ids,:,:,None]).sum(2)/passes.clamp_min(1)[:,:,None]
-        second = (self.rear_second_window[ids]*self.window[ids]).sum(-1)/passes.clamp_min(1)
-        threshold = self.skill.new_tensor(SETTINGS['prefix_pair_quality'],dtype=torch.float32)[old]
-        style_ready = (quality+1.e-6 >= threshold[:,None,None]).all((1,2))
-        height_style_ready = (quality+1.e-6 >= SETTINGS['height_pair_quality']).all((1,2))
-        height_style_ready &= (second+1.e-6 >= SETTINGS['height_rear_second_quality']).all(-1)
+        second = (anchor_window[ids]*self.window[ids]).sum(-1)/passes.clamp_min(1)
+        threshold = self.skill.new_tensor(self.settings['prefix_pair_quality'],dtype=torch.float32)[old]
+        promotion_quality = quality[:,:,self.settings.get('promotion_pair_quality_axes',[0,1])]
+        style_ready = (promotion_quality+1.e-6 >= threshold[:,None,None]).all((1,2))
+        height_style_ready = (promotion_quality+1.e-6 >= self.settings['height_pair_quality']).all((1,2))
+        if self.height_quality_key is not None:
+            height_style_ready &= (second+1.e-6 >= self.settings[self.height_quality_key]).all(-1)
         # Physical mastery is retained independently of whether ideal gait
         # quality yet allows a longer task; no physical pass window is lost.
         certified = physical_ready & (old > self.mastered[ids,rows])
@@ -125,14 +153,14 @@ class EvidenceCourse(ProgressiveCourse):
     def state_dict(self):
         state = super().state_dict()
         state.update({name:getattr(self,name).detach().cpu().clone() for name in self.evidence_fields})
-        state['evidence_version'] = VERSION
+        state['evidence_version'] = self.evidence_version
         return state
 
     def _validate(self,saved,legacy=False):
         if legacy:raise ValueError('v9 migration requires v8 evidence source')
         base = {k:v for k,v in saved.items() if k not in (*self.evidence_fields,'evidence_version')}
         ProgressiveCourse(len(self.skill),self.skill.device)._validate(base)
-        if set(saved) != set(self.state_dict()) or saved.get('evidence_version') != VERSION:
+        if set(saved) != set(self.state_dict()) or saved.get('evidence_version') != self.evidence_version:
             raise ValueError('Invalid v9 evidence keys or version')
         for name in self.evidence_fields:
             value=saved[name];expected=getattr(self,name)
@@ -149,5 +177,27 @@ class EvidenceCourse(ProgressiveCourse):
             result[name] = torch.zeros_like(saved[name])
         for name in self.evidence_fields:result[name] = torch.zeros_like(getattr(self,name),device='cpu')
         result['evidence_version'] = VERSION
+        self._validate(result)
+        return result
+
+
+class RearEntryEvidenceCourse(EvidenceCourse):
+    """Retain physical/front terrain gates; rear tail quality is diagnostic only."""
+    evidence_fields = ('quality_window','rear_tail_window')
+    settings = TRANSITION_SETTINGS
+    evidence_version = TRANSITION_VERSION
+    height_quality_key = None
+    rear_entry_transition = True
+
+    def migrate_v9(self,saved):
+        EvidenceCourse(len(self.skill),self.skill.device)._validate(saved)
+        result = {k:v for k,v in saved.items() if k != 'rear_second_window'}
+        # Physical outcomes and front evidence have identical semantics. Keep
+        # them so changing rear gait rules does not restart terrain evidence.
+        # Rear slots start at zero and refill; they are diagnostic only.
+        result['quality_window'] = saved['quality_window'].clone()
+        result['quality_window'][...,1] = 0
+        result['rear_tail_window'] = torch.zeros_like(self.rear_tail_window,device='cpu')
+        result['evidence_version'] = self.evidence_version
         self._validate(result)
         return result

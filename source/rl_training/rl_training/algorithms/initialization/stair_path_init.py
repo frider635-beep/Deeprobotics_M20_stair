@@ -18,36 +18,64 @@ PATH_VERSIONS = (VERSION, VERSION+'_reward_v2', VERSION+'_reward_v3_course_width
                  'm20_stair_path_fixed247_20261027_v6_mastered_prefix_floor',
                  'm20_stair_path_fixed247_20261027_v7_ascent_pairing',
                  'm20_stair_path_fixed247_20261027_v8_soft_pairing',
-                 'm20_stair_path_fixed247_20261027_v9_course_evidence')
+                 'm20_stair_path_fixed247_20261027_v9_course_evidence',
+                 'm20_stair_path_fixed247_20261027_v10_rear_entry_transition',
+                 'm20_stair_path_fixed247_20261028_v11_short_tread_rear',
+                 'm20_stair_path_fixed247_20261029_v12_clean_landing')
 
 
-def validate_ascent_pairing_resume(prior,target,weights,migrate=False,source='v8'):
-    """Explicit v8 -> v9; all old weights/path/descent contracts stay exact."""
+def validate_ascent_pairing_resume(prior,target,weights,migrate=False,source='v9'):
+    """Explicit ascent-only reward migration; never relax descent contracts."""
     from ...tasks.manager_based.locomotion.velocity.mdp.ascent import ascent_pairing as pairing
-    from ...tasks.manager_based.locomotion.velocity.mdp.path.stair_path_evidence import SETTINGS
-    expected_version=pairing.PREVIOUS_VERSION if migrate and source == 'v8' else pairing.VERSION
-    if ((migrate and source != 'v8') or prior.get('m20_profile') != 'ascent_entry_v1_stage9'
+    from ...tasks.manager_based.locomotion.velocity.mdp.path.stair_path_evidence import SETTINGS as V9_EVIDENCE, TRANSITION_SETTINGS as SETTINGS
+    from ...tasks.manager_based.locomotion.velocity.mdp.path.stair_path_layout import NARROW_ASCENT_SETTINGS
+    from ...tasks.manager_based.locomotion.velocity.mdp.path.stair_path_height_practice import SETTINGS as HEIGHT_PRACTICE
+    sources={'v9':pairing.V9_VERSION,'v10':pairing.V10_VERSION,'v11':pairing.V11_VERSION}
+    expected_version=sources.get(source) if migrate else pairing.VERSION
+    if ((migrate and source not in sources) or prior.get('m20_profile') != 'ascent_entry_v1_stage9'
             or prior.get('refinement_version') != expected_version or target.get('version') != pairing.VERSION):
-        raise ValueError('v9 requires explicit --stair_ascent_migrate_v8 from v8, or native v9 resume')
+        raise ValueError('v12 requires explicit --stair_ascent_migrate_v11 (or matching v9/v10 flag), or native v12 resume')
     settings={key:target[key] for key in (
         'stair_path_reward_weights','path_tracking_target','path_velocity_target','contact_slip','merged_entry_slip')}
     if prior.get('stair_path_reward_settings') != settings:
-        raise ValueError('v9 cannot change shared path/descent reward settings')
+        raise ValueError('Ascent migration cannot change shared path/descent reward settings')
     for key in ('stair_path_reward_version','stair_path_config','control_profile',
                 'descent_limits_action_units','descent_authority_schedule'):
-        if prior.get(key) != target[key]:raise ValueError('v9 must retain '+key)
+        if prior.get(key) != target[key]:raise ValueError('Ascent migration must retain '+key)
     expected=dict(prior.get('reward_weights') or {})
     if not expected:raise ValueError('Source must record all reward weights')
+    legacy_v10=dict(pairing.PREVIOUS_V10_SETTINGS)
+    transition=dict(legacy_v10.get('rear_entry_transition') or {})
+    transition.pop('stable_transition_hold_s',None)
+    legacy_v10['rear_entry_transition']=transition
+    contracts={'v9':(pairing.V9_SETTINGS,),
+               'v10':(pairing.V10_SETTINGS,pairing.PREVIOUS_V10_SETTINGS,legacy_v10),
+               'v11':(pairing.V11_SETTINGS,)}
     if migrate:
-        if prior.get('ascent_pairing') != pairing.V8_SETTINGS:
-            raise ValueError('Source v8 pairing contract mismatch')
-        if 'ascent_rear_phase' in expected:raise ValueError('v8 unexpectedly contains rear phase reward')
-        expected['ascent_rear_phase']=pairing.REAR_PHASE_WEIGHT
-    elif prior.get('ascent_pairing') != pairing.SETTINGS or prior.get('course_evidence') != SETTINGS:
-        raise ValueError('Native v9 pairing/course evidence settings mismatch')
-    if (weights != expected or target.get('ascent_pairing') != pairing.SETTINGS
-            or target.get('course_evidence') != SETTINGS):
-        raise ValueError('v9 permits only ascent_rear_phase -0.15; all existing weights must match')
+        if prior.get('ascent_pairing') not in contracts[source]:
+            raise ValueError('Source '+source+' pairing contract mismatch')
+        if prior.get('course_evidence') != (V9_EVIDENCE if source=='v9' else SETTINGS):
+            raise ValueError('Source course evidence contract mismatch')
+        if source=='v11':
+            for key,contract in (('narrow_ascent_practice',NARROW_ASCENT_SETTINGS),
+                                 ('ascent_height_practice',HEIGHT_PRACTICE)):
+                if prior.get(key) != contract:raise ValueError('Source v11 must retain '+key)
+        # Only these documented ascent rewards may change. Every other term,
+        # including disabled historical rewards, must retain its exact weight.
+        expected.update(ascent_rear_paired=pairing.REAR_PAIR_WEIGHT,
+            ascent_landing_order=pairing.LANDING_ORDER_WEIGHT,
+            ascent_rear_phase=pairing.REAR_PHASE_WEIGHT,
+            ascent_rear_landing_credit=pairing.LANDING_QUALITY_SETTINGS['rear_landing_credit_weight'])
+    elif prior.get('ascent_pairing') != pairing.SETTINGS:
+        raise ValueError('Native v12 pairing reward contract mismatch')
+    if set(weights) != set(expected):raise ValueError('Unexpected reward term added or removed')
+    for key,value in expected.items():
+        if weights.get(key) != value:raise ValueError('Must retain approved reward weight '+key)
+    for key,contract in (('ascent_pairing',pairing.SETTINGS),('course_evidence',SETTINGS),
+                         ('narrow_ascent_practice',NARROW_ASCENT_SETTINGS),
+                         ('ascent_height_practice',HEIGHT_PRACTICE)):
+        if target.get(key) != contract:raise ValueError('v12 target contract mismatch: '+key)
+        if not migrate and prior.get(key) != contract:raise ValueError('Native v12 contract mismatch: '+key)
 
 
 def validate_course_migration(prior, target, source='v4'):
@@ -232,17 +260,21 @@ def attach_curriculum_checkpoint(algorithm, env):
                 target_version = pairing.VERSION if pairing_enabled else COURSE_VERSION
                 migrating = prior_version != target_version
                 if pairing_enabled:
-                    from_v8 = prior_version == pairing.PREVIOUS_VERSION and getattr(env.cfg,'stair_ascent_migrate_v8',False)
-                    if migrating and not from_v8:
-                        raise ValueError('v9 requires --stair_ascent_migrate_v8 from a v8 checkpoint')
+                    from_v9 = prior_version == pairing.V9_VERSION and getattr(env.cfg,'stair_ascent_migrate_v9',False)
+                    from_v10 = prior_version == pairing.V10_VERSION and getattr(env.cfg,'stair_ascent_migrate_v10',False)
+                    from_v11 = prior_version == pairing.V11_VERSION and getattr(env.cfg,'stair_ascent_migrate_v11',False)
+                    if migrating and not (from_v9 or from_v10 or from_v11):
+                        raise ValueError('v12 requires the matching --stair_ascent_migrate_v11/v10/v9 flag')
                     if migrating:
                         loaded=dict(loaded)
-                        loaded['ascent_adaptive_curriculum']=env._ascent_adaptive_curriculum.migrate_v8(
-                            loaded['ascent_adaptive_curriculum'])
+                        if from_v9:
+                            loaded['ascent_adaptive_curriculum']=env._ascent_adaptive_curriculum.migrate_v9(
+                                loaded['ascent_adaptive_curriculum'])
                         env._stair_ascent_migration=dict(source_version=prior_version,target_version=target_version,
-                            changed='ascent_graded_pair_quality_physical_windows_rear_phase_guidance',
+                            changed='staged_clearance_clean_loaded_landing_credit_and_rear_emphasis',
                             retained='actor_critic_optimizer_reference_iteration_mastery_prefix_height_geometry_sampling_ramp',
-                            evidence='fresh_physical_and_pair_quality_windows_v8_strict_windows_not_reused',
+                            evidence=('physical_and_front_retained_rear_tail_fresh' if from_v9 else
+                                      'existing_physical_front_rear_windows_retained_until_geometry_change'),
                             descent='all_rewards_control_and_curriculum_unchanged')
                 elif migrating:
                     from_v4 = prior_version == layout.SAMPLING_VERSION and getattr(env.cfg,'stair_course_migrate_v4',False)

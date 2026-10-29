@@ -197,7 +197,8 @@ class StrictSequenceLedger(SequenceLedger):
         return paid
 
 
-def landing_guidance(position, velocity_z, target, enabled, first, floor, depth, rise):
+def landing_guidance(position, velocity_z, target, enabled, first, floor, depth, rise,
+                     staged=None, permission=None):
     """Prepare immediately; reward progress only after real target support.
 
     Dense landing costs require a joint horizontal/vertical landing window.
@@ -216,6 +217,10 @@ def landing_guidance(position, velocity_z, target, enabled, first, floor, depth,
     dx = (.06-offset).clamp_min(0.)+(offset-(depth-.06)).clamp_min(0.)
     height = 2.*(torch.sqrt(1.+(error_z/.08).square())-1.)
     horizontal = 2.*(torch.sqrt(1.+(dx/.15).square())-1.)
+    if staged is not None:
+        from .ascent_landing_quality import forward_factor
+        factor=forward_factor(bottom,top,offset,permission)
+        horizontal *= torch.where(staged,factor,torch.ones_like(factor))
     desired_vz = (-3.*error_z).clamp(-.40, .30)
     speed = ((velocity_z-desired_vz)/.5).square().clamp_max(4.)
     prepare = ((desired-bottom).clamp_min(0.)/.08).square().clamp_max(4.)*(1.-blend)*near

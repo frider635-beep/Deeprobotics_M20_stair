@@ -16,6 +16,7 @@ from rl_training.control.stair_path import PathConfig, PATH_VERSION
 from rl_training.models.stair_path_actor import DESCENT_LIMITS, DESCENT_WARMUP, DESCENT_RAMP
 from rl_training.tasks.manager_based.locomotion.velocity.mdp.path import stair_path_mdp as path
 from rl_training.tasks.manager_based.locomotion.velocity.mdp.path import stair_path_layout as layout
+from rl_training.tasks.manager_based.locomotion.velocity.mdp.path.stair_path_height_practice import SETTINGS as HEIGHT_PRACTICE_SETTINGS
 from rl_training.tasks.manager_based.locomotion.velocity.mdp.path.stair_path_readiness import ReadinessConfig
 from rl_training.tasks.manager_based.locomotion.velocity.mdp.path import stair_path_course as progressive
 from rl_training.tasks.manager_based.locomotion.velocity.mdp.path.rectangular_random_grid import random_grid_terrain
@@ -24,7 +25,10 @@ from rl_training.tasks.manager_based.locomotion.velocity.mdp.ascent import ascen
 from rl_training.tasks.manager_based.locomotion.velocity.mdp.ascent import ascent_entry_mdp as entry
 from rl_training.tasks.manager_based.locomotion.velocity.mdp.ascent import ascent_adaptive as adaptive
 from rl_training.tasks.manager_based.locomotion.velocity.mdp.ascent import ascent_pairing as pairing
-from rl_training.tasks.manager_based.locomotion.velocity.mdp.path.stair_path_evidence import SETTINGS as EVIDENCE_SETTINGS
+from rl_training.tasks.manager_based.locomotion.velocity.mdp.path.stair_path_evidence import TRANSITION_SETTINGS as EVIDENCE_SETTINGS
+from rl_training.tasks.manager_based.locomotion.velocity.mdp.ascent.ascent_reward_audit import (
+    audit_conflicting_rewards, disable_conflicting_rewards,
+)
 from rl_training.tasks.manager_based.locomotion.velocity.mdp.ascent.ascent_adaptive import geometry
 from rl_training.tasks.manager_based.locomotion.velocity.mdp.ascent.ascent_adaptive import HEIGHTS
 
@@ -58,7 +62,10 @@ def narrow_ascent_clearance_cost(env):
 
 def narrow_ascent_riser_contact_cost(env):
     """Make front-edge impacts visible on narrow ascent columns only."""
-    return entry.riser_contact_cost(env) * _narrow_ascent_mask(env)
+    # Preserve the existing all-wheel term and add the worst rear-wheel
+    # contact so a single HR impact is not diluted by quiet wheels.
+    return (entry.riser_contact_cost(env) +
+            .75 * entry.rear_riser_contact_cost(env)) * _narrow_ascent_mask(env)
 
 
 def path_stairs(difficulty, cfg):
@@ -129,6 +136,7 @@ def reset_path_root(env, env_ids, pose_range, velocity_range, asset_cfg=SceneEnt
 def apply_profile(env_cfg, agent_cfg, evaluation=False, profile=PROFILE):
     if profile not in (STAGE8_PROFILE, PROFILE):
         raise ValueError(f'Unknown stair path profile: {profile}')
+    reward_conflict_audit = {}
     if getattr(env_cfg, 'm20_refinement_profile', None) != profile:
         if profile == PROFILE:
             preserved_terrains = getattr(env_cfg, '_m20_general_terrain_sources', None)
@@ -139,6 +147,12 @@ def apply_profile(env_cfg, agent_cfg, evaluation=False, profile=PROFILE):
             except RuntimeError as exc:
                 raise RuntimeError(str(exc) + '; initialize the v1 task before applying the Stage9 profile') from exc
         previous.apply_profile(env_cfg, agent_cfg, evaluation=evaluation)
+        if profile == PROFILE:
+            # The paired/path objective owns ascent tread order and support
+            # style. Disable inherited single-support/diagonal/old
+            # alternating terms before installing v11 terms; otherwise they
+            # reward opposite contact patterns on the same transition.
+            disable_conflicting_rewards(env_cfg.rewards)
         from rl_training.tasks.manager_based.locomotion.velocity.mdp import stair_teacher
         stair_teacher.TUNING['stair_path_feedback'] = True
         env_cfg.stair_path_config = PathConfig().to_dict()
@@ -170,6 +184,7 @@ def apply_profile(env_cfg, agent_cfg, evaluation=False, profile=PROFILE):
             env_cfg.ascent_adaptive_ascent_columns = layout.ASCENT_COLUMNS
             env_cfg.ascent_adaptive_ascent_column_ids = tuple(range(layout.ASCENT_COLUMNS))
             env_cfg.ascent_adaptive_reference_columns = (layout.ASCENT_REFERENCE_COLUMN,)
+            env_cfg.ascent_practice_only_columns = layout.NARROW_ASCENT_COLUMNS
             env_cfg.stair_path_flat_column = layout.FLAT_COLUMN
             env_cfg.stair_path_flat_columns = layout.FLAT_COLUMNS
             env_cfg.stair_path_descent_start = layout.DESCENT_START
@@ -210,6 +225,8 @@ def apply_profile(env_cfg, agent_cfg, evaluation=False, profile=PROFILE):
         # by landing/hold guidance. No descent or path objective is changed.
         if profile == PROFILE:
             env_cfg.stair_ascent_pairing_v9 = True
+            env_cfg.stair_ascent_rear_entry_v10 = True
+            env_cfg.stair_ascent_landing_quality_v12 = True
             env_cfg.rewards.ascent_entry_clearance.func = pairing.reward
             env_cfg.rewards.ascent_entry_clearance.params = {'name':'clearance'}
             env_cfg.rewards.ascent_entry_clearance.weight = -.30
@@ -217,6 +234,9 @@ def apply_profile(env_cfg, agent_cfg, evaluation=False, profile=PROFILE):
             env_cfg.rewards.ascent_riser_contact.weight = -.30
             env_cfg.rewards.ascent_rear_paired = RewardTermCfg(func=pairing.reward,
                 weight=pairing.REAR_PAIR_WEIGHT,params={'name':'rear_paired'})
+            env_cfg.rewards.ascent_rear_landing_credit = RewardTermCfg(func=pairing.reward,
+                weight=pairing.LANDING_QUALITY_SETTINGS['rear_landing_credit_weight'],
+                params={'name':'rear_landing_credit'})
             env_cfg.rewards.ascent_landing_order = RewardTermCfg(func=pairing.reward,
                 weight=pairing.LANDING_ORDER_WEIGHT,params={'name':'landing_order'})
             env_cfg.rewards.ascent_rear_phase = RewardTermCfg(func=pairing.reward,
@@ -237,6 +257,11 @@ def apply_profile(env_cfg, agent_cfg, evaluation=False, profile=PROFILE):
                 func=path.general_terrain_curriculum, params={'min_commanded_translation_m': .1})
         env_cfg.m20_refinement_profile = profile
         alternating.gate_positive_rewards(env_cfg.rewards)
+        if profile == PROFILE:
+            env_cfg.rewards.stair_up_task_crossing.params['require_clean_landing'] = True
+        reward_conflict_audit = audit_conflicting_rewards(env_cfg.rewards)
+    else:
+        reward_conflict_audit = audit_conflicting_rewards(env_cfg.rewards)
     if evaluation:
         env_cfg.ascent_adaptive_training = False
         for terrain in env_cfg.scene.terrain.terrain_generator.sub_terrains.values():
@@ -248,14 +273,17 @@ def apply_profile(env_cfg, agent_cfg, evaluation=False, profile=PROFILE):
     manifest = configure_agent(agent_cfg, profile=profile)
     manifest['gated_positive_rewards'] = alternating.audit_positive_rewards(env_cfg.rewards)
     if profile == PROFILE:
+        manifest['reward_conflict_audit'] = reward_conflict_audit
+    if profile == PROFILE:
         manifest.update(contact_curriculum=dict(prefixes=list(progressive.PREFIXES),
+            excluded_practice_columns=list(layout.NARROW_ASCENT_COLUMNS),
             minimum_task_fractions={'2':.5,'3':.3,'4':.2},
-            promote='both_speeds_physical_6_of_8_and_graded_per_axle_pair_quality',
-            strict_success='final_full_episode_gait_acceptance',
+            promote='both_speeds_physical_6_of_8_and_retained_front_pair_quality',
+            strict_success='front_full_episode_rear_from_tread3',
             demote_consecutive_failures=3,demotion_window='current_speed_8_trials_physical_success_at_most_half',
             prefix_quality_thresholds=deepcopy(EVIDENCE_SETTINGS['prefix_pair_quality']),
             height_quality_threshold=EVIDENCE_SETTINGS['height_pair_quality'],
-            height_rear_second_quality=EVIDENCE_SETTINGS['height_rear_second_quality'],
+            rear_quality_role=EVIDENCE_SETTINGS['rear_quality_role'],
             demotion='shorten_prefix_at_same_height_first_never_below_certified_prefix',
             mastery='per_environment_geometry_and_height_both_speeds_6_of_8_retained_on_failure',
             mastered_floor_height_fallback_failures=progressive.ProgressiveCourse.mastered_height_failure_episodes,
@@ -291,6 +319,10 @@ def configure_agent(agent_cfg, profile=PROFILE):
         critic_inputs='critic285_plus_raw_command3_plus_ascent_control12',
         stair_path_version=PATH_VERSION, stair_path_config=PathConfig().to_dict(),
         stair_path_reward_version=REWARD_VERSION, stair_path_reward_weights=REWARD_WEIGHTS.copy(),
+        ascent_metrics=dict(version='ascent_adaptive_metrics_main_practice_v1',
+                            main_excludes_narrow_columns=list(layout.NARROW_ASCENT_COLUMNS),
+                            practice_prefix='practice_',
+                            curriculum_excludes_practice=True),
         path_tracking_target='effective_xy_only_during_path_feedback_otherwise_raw',
         path_velocity_target='smooth_bounded_inward_return_then_zero_near_route',
         contact_slip='per_support_wheel_lateral015_both_plus_half_longitudinal020_descent',
@@ -307,6 +339,7 @@ def configure_agent(agent_cfg, profile=PROFILE):
         narrow_ascent_contact_protection=(dict(depths_m=[.20,.25], clearance_weight=-.30,
             riser_contact_weight=-.30, scope='ascent_only') if stage9 else None),
         staged_sampling=(dict(total_iterations=layout.SAMPLING_TOTAL_ITERATIONS,
+            narrow_width_reweighting=deepcopy(layout.NARROW_ASCENT_SETTINGS),
             advancement='manual_by_default_optional_matched_strata_plateau_and_automatic_demotion',
             iteration_boundaries=[], budget_forces_advancement=False,
             transition_iterations=ReadinessConfig().transition_iterations,
@@ -323,8 +356,10 @@ def configure_agent(agent_cfg, profile=PROFILE):
             fixed_descent_and_non_stair_assignments=True,
             unchanged_geometry_progress_preserved=True,
             changed_geometry_progress='minimum_pinned_prefix_and_fresh_both_speed_windows') if stage9 else None),
-        reward_adjustment=('ascent_only_rear_phase_guidance_and_physical_graded_pair_course' if stage9 else None),
+        reward_adjustment=('short_tread_rear_clearance_low_approach_narrow_width_practice_only' if stage9 else None),
         ascent_pairing=(deepcopy(pairing.SETTINGS) if stage9 else None),
+        narrow_ascent_practice=(deepcopy(layout.NARROW_ASCENT_SETTINGS) if stage9 else None),
+        ascent_height_practice=(deepcopy(HEIGHT_PRACTICE_SETTINGS) if stage9 else None),
         course_evidence=(deepcopy(EVIDENCE_SETTINGS) if stage9 else None),
         geometry=('fixed_width_and_depth_per_column_lowest_row_for_new_width_tasks' if stage9
                   else 'legacy_fixed_depth_per_column'),
